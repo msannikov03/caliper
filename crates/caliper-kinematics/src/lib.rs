@@ -183,19 +183,38 @@ pub struct SingularityReport {
 pub struct Jacobian(pub DMatrix<f64>);
 
 impl Jacobian {
-    /// Singular values (descending).
+    /// Singular values (descending). Empty for a 0-DOF Jacobian.
     pub fn singular_values(&self) -> DVector<f64> {
+        if self.0.ncols() == 0 || self.0.nrows() == 0 {
+            return DVector::zeros(0);
+        }
         self.0.clone().svd(false, false).singular_values
     }
-    /// Yoshikawa manipulability = product of singular values.
+    /// Yoshikawa manipulability = product of singular values (0 for a 0-DOF Jacobian).
     pub fn manipulability(&self) -> f64 {
+        if self.0.ncols() == 0 {
+            return 0.0;
+        }
         self.singular_values().iter().product()
     }
 
-    /// The single SVD → the full [`SingularityReport`].
+    /// The single SVD → the full [`SingularityReport`]. Returns a sentinel for a
+    /// legal 0-DOF (fixed-only) robot instead of running an empty SVD.
     pub fn analyze(&self, p: &SingularityParams) -> SingularityReport {
         let j = &self.0;
         let n = j.ncols();
+        if n == 0 || j.nrows() == 0 {
+            return SingularityReport {
+                manipulability: 0.0,
+                condition_number: f64::INFINITY,
+                sigma_min: 0.0,
+                kind: SingularityKind::None,
+                offending_joints: vec![],
+                nullspace_basis: DMatrix::zeros(n, 0),
+                escape_direction: DVector::zeros(n),
+                sigma: [0.0; 3],
+            };
+        }
         let svd = j.clone().svd(true, true);
         let s = &svd.singular_values;
         let k = s.len();
@@ -320,12 +339,16 @@ mod tests {
     use std::f64::consts::PI;
     use std::path::Path;
 
-    fn toy() -> Model {
-        let p = concat!(
+    fn load(name: &str) -> Model {
+        let p = format!(
+            "{}/../../oracle/fixtures/robots/{}",
             env!("CARGO_MANIFEST_DIR"),
-            "/../../oracle/fixtures/robots/toy.urdf"
+            name
         );
-        Model::from_urdf(Path::new(p)).unwrap()
+        Model::from_urdf(Path::new(&p)).unwrap()
+    }
+    fn toy() -> Model {
+        load("toy.urdf")
     }
 
     #[test]
@@ -454,5 +477,46 @@ mod tests {
         assert!(g.damping_sq(e - 1e-12) < 1e-6); // continuous at the boundary
         assert!(g.damping_sq(0.0) > 0.0); // engaged at the singularity
         assert!(g.damping_sq(e * 0.5) > g.damping_sq(e * 0.9)); // more damping as σ→0
+    }
+
+    #[test]
+    fn prismatic_fk_and_jacobian() {
+        let m = load("prismatic.urdf");
+        let frame = m.tip_frame();
+        let home = fk_tip(&m, &[0.0, 0.0]).translation();
+        let moved = fk_tip(&m, &[0.0, 0.25]).translation();
+        assert!((moved[0] - (home[0] + 0.25)).abs() < 1e-12);
+        assert!((moved[1] - home[1]).abs() < 1e-12 && (moved[2] - home[2]).abs() < 1e-12);
+        // analytic Jacobian (incl. the prismatic [z;0] column) vs finite-difference
+        let (_, jac) = jacobian(&m, &[0.3, 0.2], frame, JacFrame::World);
+        let jfd = fd_jacobian(&m, &[0.3, 0.2], frame, 1e-6);
+        assert!((&jac - &jfd).norm() < 1e-6);
+    }
+
+    #[test]
+    fn branched_ancestor_masking() {
+        let m = load("branched.urdf");
+        let q = vec![0.3; m.ndof];
+        let fa = m.frame_id("tipA").unwrap();
+        let fb = m.frame_id("tipB").unwrap();
+        let (_, ja) = jacobian(&m, &q, fa, JacFrame::World);
+        let (_, jb) = jacobian(&m, &q, fb, JacFrame::World);
+        let col = |name: &str| m.joint_names.iter().position(|n| n == name).unwrap();
+        // tipA does not depend on j3; tipB does not depend on j2
+        assert!(ja.column(col("j3")).norm() < 1e-15);
+        assert!(jb.column(col("j2")).norm() < 1e-15);
+        // but each DOES depend on its own branch joint
+        assert!(ja.column(col("j2")).norm() > 1e-6);
+        assert!(jb.column(col("j3")).norm() > 1e-6);
+    }
+
+    #[test]
+    fn zero_dof_analyze_does_not_panic() {
+        let m = load("fixed_only.urdf");
+        assert_eq!(m.ndof, 0);
+        let (_, j) = jacobian(&m, &[], m.tip_frame(), JacFrame::World);
+        let rep = Jacobian(j).analyze(&SingularityParams::default());
+        assert_eq!(rep.kind, SingularityKind::None);
+        assert!((fk_tip(&m, &[]).translation()[2] - 0.3).abs() < 1e-12);
     }
 }

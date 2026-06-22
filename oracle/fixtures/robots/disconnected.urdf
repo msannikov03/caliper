@@ -1,0 +1,7 @@
+<?xml version="1.0"?>
+<robot name="disc">
+  <link name="root"/><link name="a"/><link name="b"/><link name="c"/>
+  <joint name="j1" type="fixed"><parent link="root"/><child link="a"/><origin xyz="0 0 0.1" rpy="0 0 0"/></joint>
+  <joint name="j2" type="fixed"><parent link="b"/><child link="c"/><origin xyz="0 0 0.1" rpy="0 0 0"/></joint>
+  <joint name="j3" type="fixed"><parent link="c"/><child link="b"/><origin xyz="0 0 0.1" rpy="0 0 0"/></joint>
+</robot>

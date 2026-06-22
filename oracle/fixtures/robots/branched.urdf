@@ -1,0 +1,23 @@
+<?xml version="1.0"?>
+<robot name="ybranch">
+  <link name="base"/><link name="l1"/><link name="fixmid"/><link name="tipA"/><link name="tipB"/>
+  <joint name="j1" type="revolute">
+    <parent link="base"/><child link="l1"/>
+    <origin xyz="0 0 0.1" rpy="0 0 0"/><axis xyz="0 0 1"/>
+    <limit lower="-3" upper="3" effort="1" velocity="1"/>
+  </joint>
+  <joint name="f1" type="fixed">
+    <parent link="l1"/><child link="fixmid"/>
+    <origin xyz="0.1 0 0" rpy="0 0 0"/>
+  </joint>
+  <joint name="j2" type="revolute">
+    <parent link="fixmid"/><child link="tipA"/>
+    <origin xyz="0.2 0 0" rpy="0 0 0"/><axis xyz="0 1 0"/>
+    <limit lower="-3" upper="3" effort="1" velocity="1"/>
+  </joint>
+  <joint name="j3" type="revolute">
+    <parent link="l1"/><child link="tipB"/>
+    <origin xyz="0 0.2 0" rpy="0 0 0"/><axis xyz="1 0 0"/>
+    <limit lower="-3" upper="3" effort="1" velocity="1"/>
+  </joint>
+</robot>

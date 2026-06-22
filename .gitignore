@@ -5,3 +5,9 @@ node_modules/
 .venv/
 *.rrd
 Cargo.lock.bak
+# build artifacts that must never be committed
+*.so
+*.pyc
+*.abi3.so
+__pycache__/
+.pytest_cache/

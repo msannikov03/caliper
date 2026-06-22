@@ -33,6 +33,8 @@ pub enum CompileError {
     MultiRoot,
     #[error("joint `{0}` has a zero-length axis")]
     ZeroAxis(String),
+    #[error("link `{0}` is unreachable from the root (cycle or disconnected subtree)")]
+    Disconnected(String),
 }
 
 /// A renderable / queryable link frame, hung off its nearest movable joint.
@@ -158,12 +160,13 @@ impl RobotTree {
                 .ok_or_else(|| CompileError::DanglingLink(j.child.link.clone()))?;
             let (kind, limits) = match &j.joint_type {
                 urdf_rs::JointType::Revolute => {
-                    (RawKind::Revolute, Some((j.limit.lower, j.limit.upper)))
+                    (RawKind::Revolute, valid_limit(j.limit.lower, j.limit.upper))
                 }
                 urdf_rs::JointType::Continuous => (RawKind::Revolute, None),
-                urdf_rs::JointType::Prismatic => {
-                    (RawKind::Prismatic, Some((j.limit.lower, j.limit.upper)))
-                }
+                urdf_rs::JointType::Prismatic => (
+                    RawKind::Prismatic,
+                    valid_limit(j.limit.lower, j.limit.upper),
+                ),
                 urdf_rs::JointType::Fixed => (RawKind::Fixed, None),
                 other => return Err(CompileError::UnsupportedJoint(format!("{other:?}"))),
             };
@@ -190,6 +193,12 @@ fn pose_to_se3(p: &urdf_rs::Pose) -> Se3 {
         Translation3::new(x, y, z),
         UnitQuaternion::from_euler_angles(r, pi, ya),
     ))
+}
+
+/// A URDF limit is meaningful only when `lower < upper`; otherwise treat the
+/// joint as unbounded (a missing limit serializes as `0,0`).
+fn valid_limit(lo: f64, hi: f64) -> Option<(f64, f64)> {
+    (lo < hi).then_some((lo, hi))
 }
 
 fn normalize_axis(a: &Vector3<f64>) -> Option<Vector3<f64>> {
@@ -275,6 +284,15 @@ fn compile(t: &RobotTree) -> Result<Model, CompileError> {
             stack.push(j.child);
         }
     }
+    // Every link must have been reached: otherwise a cycle or a disconnected
+    // subtree silently truncated the model.
+    if m.frames.len() != nlinks {
+        let orphan = (0..nlinks)
+            .find(|&l| !m.frame_index.contains_key(&t.links[l]))
+            .map(|l| t.links[l].clone())
+            .unwrap_or_default();
+        return Err(CompileError::Disconnected(orphan));
+    }
     Ok(m)
 }
 
@@ -282,12 +300,18 @@ fn compile(t: &RobotTree) -> Result<Model, CompileError> {
 mod tests {
     use super::*;
 
-    fn toy() -> Model {
-        let p = concat!(
+    fn fixture(name: &str) -> String {
+        format!(
+            "{}/../../oracle/fixtures/robots/{}",
             env!("CARGO_MANIFEST_DIR"),
-            "/../../oracle/fixtures/robots/toy.urdf"
-        );
-        Model::from_urdf(Path::new(p)).unwrap()
+            name
+        )
+    }
+    fn load(name: &str) -> Model {
+        Model::from_urdf(Path::new(&fixture(name))).unwrap()
+    }
+    fn toy() -> Model {
+        load("toy.urdf")
     }
 
     #[test]
@@ -311,5 +335,50 @@ mod tests {
         let mut q = vec![10.0, -10.0];
         m.clamp(&mut q);
         assert!(q[0] <= 3.1401 && q[1] >= -3.1401);
+    }
+
+    #[test]
+    fn prismatic_compiles() {
+        let m = load("prismatic.urdf");
+        assert_eq!(m.ndof, 2);
+        assert_eq!(m.kind, vec![JointKind::Revolute, JointKind::Prismatic]);
+        assert_eq!(m.limits[1], Some((0.0, 0.5)));
+    }
+
+    #[test]
+    fn branched_compiles_with_folded_fixed() {
+        let m = load("branched.urdf");
+        assert_eq!(m.ndof, 3);
+        for n in ["j1", "j2", "j3"] {
+            assert!(m.joint_names.iter().any(|x| x == n), "missing {n}");
+        }
+        // the fixed joint f1 becomes a queryable frame, not a dof
+        assert!(m.frame_id("fixmid").is_some());
+        assert!(m.frame_id("tipA").is_some() && m.frame_id("tipB").is_some());
+    }
+
+    #[test]
+    fn fixed_only_is_zero_dof() {
+        let m = load("fixed_only.urdf");
+        assert_eq!(m.ndof, 0);
+        assert_eq!(m.frame_name(m.tip_frame()), "tip");
+    }
+
+    #[test]
+    fn redundant7_compiles() {
+        let m = load("redundant7.urdf");
+        assert_eq!(m.ndof, 7);
+        // topological invariant: parent index strictly less than own index
+        for (i, p) in m.parent.iter().enumerate() {
+            if let Some(p) = p {
+                assert!(*p < i);
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_disconnected() {
+        let err = Model::from_urdf(Path::new(&fixture("disconnected.urdf"))).unwrap_err();
+        assert!(matches!(err, CompileError::Disconnected(_)), "got {err:?}");
     }
 }

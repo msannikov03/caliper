@@ -17,6 +17,9 @@ pub struct IkOpts {
     pub max_iters: usize,
     pub restarts: usize,
     pub lambda0_sq: f64,
+    /// Always-on Tikhonov floor on the damping so `JᵀJ` stays SPD (essential for
+    /// redundant arms where `JᵀJ` is rank-deficient and Cholesky would fail).
+    pub lambda_floor_sq: f64,
     pub w_thresh: f64,
     pub step_clamp: f64,
     pub seed_rng: u64,
@@ -25,11 +28,12 @@ pub struct IkOpts {
 impl Default for IkOpts {
     fn default() -> Self {
         Self {
-            tol_pos: 1e-10,
-            tol_rot: 1e-10,
+            tol_pos: 1e-9,
+            tol_rot: 1e-9,
             max_iters: 100,
             restarts: 8,
             lambda0_sq: 1e-3,
+            lambda_floor_sq: 1e-10,
             w_thresh: 1e-3,
             step_clamp: 0.3,
             seed_rng: 0xC0FFEE,
@@ -48,6 +52,15 @@ pub struct IkResult {
 
 /// Solve IK for `frame` to reach `target`, starting from `seed`.
 pub fn ik(model: &Model, frame: usize, target: &Se3, seed: &[f64], opts: &IkOpts) -> IkResult {
+    if seed.len() != model.ndof {
+        return IkResult {
+            success: false,
+            q: vec![0.0; model.ndof],
+            residual: f64::INFINITY,
+            iters: 0,
+            restarts_used: 0,
+        };
+    }
     let (lo, hi) = limits(model);
     let mut rng = SplitMix64(opts.seed_rng);
     let mut best: Option<IkResult> = None;
@@ -107,7 +120,8 @@ fn solve_one(
             0.0
         } else {
             opts.lambda0_sq * (1.0 - w / opts.w_thresh).powi(2)
-        };
+        }
+        .max(opts.lambda_floor_sq); // floor keeps H SPD for redundant (wide-J) arms
 
         // LM normal equations: (JᵀJ + λ²(I + diag(JᵀJ))) dq = Jᵀe
         let jt = j.transpose();
@@ -196,12 +210,16 @@ mod tests {
     use super::*;
     use std::path::Path;
 
-    fn toy() -> Model {
-        let p = concat!(
+    fn load(name: &str) -> Model {
+        let p = format!(
+            "{}/../../oracle/fixtures/robots/{}",
             env!("CARGO_MANIFEST_DIR"),
-            "/../../oracle/fixtures/robots/toy.urdf"
+            name
         );
-        Model::from_urdf(Path::new(p)).unwrap()
+        Model::from_urdf(Path::new(&p)).unwrap()
+    }
+    fn toy() -> Model {
+        load("toy.urdf")
     }
 
     /// FK(IK(FK(q))) == FK(q): the headline round-trip, over a deterministic sweep.
@@ -243,5 +261,56 @@ mod tests {
             .0
             .norm();
         assert!(err < 1e-8);
+    }
+
+    #[test]
+    fn ik_redundant_7dof() {
+        let m = load("redundant7.urdf");
+        assert_eq!(m.ndof, 7);
+        let frame = m.tip_frame();
+        let opts = IkOpts::default();
+        let mut rng = SplitMix64(0x777);
+        for _ in 0..50 {
+            let q_true: Vec<f64> = (0..7).map(|_| (rng.next_f64() - 0.5) * 2.0).collect();
+            let target = fk_frame(&m, &q_true, frame);
+            let seed: Vec<f64> = q_true
+                .iter()
+                .map(|&x| x + (rng.next_f64() - 0.5) * 0.4)
+                .collect();
+            let res = ik(&m, frame, &target, &seed, &opts);
+            assert!(
+                res.success,
+                "redundant IK failed: residual {:.2e}",
+                res.residual
+            );
+            let err = Se3(fk_frame(&m, &res.q, frame).0.inverse() * target.0)
+                .log()
+                .0
+                .norm();
+            assert!(err < 1e-8, "pose error {err:.2e}");
+        }
+    }
+
+    #[test]
+    fn ik_prismatic_joint() {
+        let m = load("prismatic.urdf");
+        let frame = m.tip_frame();
+        let target = fk_frame(&m, &[0.5, 0.3], frame);
+        let res = ik(&m, frame, &target, &[0.0, 0.1], &IkOpts::default());
+        assert!(res.success);
+        let err = Se3(fk_frame(&m, &res.q, frame).0.inverse() * target.0)
+            .log()
+            .0
+            .norm();
+        assert!(err < 1e-8);
+    }
+
+    #[test]
+    fn ik_rejects_wrong_seed_length() {
+        let m = toy();
+        let frame = m.tip_frame();
+        let target = fk_frame(&m, &[0.0, 0.0], frame);
+        let res = ik(&m, frame, &target, &[0.0, 0.0, 0.0], &IkOpts::default());
+        assert!(!res.success && !res.residual.is_finite());
     }
 }

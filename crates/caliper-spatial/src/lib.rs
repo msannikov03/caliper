@@ -6,8 +6,11 @@
 //! swap blocks when porting those formulas.)
 use nalgebra::{Isometry3, Matrix3, Matrix6, Translation3, UnitQuaternion, Vector3, Vector6};
 
-/// Small-angle threshold on θ = ‖ω‖.
-const EPS: f64 = 1e-8;
+/// Small-angle threshold on θ = ‖ω‖. Chosen so the (θ²-corrected) Taylor branch
+/// and the closed forms are *both* accurate across the crossover — the closed
+/// forms (1−cosθ)/θ² etc. lose precision to catastrophic cancellation well above
+/// 1e-8, so the threshold must be ~1e-4, not 1e-8.
+const EPS: f64 = 1e-4;
 
 /// A twist / screw axis in se(3), stored `[v; ω]` (linear 0..3, angular 3..6).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -67,8 +70,10 @@ impl Se3 {
         let wx = skew(&phi);
         let rot = UnitQuaternion::from_scaled_axis(phi);
         let vmat = if theta < EPS {
-            // V ≈ I + ½[φ] + (1/6)[φ]²
-            Matrix3::identity() + 0.5 * wx + (1.0 / 6.0) * (wx * wx)
+            // V Taylor: a = ½ − θ²/24, b = 1/6 − θ²/120
+            let a = 0.5 - theta * theta / 24.0;
+            let b = 1.0 / 6.0 - theta * theta / 120.0;
+            Matrix3::identity() + a * wx + b * (wx * wx)
         } else {
             let a = (1.0 - theta.cos()) / (theta * theta); // (1-cosθ)/θ²
             let b = (theta - theta.sin()) / theta.powi(3); // (θ-sinθ)/θ³
@@ -84,7 +89,9 @@ impl Se3 {
         let theta = phi.norm();
         let wx = skew(&phi);
         let vinv = if theta < EPS {
-            Matrix3::identity() - 0.5 * wx + (1.0 / 12.0) * (wx * wx)
+            // V⁻¹ Taylor: c = 1/12 + θ²/720
+            let c = 1.0 / 12.0 + theta * theta / 720.0;
+            Matrix3::identity() - 0.5 * wx + c * (wx * wx)
         } else {
             let c = 1.0 / (theta * theta) - (1.0 + theta.cos()) / (2.0 * theta * theta.sin());
             Matrix3::identity() - 0.5 * wx + c * (wx * wx)
@@ -175,7 +182,7 @@ mod tests {
         }
         fn twist(&mut self) -> Twist {
             let ax = Vector3::new(self.unit(), self.unit(), self.unit()).normalize();
-            let angle = 1e-6 + self.f() * (PI - 1e-2 - 1e-6); // stay away from θ=π
+            let angle = 1e-9 + self.f() * (PI - 2e-9); // full range incl. small + near-π
             let v = Vector3::new(self.unit(), self.unit(), self.unit());
             Twist::from_vw(v, ax * angle)
         }
@@ -204,6 +211,46 @@ mod tests {
         );
         let big_t = Se3::exp(&t);
         assert!(se3_diff(&Se3::exp(&big_t.log()), &big_t) < 1e-12);
+    }
+
+    #[test]
+    fn small_angle_band_sweep() {
+        // log-spaced θ across the band that exposed the old EPS threshold bug
+        let axis = Vector3::new(0.3, -0.5, 0.8).normalize();
+        let v = Vector3::new(0.7, -0.2, 0.4);
+        let mut th = 1e-9;
+        while th < 1e-2 {
+            let t = Twist::from_vw(v, axis * th);
+            let big_t = Se3::exp(&t);
+            assert!(
+                se3_diff(&Se3::exp(&big_t.log()), &big_t) < 1e-12,
+                "θ={th:e}"
+            );
+            assert!((big_t.log().0 - t.0).norm() < 1e-10, "θ={th:e}");
+            th *= 3.0;
+        }
+    }
+
+    #[test]
+    fn near_pi_roundtrip() {
+        let axis = Vector3::new(1.0, 0.2, -0.3).normalize();
+        let v = Vector3::new(0.5, 0.1, -0.4);
+        for d in [1e-2, 1e-4, 1e-6] {
+            let t = Twist::from_vw(v, axis * (PI - d));
+            let big_t = Se3::exp(&t);
+            assert!(
+                se3_diff(&Se3::exp(&big_t.log()), &big_t) < 1e-9,
+                "θ=π−{d:e}"
+            );
+        }
+    }
+
+    #[test]
+    fn prismatic_translates() {
+        let axis = Vector3::new(0.0, 0.0, 1.0);
+        let t = exp_prismatic(&axis, 0.37);
+        assert!((Vector3::from(t.translation()) - axis * 0.37).norm() < 1e-15);
+        assert!((t.rotation() - Matrix3::identity()).norm() < 1e-15);
     }
 
     #[test]

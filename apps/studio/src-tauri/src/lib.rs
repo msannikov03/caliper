@@ -15,10 +15,23 @@ fn engine_version() -> String {
 }
 
 /// Load a robot from a URDF path and return its structure.
+///
+/// Security: only `.urdf`/`.xacro` files are accepted (so this is not a general
+/// arbitrary-file-read primitive), and errors are mapped to a generic message
+/// rather than leaking filesystem detail to the webview. When wired into the UI,
+/// file selection should go through the native dialog plugin, not a raw path.
 #[tauri::command]
 fn load_robot(path: String) -> Result<RobotInfo, String> {
-    let robot =
-        caliper::model::Robot::from_urdf(std::path::Path::new(&path)).map_err(|e| e.to_string())?;
+    let p = std::path::Path::new(&path);
+    let ext_ok = p
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("urdf") || e.eq_ignore_ascii_case("xacro"));
+    if !ext_ok {
+        return Err("only .urdf or .xacro files are supported".into());
+    }
+    let robot = caliper::model::Robot::from_urdf(p)
+        .map_err(|_| "failed to load robot from the given URDF".to_string())?;
     Ok(RobotInfo {
         name: robot.name.clone(),
         dof: robot.ndof(),

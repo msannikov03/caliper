@@ -14,9 +14,23 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
+      # studio (Tauri app) excluded: it needs a built frontend (dist/); see the `studio` job.
+      - run: cargo clippy --workspace --exclude studio --all-targets -- -D warnings
+      - run: cargo test --workspace --exclude studio
       - run: bash scripts/assert-lean.sh
+
+  studio:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm --prefix apps/studio ci
+      - run: npm --prefix apps/studio run build
+      - run: cargo build -p studio
 
   python:
     runs-on: macos-14

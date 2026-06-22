@@ -1,0 +1,53 @@
+:root {
+  font-family: Inter, system-ui, -apple-system, sans-serif;
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  margin: 0;
+  height: 100%;
+  background: #0a0a0c;
+  overflow: hidden;
+}
+
+.app {
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.topbar {
+  height: 44px;
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 0 16px;
+  background: #0d0d11;
+  border-bottom: 1px solid #1b1b22;
+  user-select: none;
+}
+
+.brand {
+  font-weight: 600;
+  font-size: 13.5px;
+  letter-spacing: -0.01em;
+  color: #fafafa;
+}
+
+.engine {
+  font-size: 11.5px;
+  color: #6b6b78;
+  font-variant-numeric: tabular-nums;
+}
+
+.viewport {
+  flex: 1 1 auto;
+  min-height: 0;
+}

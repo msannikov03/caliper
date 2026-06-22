@@ -468,6 +468,12 @@ dependencies = [
 [[package]]
 name = "caliper-ik"
 version = "0.1.0"
+dependencies = [
+ "caliper-kinematics",
+ "caliper-model",
+ "caliper-spatial",
+ "nalgebra",
+]
 
 [[package]]
 name = "caliper-kinematics"

@@ -7,4 +7,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+caliper-spatial.workspace = true
+caliper-model.workspace = true
+caliper-kinematics.workspace = true
+nalgebra.workspace = true
 

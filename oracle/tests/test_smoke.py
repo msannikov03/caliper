@@ -35,6 +35,5 @@ def test_face_parity():
     assert f"dof:   {r.ndof}" in out
 
 
-@pytest.mark.skip(reason="FK math lands in Phase 1 — cross-validate vs Pinocchio then")
-def test_fk_vs_pinocchio():
-    ...
+# FK / Jacobian cross-validation vs Pinocchio now lives in test_pinocchio.py
+# (gated on the optional `pinocchio` dependency + the extended PyO3 bindings).

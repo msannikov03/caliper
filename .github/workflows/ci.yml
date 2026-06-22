@@ -38,6 +38,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: astral-sh/setup-uv@v5
-      - run: uv venv && uv pip install maturin pytest
+      # numpy + pin (Pinocchio) make oracle/tests/test_pinocchio.py actually RUN
+      # (it importorskips otherwise) — the independent FK/Jacobian cross-validation.
+      - run: uv venv && uv pip install maturin pytest numpy pin
       - run: uv run maturin develop -m crates/caliper-py/Cargo.toml
       - run: uv run python -m pytest oracle -v

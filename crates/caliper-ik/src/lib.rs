@@ -6,7 +6,7 @@
 use caliper_kinematics::{JacFrame, fk_frame, jacobian};
 use caliper_model::Model;
 use caliper_spatial::Se3;
-use nalgebra::{Cholesky, DMatrix, DVector};
+use nalgebra::{Cholesky, DVector};
 
 const UNBOUNDED: f64 = 1.0e6;
 
@@ -69,6 +69,7 @@ pub fn ik(model: &Model, frame: usize, target: &Se3, seed: &[f64], opts: &IkOpts
     best.unwrap()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn solve_one(
     model: &Model,
     frame: usize,

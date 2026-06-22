@@ -48,19 +48,23 @@ fn main() -> anyhow::Result<()> {
         }
         Cmd::Fk { urdf, joints } => {
             let robot = caliper::model::Robot::from_urdf(&urdf)?;
+            let m = &robot.model;
             anyhow::ensure!(
-                joints.len() == robot.ndof(),
+                joints.len() == m.ndof,
                 "expected {} joint value(s), got {}",
-                robot.ndof(),
+                m.ndof,
                 joints.len()
             );
+            let pose = caliper::kinematics::fk_tip(m, &joints);
+            let p = pose.translation();
+            let r = pose.0.rotation.euler_angles();
+            let tip = m.frame_name(m.tip_frame());
             println!(
-                "loaded '{}' ({} dof), q = {:?}",
-                robot.name,
-                robot.ndof(),
-                joints
+                "FK '{}' → tip frame '{}'  (q = {:?})",
+                robot.name, tip, joints
             );
-            println!("(forward-kinematics math lands in Phase 1)");
+            println!("  position : [{:.5}, {:.5}, {:.5}]", p[0], p[1], p[2]);
+            println!("  rpy      : [{:.5}, {:.5}, {:.5}]", r.0, r.1, r.2);
         }
     }
     Ok(())

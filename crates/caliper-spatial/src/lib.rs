@@ -109,7 +109,8 @@ impl Se3 {
         let p = self.translation_vec();
         let mut ad = Matrix6::zeros();
         ad.fixed_view_mut::<3, 3>(0, 0).copy_from(&rt);
-        ad.fixed_view_mut::<3, 3>(0, 3).copy_from(&(-(rt * skew(&p))));
+        ad.fixed_view_mut::<3, 3>(0, 3)
+            .copy_from(&(-(rt * skew(&p))));
         ad.fixed_view_mut::<3, 3>(3, 3).copy_from(&rt);
         ad
     }
@@ -197,7 +198,10 @@ mod tests {
 
     #[test]
     fn small_angle_branch() {
-        let t = Twist::from_vw(Vector3::new(0.3, -0.2, 0.1), Vector3::new(1e-10, -1e-10, 5e-11));
+        let t = Twist::from_vw(
+            Vector3::new(0.3, -0.2, 0.1),
+            Vector3::new(1e-10, -1e-10, 5e-11),
+        );
         let big_t = Se3::exp(&t);
         assert!(se3_diff(&Se3::exp(&big_t.log()), &big_t) < 1e-12);
     }

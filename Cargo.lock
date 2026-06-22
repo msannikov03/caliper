@@ -473,6 +473,8 @@ version = "0.1.0"
 name = "caliper-kinematics"
 version = "0.1.0"
 dependencies = [
+ "caliper-model",
+ "caliper-spatial",
  "nalgebra",
 ]
 
@@ -480,6 +482,8 @@ dependencies = [
 name = "caliper-model"
 version = "0.1.0"
 dependencies = [
+ "caliper-spatial",
+ "nalgebra",
  "thiserror 2.0.18",
  "urdf-rs",
 ]

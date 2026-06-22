@@ -1,0 +1,19 @@
+[package]
+name = "caliper-py"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "_caliper"
+crate-type = ["cdylib", "rlib"]
+# Bindings are validated via the Python oracle, not `cargo test` (which would
+# dlopen libpython at runtime and fail outside a configured venv).
+test = false
+doctest = false
+
+[dependencies]
+caliper.workspace = true
+pyo3.workspace = true

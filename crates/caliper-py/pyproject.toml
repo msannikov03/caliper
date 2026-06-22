@@ -1,0 +1,15 @@
+[build-system]
+requires = ["maturin>=1.9,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "caliper"
+version = "0.1.0"
+description = "A modern, open robotics engine — Python bindings"
+requires-python = ">=3.10"
+classifiers = ["Programming Language :: Rust"]
+
+[tool.maturin]
+module-name = "caliper._caliper"
+python-source = "python"
+features = ["pyo3/extension-module"]

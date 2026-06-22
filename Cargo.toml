@@ -1,0 +1,42 @@
+[workspace]
+resolver = "3"
+members = [
+  "crates/caliper-spatial",
+  "crates/caliper-model",
+  "crates/caliper-kinematics",
+  "crates/caliper-dynamics",
+  "crates/caliper-ik",
+  "crates/caliper-hal",
+  "crates/caliper",
+  "crates/caliper-cli",
+  "crates/caliper-py",
+]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.89"
+version = "0.1.0"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/msannikov03/caliper"
+
+[workspace.dependencies]
+nalgebra = { version = "0.35", features = ["serde-serialize"] }
+urdf-rs = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+approx = "0.5"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+pyo3 = { version = "0.29", features = ["abi3-py310"] }
+caliper-spatial    = { path = "crates/caliper-spatial", version = "0.1.0" }
+caliper-model      = { path = "crates/caliper-model", version = "0.1.0" }
+caliper-kinematics = { path = "crates/caliper-kinematics", version = "0.1.0" }
+caliper-dynamics   = { path = "crates/caliper-dynamics", version = "0.1.0" }
+caliper-ik         = { path = "crates/caliper-ik", version = "0.1.0" }
+caliper-hal        = { path = "crates/caliper-hal", version = "0.1.0" }
+caliper            = { path = "crates/caliper", version = "0.1.0" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

@@ -1,7 +1,7 @@
 //! Forward kinematics, Jacobians, and singularity analysis.
 use caliper_model::{JointKind, Model};
 use caliper_spatial::{Se3, exp_prismatic, exp_revolute};
-use nalgebra::{DMatrix, DVector, Matrix3, Vector3};
+use nalgebra::{DMatrix, DVector, Matrix3, Vector3, Vector6};
 
 /// Local exp of movable joint `i` at configuration `q`.
 #[inline]
@@ -133,18 +133,183 @@ fn rotate_twist_rows(j: &DMatrix<f64>, rm: &Matrix3<f64>) -> DMatrix<f64> {
     out
 }
 
-/// A geometric Jacobian wrapper carrying the SVD-based analysis used by the
-/// singularity stack (built in the next step).
+/// How the smallest singular direction is lost at a singularity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SingularityKind {
+    None,
+    Wrist,
+    Elbow,
+    Shoulder,
+    Boundary,
+}
+
+/// Tolerances for singularity analysis + the governor (metric / rad robots).
+#[derive(Clone, Copy, Debug)]
+pub struct SingularityParams {
+    /// Relative nullspace tolerance: `σ < eps_null·σ_max` ⇒ a null direction.
+    pub eps_null: f64,
+    /// `σ_min` below which the governor engages.
+    pub eps_activate: f64,
+    /// Maximum DLS damping `λ`.
+    pub lambda_max: f64,
+}
+impl Default for SingularityParams {
+    fn default() -> Self {
+        Self {
+            eps_null: 1e-6,
+            eps_activate: 1e-2,
+            lambda_max: 1e-1,
+        }
+    }
+}
+
+/// A typed, structured singularity report — Caliper's signature feature.
+#[derive(Clone, Debug)]
+pub struct SingularityReport {
+    pub manipulability: f64,
+    pub condition_number: f64,
+    pub sigma_min: f64,
+    pub kind: SingularityKind,
+    pub offending_joints: Vec<usize>,
+    /// `ndof × m` (m = number of near-zero singular values).
+    pub nullspace_basis: DMatrix<f64>,
+    /// `ndof`, the unit right-singular vector of `σ_min`.
+    pub escape_direction: DVector<f64>,
+    /// The three smallest singular values, ascending.
+    pub sigma: [f64; 3],
+}
+
+/// A geometric Jacobian wrapper carrying the SVD-based singularity analysis.
 pub struct Jacobian(pub DMatrix<f64>);
 
 impl Jacobian {
-    /// Singular values of the Jacobian (descending).
+    /// Singular values (descending).
     pub fn singular_values(&self) -> DVector<f64> {
         self.0.clone().svd(false, false).singular_values
     }
     /// Yoshikawa manipulability = product of singular values.
     pub fn manipulability(&self) -> f64 {
         self.singular_values().iter().product()
+    }
+
+    /// The single SVD → the full [`SingularityReport`].
+    pub fn analyze(&self, p: &SingularityParams) -> SingularityReport {
+        let j = &self.0;
+        let n = j.ncols();
+        let svd = j.clone().svd(true, true);
+        let s = &svd.singular_values;
+        let k = s.len();
+        let u = svd.u.as_ref().expect("u");
+        let vt = svd.v_t.as_ref().expect("v_t");
+
+        let sigma_max = s[0];
+        let sigma_min = s[k - 1];
+        let manipulability: f64 = s.iter().product();
+        let condition_number = if sigma_min > 0.0 {
+            sigma_max / sigma_min
+        } else {
+            f64::INFINITY
+        };
+
+        let mut sigma = [0.0; 3];
+        for (i, slot) in sigma.iter_mut().enumerate() {
+            *slot = if k > i { s[k - 1 - i] } else { 0.0 };
+        }
+
+        let tol = p.eps_null * sigma_max;
+        let null_idx: Vec<usize> = (0..k).filter(|&i| s[i] < tol).collect();
+        let mut nullspace_basis = DMatrix::<f64>::zeros(n, null_idx.len());
+        for (c, &i) in null_idx.iter().enumerate() {
+            let col = DVector::from_iterator(n, vt.row(i).iter().copied());
+            nullspace_basis.set_column(c, &col);
+        }
+
+        let escape_direction = DVector::from_iterator(n, vt.row(k - 1).iter().copied());
+        let u_min = Vector6::from_iterator(u.column(k - 1).iter().copied());
+        let kind = classify(&u_min, sigma_min, p.eps_activate);
+
+        let emax = escape_direction
+            .iter()
+            .fold(0.0_f64, |a, &x| a.max(x.abs()));
+        let offending_joints = (0..n)
+            .filter(|&i| emax > 0.0 && escape_direction[i].abs() > 0.5 * emax)
+            .collect();
+
+        SingularityReport {
+            manipulability,
+            condition_number,
+            sigma_min,
+            kind,
+            offending_joints,
+            nullspace_basis,
+            escape_direction,
+            sigma,
+        }
+    }
+}
+
+/// Classify the lost direction from the smallest left-singular vector
+/// `u_min = [v(0..3); ω(3..6)]`. (Per-topology geometric tests can refine this.)
+fn classify(u_min: &Vector6<f64>, sigma_min: f64, eps: f64) -> SingularityKind {
+    if sigma_min >= eps {
+        return SingularityKind::None;
+    }
+    let lin = Vector3::new(u_min[0], u_min[1], u_min[2]).norm();
+    let ang = Vector3::new(u_min[3], u_min[4], u_min[5]).norm();
+    if ang > 1.5 * lin {
+        SingularityKind::Wrist // orientation DOF collapsed
+    } else if lin > 1.5 * ang {
+        SingularityKind::Boundary // translation DOF collapsed at a reach edge
+    } else {
+        SingularityKind::Elbow // mixed translation + orientation
+    }
+}
+
+/// Wraps a solver's output to stay safe near singularities.
+pub struct SingularityGovernor {
+    pub params: SingularityParams,
+}
+
+impl SingularityGovernor {
+    pub fn new(params: SingularityParams) -> Self {
+        Self { params }
+    }
+    /// Smooth, C¹ damping `λ²` that ramps in as `σ_min` drops below `eps_activate`.
+    pub fn damping_sq(&self, sigma_min: f64) -> f64 {
+        let e = self.params.eps_activate;
+        if sigma_min >= e {
+            0.0
+        } else {
+            let r = sigma_min / e;
+            self.params.lambda_max.powi(2) * (1.0 - r * r)
+        }
+    }
+    /// Scale a commanded 6-twist near a singularity: attenuate components along
+    /// ill-conditioned directions when *approaching*, let them escape when
+    /// *leaving*. `u`,`s` come from the same SVD used for the report.
+    pub fn scale_twist(
+        &self,
+        v_cmd: &Vector6<f64>,
+        u: &DMatrix<f64>,
+        s: &DVector<f64>,
+        prev_sigma_min: f64,
+    ) -> Vector6<f64> {
+        let k = s.len();
+        let lambda2 = self.damping_sq(s[k - 1]);
+        let approaching = s[k - 1] < prev_sigma_min;
+        let mut out = Vector6::zeros();
+        for i in 0..k {
+            let ui = Vector6::from_iterator(u.column(i).iter().copied());
+            let c = ui.dot(v_cmd);
+            let sg = s[i];
+            let gain = if approaching {
+                sg * sg / (sg * sg + lambda2)
+            } else {
+                1.0
+            };
+            out += (c * gain) * ui;
+        }
+        out
     }
 }
 
@@ -243,5 +408,51 @@ mod tests {
         let (_, jb) = jacobian(&m, &q, f, JacFrame::Body);
         let back = rotate_twist_rows(&jb, &ee.rotation());
         assert!((&back - &jw).norm() < 1e-12);
+    }
+
+    fn singular_synthetic() -> Jacobian {
+        // 6×3 with column 2 == column 1 ⇒ rank 2 ⇒ a 1-D nullspace.
+        let mut m = DMatrix::<f64>::zeros(6, 3);
+        m[(0, 0)] = 1.0;
+        m[(1, 1)] = 1.0;
+        m[(2, 2)] = 1.0;
+        let c1 = m.column(1).into_owned();
+        m.set_column(2, &c1);
+        Jacobian(m)
+    }
+
+    #[test]
+    fn analyze_svd_identities() {
+        let m = toy();
+        let (_, j) = jacobian(&m, &[0.4, 0.7], m.tip_frame(), JacFrame::World);
+        let jac = Jacobian(j.clone());
+        let rep = jac.analyze(&SingularityParams::default());
+        assert!((rep.escape_direction.norm() - 1.0).abs() < 1e-9);
+        // ‖J · v_min‖ == σ_min  (SVD identity)
+        assert!(((&j * &rep.escape_direction).norm() - rep.sigma_min).abs() < 1e-9);
+        assert!((rep.manipulability - jac.manipulability()).abs() < 1e-12);
+        assert_eq!(rep.kind, SingularityKind::None); // generic config is well-conditioned
+    }
+
+    #[test]
+    fn analyze_detects_rank_deficiency() {
+        let jac = singular_synthetic();
+        let rep = jac.analyze(&SingularityParams::default());
+        assert!(rep.sigma_min < 1e-9);
+        assert!(rep.condition_number > 1e10);
+        assert_eq!(rep.nullspace_basis.ncols(), 1);
+        assert_ne!(rep.kind, SingularityKind::None);
+        let null = rep.nullspace_basis.column(0).into_owned();
+        assert!((&jac.0 * &null).norm() < 1e-9); // J · nullspace ≈ 0
+    }
+
+    #[test]
+    fn governor_damping_is_continuous_and_monotone() {
+        let g = SingularityGovernor::new(SingularityParams::default());
+        let e = g.params.eps_activate;
+        assert_eq!(g.damping_sq(e + 1.0), 0.0); // off above threshold
+        assert!(g.damping_sq(e - 1e-12) < 1e-6); // continuous at the boundary
+        assert!(g.damping_sq(0.0) > 0.0); // engaged at the singularity
+        assert!(g.damping_sq(e * 0.5) > g.damping_sq(e * 0.9)); // more damping as σ→0
     }
 }

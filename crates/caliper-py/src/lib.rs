@@ -632,6 +632,11 @@ impl Simulator {
         damping: f64,
         substeps: usize,
     ) -> PyResult<Self> {
+        if !(damping.is_finite() && damping >= 0.0) {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "damping must be finite and >= 0 (negative damping injects energy)",
+            ));
+        }
         let model = std::sync::Arc::new(robot.inner.model.clone());
         let mut inner = dynamics::Simulator::new(model).map_err(dyn_err)?;
         inner.set_gravity(grav(gravity));
@@ -677,6 +682,11 @@ impl Simulator {
         self.inner.set_gravity(Vector3::new(g[0], g[1], g[2]));
     }
     fn set_damping(&mut self, d: Vec<f64>) -> PyResult<()> {
+        if d.iter().any(|x| !x.is_finite() || *x < 0.0) {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "damping must be finite and >= 0 (negative damping injects energy)",
+            ));
+        }
         self.inner.set_damping(&d).map_err(dyn_err)
     }
     #[pyo3(signature = (q0=None, qd0=None))]
@@ -690,6 +700,8 @@ impl Simulator {
                 let n = self.inner.ndof();
                 let q = q.unwrap_or_else(|| vec![0.0; n]);
                 let v = v.unwrap_or_else(|| vec![0.0; n]);
+                finite_or_err("q0", &q)?;
+                finite_or_err("qd0", &v)?;
                 self.inner.reset_to(&q, &v).map_err(dyn_err)
             }
         }
@@ -702,6 +714,11 @@ impl Simulator {
         horizon: f64,
         sample_dt: Option<f64>,
     ) -> PyResult<(Vec<f64>, Vec<Vec<f64>>, Vec<Vec<f64>>)> {
+        if !(horizon.is_finite() && horizon > 0.0 && horizon <= 600.0) {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "horizon must be finite, > 0, and <= 600 s",
+            ));
+        }
         let sdt = sample_dt.unwrap_or(self.dt).max(1e-4);
         let n = ((horizon / sdt).ceil() as usize).max(1);
         let (mut ts, mut qs, mut qds) = (vec![], vec![], vec![]);

@@ -909,6 +909,11 @@ fn sim_drop(
     if req.q_start.iter().any(|x| !x.is_finite()) {
         return Err("q_start contains a non-finite value".into());
     }
+    if let Some(g) = req.gravity {
+        if g.iter().any(|x| !x.is_finite()) {
+            return Err("gravity contains a non-finite value".into());
+        }
+    }
     let render_dt = req.dt.unwrap_or(0.02).clamp(1e-3, 0.1);
     let step_dt = req.step_dt.unwrap_or(1e-3).clamp(1e-4, render_dt);
     let duration = req.duration.unwrap_or(4.0).clamp(0.1, 30.0);
@@ -1011,6 +1016,11 @@ fn dynamics_at(
         .any(|x| !x.is_finite())
     {
         return Err("q/qd/qdd contains a non-finite value".into());
+    }
+    if let Some(a) = gravity {
+        if a.iter().any(|x| !x.is_finite()) {
+            return Err("gravity contains a non-finite value".into());
+        }
     }
     let g = gravity
         .map(|a| Vector3::new(a[0], a[1], a[2]))
@@ -1177,13 +1187,22 @@ mod tests {
         assert!(m.has_inertia);
         let mut sim = Simulator::new(std::sync::Arc::new(m.clone())).unwrap();
         sim.set_damping(&vec![0.05; m.ndof]).unwrap();
-        sim.reset_to(&vec![0.0; m.ndof], &vec![0.0; m.ndof])
-            .unwrap();
+        // q=0 is an EXACT gravity equilibrium for showcase6 (every link COM sits on
+        // the vertical Z-stack above its joint axis → zero gravity torque), so start
+        // from a tilted pose with a real moment arm.
+        let q0 = vec![0.0, 0.3, 0.3, 0.0, 0.2, 0.0];
+        sim.reset_to(&q0, &vec![0.0; m.ndof]).unwrap();
         let e0 = sim.total_energy();
         for _ in 0..200 {
             sim.step(0.02).unwrap();
         }
-        assert!(sim.q().iter().any(|&x| x.abs() > 0.05), "arm did not fall");
+        assert!(
+            sim.q()
+                .iter()
+                .zip(&q0)
+                .any(|(&x, &x0)| (x - x0).abs() > 0.05),
+            "arm did not fall"
+        );
         assert!(sim.total_energy() <= e0 + 1e-6, "damped energy increased");
     }
 }

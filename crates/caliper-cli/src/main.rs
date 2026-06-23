@@ -129,6 +129,7 @@ fn grav_vec(g: &Option<Vec<f64>>) -> anyhow::Result<Vector3<f64>> {
         None => Ok(GRAVITY_EARTH),
         Some(v) => {
             anyhow::ensure!(v.len() == 3, "--gravity needs 3 values x,y,z");
+            anyhow::ensure!(v.iter().all(|x| x.is_finite()), "--gravity must be finite");
             Ok(Vector3::new(v[0], v[1], v[2]))
         }
     }
@@ -364,6 +365,10 @@ fn main() -> anyhow::Result<()> {
                 "--vel/--accel must have {} values",
                 m.ndof
             );
+            anyhow::ensure!(
+                joints.iter().chain(&qd).chain(&qdd).all(|x| x.is_finite()),
+                "joints/vel/accel contains a non-finite value"
+            );
             let g = grav_vec(&gravity)?;
             let tau = dynamics::rnea(m, &joints, &qd, &qdd, &g)?;
             let gq = dynamics::rnea(m, &joints, &vec![0.0; m.ndof], &vec![0.0; m.ndof], &g)?;
@@ -413,12 +418,17 @@ fn main() -> anyhow::Result<()> {
             );
             let q0 = start.unwrap_or_else(|| vec![0.0; m.ndof]);
             anyhow::ensure!(q0.len() == m.ndof, "--start needs {} values", m.ndof);
+            anyhow::ensure!(
+                q0.iter().all(|x| x.is_finite()),
+                "--start contains a non-finite value"
+            );
             let model = Arc::new(m.clone());
             let mut sim = Simulator::new(model)?;
             sim.set_gravity(grav_vec(&gravity)?);
             sim.set_damping(&vec![damping; m.ndof])?;
-            sim.h_max = dt;
-            sim.qd_clamp = None;
+            // Keep the integrator's substepping (default h_max=1e-3) and qd clamp on:
+            // step(dt) subdivides a coarse --dt, so it stays stable instead of
+            // diverging into a spurious NotSpd abort.
             if let Some(tau) = torque {
                 anyhow::ensure!(tau.len() == m.ndof, "--torque needs {} values", m.ndof);
                 sim.set_torque(&tau)?;

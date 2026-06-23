@@ -6,7 +6,10 @@ export function JointPanel() {
   const robot = useStore((s) => s.robot);
   const q = useStore((s) => s.q);
   const setJoint = useStore((s) => s.setJoint);
+  const playing = useStore((s) => s.playing);
+  const mode = useStore((s) => s.mode);
   if (!robot) return null;
+  const locked = playing || mode === "simulate"; // sim/playback own the pose
 
   return (
     <aside className="joint-panel">
@@ -30,6 +33,7 @@ export function JointPanel() {
               max={hi}
               step={0.001}
               value={v}
+              disabled={locked}
               onChange={(e) => setJoint(i, parseFloat(e.target.value))}
             />
             <span className="val">{v.toFixed(3)}</span>

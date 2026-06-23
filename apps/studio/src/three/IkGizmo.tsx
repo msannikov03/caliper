@@ -18,6 +18,7 @@ export function IkGizmo() {
   const robot = useStore((s) => s.robot);
   const frames = useStore((s) => s.frames);
   const playing = useStore((s) => s.playing);
+  const mode = useStore((s) => s.mode);
   const solveIkGoverned = useStore((s) => s.solveIkGoverned);
   const controls = useThree((s) => s.controls) as unknown as
     | { enabled: boolean }
@@ -38,7 +39,8 @@ export function IkGizmo() {
     return m;
   }, [tipMat]);
 
-  if (!robot || !tipMat || playing) return null; // gizmo hidden during playback
+  // gizmo hidden during playback + in simulate mode (the sim owns the pose)
+  if (!robot || !tipMat || playing || mode === "simulate") return null;
 
   const queue = (w: THREE.Matrix4) => {
     if (raf.current) return;

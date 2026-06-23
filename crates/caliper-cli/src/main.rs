@@ -1,9 +1,14 @@
 //! `caliper` — the command-line face of the engine.
 use caliper::dynamics::{self, GRAVITY_EARTH, Simulator};
+use caliper::hal::{
+    ControlLoop, DatasetReader, DatasetSpec, Gains, HoldSetpoint, JointMap, LeaderFollowerSource,
+    PhysicsSimBackend, Recorder, RobotBackend, SimBackend, replay_frame,
+};
 use caliper::ik::{IkOpts, ik};
 use caliper::kinematics::{JacFrame, Jacobian, SingularityParams, jacobian};
 use caliper::motion::{CartesianMoveOpts, MotionLimits, MotionLimitsConfig, move_j, move_l};
 use caliper::spatial::Se3;
+use caliper_collision::{CollisionModel, WorldScene};
 use clap::{Parser, Subcommand};
 use nalgebra::{Matrix3, UnitQuaternion, Vector3};
 use std::path::PathBuf;
@@ -112,6 +117,69 @@ enum Cmd {
         dt: f64,
         #[arg(long, default_value_t = 0.1)]
         print_dt: f64,
+    },
+    /// Run the deterministic control loop on a physical sim to a goal (Phase 5).
+    Run {
+        urdf: PathBuf,
+        /// Goal joint configuration (length = ndof).
+        #[arg(long, value_delimiter = ',', allow_hyphen_values = true)]
+        goal: Vec<f64>,
+        /// Start config (length = ndof). Defaults to all-zeros.
+        #[arg(long, value_delimiter = ',', allow_hyphen_values = true)]
+        start: Option<Vec<f64>>,
+        #[arg(long, default_value_t = 100.0)]
+        kp: f64,
+        #[arg(long, default_value_t = 20.0)]
+        kd: f64,
+        #[arg(long, default_value_t = 1e-3)]
+        dt: f64,
+        #[arg(long, default_value_t = 4000)]
+        ticks: usize,
+    },
+    /// Leader-follower teleop demo (pure sim): a follower tracks a scripted leader.
+    Teleop {
+        urdf: PathBuf,
+        #[arg(long, default_value_t = 3000)]
+        ticks: usize,
+        #[arg(long, default_value_t = 1e-3)]
+        dt: f64,
+    },
+    /// Run a control loop and record a LeRobotDataset v2.1 episode (Phase 5).
+    Record {
+        urdf: PathBuf,
+        /// Output dataset directory.
+        #[arg(long)]
+        out: PathBuf,
+        #[arg(long, value_delimiter = ',', allow_hyphen_values = true)]
+        goal: Vec<f64>,
+        #[arg(long, value_delimiter = ',', allow_hyphen_values = true)]
+        start: Option<Vec<f64>>,
+        #[arg(long, default_value_t = 2000)]
+        ticks: usize,
+        #[arg(long, default_value_t = 50)]
+        fps: u32,
+        #[arg(long, default_value = "caliper demo")]
+        task: String,
+    },
+    /// Replay a recorded LeRobotDataset episode through a sim backend (Phase 5).
+    Replay {
+        urdf: PathBuf,
+        #[arg(long)]
+        dataset: PathBuf,
+        #[arg(long, default_value_t = 0)]
+        episode: usize,
+    },
+    /// Check self/world collisions at a configuration (Phase 5).
+    Collide {
+        urdf: PathBuf,
+        #[arg(long, value_delimiter = ',', allow_hyphen_values = true)]
+        joints: Vec<f64>,
+        /// Add a solid ground half-space at z = <ground>.
+        #[arg(long)]
+        ground: Option<f64>,
+        /// Collider inflation margin (m).
+        #[arg(long, default_value_t = 0.0)]
+        margin: f64,
     },
 }
 
@@ -474,6 +542,224 @@ fn main() -> anyhow::Result<()> {
                 println!("  settled (|qd|max < 1e-3)");
             }
         }
+        Cmd::Run {
+            urdf,
+            goal,
+            start,
+            kp,
+            kd,
+            dt,
+            ticks,
+        } => {
+            let robot = caliper::model::Robot::from_urdf(&urdf)?;
+            let m = &robot.model;
+            anyhow::ensure!(
+                m.has_inertia,
+                "model '{}' has no <inertial>; control needs dynamics",
+                robot.name
+            );
+            anyhow::ensure!(goal.len() == m.ndof, "--goal needs {} values", m.ndof);
+            let start = start.unwrap_or_else(|| vec![0.0; m.ndof]);
+            anyhow::ensure!(start.len() == m.ndof, "--start needs {} values", m.ndof);
+            anyhow::ensure!(
+                goal.iter().chain(&start).all(|x| x.is_finite()),
+                "goal/start must be finite"
+            );
+            anyhow::ensure!(dt.is_finite() && dt > 0.0, "--dt must be > 0");
+            let model = Arc::new(m.clone());
+            let mut backend = PhysicsSimBackend::new(model.clone())?;
+            backend.set_state(&start, &vec![0.0; m.ndof])?;
+            let mut loopy = ControlLoop::new(backend, model, dt)?.with_gains(Gains { kp, kd });
+            let mut sp = HoldSetpoint::new(goal.clone());
+            loopy.run_to(&mut sp, ticks)?;
+            let q = loopy.backend().joint_positions();
+            let err = q
+                .iter()
+                .zip(&goal)
+                .map(|(a, b)| (a - b).powi(2))
+                .sum::<f64>()
+                .sqrt();
+            println!(
+                "RUN '{}'  ticks={ticks} dt={dt} kp={kp} kd={kd}",
+                robot.name
+            );
+            println!("  goal : [{}]", fmt_vec(&goal));
+            println!("  final: [{}]", fmt_vec(&q));
+            println!(
+                "  ||q - goal|| = {err:.3e}  ->  {}",
+                if err < 1e-2 { "PASS" } else { "FAIL" }
+            );
+        }
+        Cmd::Teleop { urdf, ticks, dt } => {
+            let robot = caliper::model::Robot::from_urdf(&urdf)?;
+            let m = &robot.model;
+            anyhow::ensure!(dt.is_finite() && dt > 0.0, "--dt must be > 0");
+            let n = m.ndof;
+            let model = Arc::new(m.clone());
+            let follower = SimBackend::new(n);
+            let leader = Box::new(SimBackend::new(n));
+            let mut src = LeaderFollowerSource::new(leader, JointMap::identity(n));
+            let mut loopy = ControlLoop::new(follower, model, dt)?;
+            let mut worst = 0.0f64;
+            for k in 0..ticks {
+                let t = k as f64 * dt;
+                // gentle leader sweep, starting from zero (no initial jump)
+                let lead: Vec<f64> = (0..n)
+                    .map(|i| 0.3 * (0.5 * t * (1.0 + 0.2 * i as f64)).sin())
+                    .collect();
+                src.leader_mut().command_joint_positions(&lead)?;
+                loopy.step(&mut src, None)?;
+                let fq = loopy.backend().joint_positions();
+                let e = fq
+                    .iter()
+                    .zip(&lead)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0, f64::max);
+                worst = worst.max(e);
+            }
+            println!(
+                "TELEOP '{}'  {n} dof, {ticks} ticks (leader→follower)",
+                robot.name
+            );
+            println!(
+                "  max |follower - leader| = {worst:.3e}  ->  {}",
+                if worst < 5e-2 { "PASS" } else { "FAIL" }
+            );
+        }
+        Cmd::Record {
+            urdf,
+            out,
+            goal,
+            start,
+            ticks,
+            fps,
+            task,
+        } => {
+            let robot = caliper::model::Robot::from_urdf(&urdf)?;
+            let m = &robot.model;
+            anyhow::ensure!(m.has_inertia, "model '{}' has no <inertial>", robot.name);
+            anyhow::ensure!(goal.len() == m.ndof, "--goal needs {} values", m.ndof);
+            anyhow::ensure!(fps > 0, "--fps must be > 0");
+            let start = start.unwrap_or_else(|| vec![0.0; m.ndof]);
+            anyhow::ensure!(start.len() == m.ndof, "--start needs {} values", m.ndof);
+            anyhow::ensure!(
+                goal.iter().chain(&start).all(|x| x.is_finite()),
+                "goal/start must be finite"
+            );
+            let model = Arc::new(m.clone());
+            let mut backend = PhysicsSimBackend::new(model.clone())?;
+            backend.set_state(&start, &vec![0.0; m.ndof])?;
+            let dt = 1.0 / fps as f64;
+            let mut loopy = ControlLoop::new(backend, model, dt)?;
+            let mut sp = HoldSetpoint::new(goal.clone());
+            let frames = loopy.run_record(&mut sp, ticks)?;
+            let mut rec = Recorder::create(&out, DatasetSpec::from_model(m, fps))?;
+            rec.start_episode(&task)?;
+            for f in &frames {
+                rec.append_control_frame(f)?;
+            }
+            rec.finalize_episode()?;
+            let root = rec.close()?;
+            println!("RECORD '{}'  ->  {}", robot.name, root.display());
+            println!("  episode 0: {ticks} frames @ {fps} fps, task = '{task}'");
+            println!("  data/chunk-000/episode_000000.parquet  (LeRobotDataset v2.1)");
+        }
+        Cmd::Replay {
+            urdf,
+            dataset,
+            episode,
+        } => {
+            let robot = caliper::model::Robot::from_urdf(&urdf)?;
+            let m = &robot.model;
+            let rd = DatasetReader::open(&dataset)?;
+            anyhow::ensure!(
+                rd.ndof == m.ndof,
+                "dataset ndof {} != robot ndof {}",
+                rd.ndof,
+                m.ndof
+            );
+            let ep = rd.read_episode(episode)?;
+            anyhow::ensure!(!ep.is_empty(), "episode {episode} is empty");
+            let mut b = SimBackend::new(m.ndof);
+            println!(
+                "REPLAY '{}'  episode {episode}: {} frames @ {} fps",
+                robot.name,
+                ep.len(),
+                rd.fps
+            );
+            for i in 0..ep.len() {
+                replay_frame(&mut b, &ep, i)?;
+                if i < 3 || i + 1 == ep.len() {
+                    println!(
+                        "  [{i:4}] t={:.3}  action=[{}]",
+                        ep.timestamps[i],
+                        fmt_vec(&b.joint_positions())
+                    );
+                }
+            }
+            let last = ep.len() - 1;
+            let err = b
+                .joint_positions()
+                .iter()
+                .zip(&ep.actions[last])
+                .map(|(a, c)| (a - c).abs())
+                .fold(0.0, f64::max);
+            println!(
+                "  round-trip |q - action_last| = {err:.3e}  ->  {}",
+                if err < 1e-6 { "PASS" } else { "FAIL" }
+            );
+        }
+        Cmd::Collide {
+            urdf,
+            joints,
+            ground,
+            margin,
+        } => {
+            let robot = caliper::model::Robot::from_urdf(&urdf)?;
+            let m = &robot.model;
+            anyhow::ensure!(
+                joints.len() == m.ndof,
+                "expected {} joint value(s), got {}",
+                m.ndof,
+                joints.len()
+            );
+            anyhow::ensure!(
+                joints.iter().all(|x| x.is_finite()),
+                "joints contains a non-finite value"
+            );
+            let model = Arc::new(m.clone());
+            let mut scene = WorldScene::new();
+            if let Some(z) = ground {
+                scene = scene.with_ground(z);
+            }
+            let cm = CollisionModel::new(model, scene, margin);
+            let rep = cm.query(&joints)?;
+            println!(
+                "COLLIDE '{}'  ({} colliders)",
+                robot.name,
+                cm.num_colliders()
+            );
+            let uncovered = cm.uncovered_frames();
+            if uncovered > 0 {
+                println!(
+                    "  ⚠ {uncovered} frame(s) have NO collider (mesh/none) — collisions there are NOT detected"
+                );
+            }
+            println!("  collision: {}", rep.has_collision());
+            for (a, b) in &rep.self_pairs {
+                println!("  self : {} <-> {}", m.frame_name(*a), m.frame_name(*b));
+            }
+            for f in &rep.world_hits {
+                println!("  world: {}", m.frame_name(*f));
+            }
+        }
     }
     Ok(())
+}
+
+fn fmt_vec(v: &[f64]) -> String {
+    v.iter()
+        .map(|x| format!("{x:.4}"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }

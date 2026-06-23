@@ -1,5 +1,10 @@
 //! Python bindings (`import caliper`) — the scripting / analysis face.
 use caliper::dynamics::{self, DynError, GRAVITY_EARTH};
+use caliper::hal::{
+    ControlLoop as EngineLoop, DatasetReader as EngineReader, DatasetSpec, Gains, HoldSetpoint,
+    JointMap, LeaderFollowerSource, PhysicsSimBackend, Recorder as EngineRecorder, RobotBackend,
+    SafetyConfig, SafetyMonitor as EngineMonitor, SimBackend,
+};
 use caliper::ik::{IkOpts, ik};
 use caliper::kinematics::{JacFrame, Jacobian, SingularityKind, SingularityParams, jacobian};
 use caliper::motion::{
@@ -7,9 +12,11 @@ use caliper::motion::{
     move_j, move_l,
 };
 use caliper::spatial::Se3;
+use caliper_collision::{CollisionError, CollisionModel as EngineCollision, WorldScene};
 use nalgebra::{DMatrix, Matrix3, UnitQuaternion, Vector3};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
+use std::sync::Arc;
 
 /// Engine version string.
 #[pyfunction]
@@ -613,6 +620,12 @@ fn grav(g: Option<[f64; 3]>) -> Vector3<f64> {
 fn dyn_err(e: DynError) -> PyErr {
     pyo3::exceptions::PyValueError::new_err(e.to_string())
 }
+fn hal_err(e: caliper::hal::Error) -> PyErr {
+    pyo3::exceptions::PyValueError::new_err(e.to_string())
+}
+fn col_err(e: CollisionError) -> PyErr {
+    pyo3::exceptions::PyValueError::new_err(e.to_string())
+}
 
 /// A torque-driven gravity simulator (fixed-base, no contact).
 #[pyclass]
@@ -761,6 +774,357 @@ fn dmatrix_to_rows(m: &DMatrix<f64>) -> Vec<Vec<f64>> {
         .collect()
 }
 
+// ===== Phase 5: control loop, dataset, collision, safety, teleop =====
+
+/// A deterministic computed-torque control loop over a physical sim backend.
+#[pyclass]
+struct ControlLoop {
+    inner: EngineLoop<PhysicsSimBackend>,
+    ndof: usize,
+}
+
+#[pymethods]
+impl ControlLoop {
+    #[new]
+    #[pyo3(signature = (robot, dt=1e-3, kp=100.0, kd=20.0, gravity=None, start=None))]
+    fn new(
+        robot: &Robot,
+        dt: f64,
+        kp: f64,
+        kd: f64,
+        gravity: Option<[f64; 3]>,
+        start: Option<Vec<f64>>,
+    ) -> PyResult<Self> {
+        let m = &robot.inner.model;
+        if !m.has_inertia {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "robot has no <inertial> data; control needs dynamics",
+            ));
+        }
+        let model = Arc::new(m.clone());
+        let mut backend = PhysicsSimBackend::new(model.clone()).map_err(hal_err)?;
+        if let Some(q0) = start {
+            if q0.len() != m.ndof {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "start length {} != ndof {}",
+                    q0.len(),
+                    m.ndof
+                )));
+            }
+            finite_or_err("start", &q0)?;
+            backend
+                .set_state(&q0, &vec![0.0; m.ndof])
+                .map_err(hal_err)?;
+        }
+        let mut inner = EngineLoop::new(backend, model, dt)
+            .map_err(hal_err)?
+            .with_gains(Gains { kp, kd });
+        if let Some(g) = gravity {
+            inner = inner.with_gravity(grav(Some(g)));
+        }
+        Ok(ControlLoop {
+            inner,
+            ndof: m.ndof,
+        })
+    }
+
+    /// Regulate to `goal` for `ticks` steps (no recording).
+    fn run_to(&mut self, goal: Vec<f64>, ticks: usize) -> PyResult<()> {
+        self.check_goal(&goal)?;
+        let mut sp = HoldSetpoint::new(goal);
+        self.inner.run_to(&mut sp, ticks).map_err(hal_err)
+    }
+
+    /// Regulate to `goal`, recording each tick. Returns (times, states, actions),
+    /// where `states` = measured q (observation.state) and `actions` = commanded q.
+    #[allow(clippy::type_complexity)]
+    fn rollout_to(
+        &mut self,
+        goal: Vec<f64>,
+        ticks: usize,
+    ) -> PyResult<(Vec<f64>, Vec<Vec<f64>>, Vec<Vec<f64>>)> {
+        self.check_goal(&goal)?;
+        let mut sp = HoldSetpoint::new(goal);
+        let frames = self.inner.run_record(&mut sp, ticks).map_err(hal_err)?;
+        let times = frames.iter().map(|f| f.t).collect();
+        let states = frames.iter().map(|f| f.measured.clone()).collect();
+        let actions = frames.iter().map(|f| f.command.clone()).collect();
+        Ok((times, states, actions))
+    }
+
+    /// Latch an e-stop (loop + backend).
+    fn estop(&mut self) -> PyResult<()> {
+        self.inner.estop().map_err(hal_err)
+    }
+
+    #[getter]
+    fn q(&self) -> Vec<f64> {
+        self.inner.backend().joint_positions()
+    }
+    #[getter]
+    fn qd(&mut self) -> PyResult<Vec<f64>> {
+        Ok(self
+            .inner
+            .backend_mut()
+            .read_state()
+            .map_err(hal_err)?
+            .qd_or_zero())
+    }
+    #[getter]
+    fn time(&self) -> f64 {
+        self.inner.time()
+    }
+    #[getter]
+    fn tick(&self) -> u64 {
+        self.inner.tick()
+    }
+    fn __repr__(&self) -> String {
+        format!(
+            "ControlLoop(ndof={}, t={:.3}s)",
+            self.ndof,
+            self.inner.time()
+        )
+    }
+}
+
+impl ControlLoop {
+    fn check_goal(&self, goal: &[f64]) -> PyResult<()> {
+        if goal.len() != self.ndof {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "goal length {} != ndof {}",
+                goal.len(),
+                self.ndof
+            )));
+        }
+        finite_or_err("goal", goal)
+    }
+}
+
+/// Writes a LeRobotDataset v2.1 episode to disk.
+#[pyclass]
+struct Recorder {
+    inner: Option<EngineRecorder>,
+}
+
+#[pymethods]
+impl Recorder {
+    #[new]
+    #[pyo3(signature = (robot, out, fps=30))]
+    fn new(robot: &Robot, out: &str, fps: u32) -> PyResult<Self> {
+        let spec = DatasetSpec::from_model(&robot.inner.model, fps);
+        let inner = EngineRecorder::create(out, spec).map_err(hal_err)?;
+        Ok(Recorder { inner: Some(inner) })
+    }
+    fn start_episode(&mut self, task: &str) -> PyResult<()> {
+        self.get()?.start_episode(task).map_err(hal_err)
+    }
+    fn append(&mut self, state: Vec<f64>, action: Vec<f64>, t: f64) -> PyResult<()> {
+        finite_or_err("state", &state)?;
+        finite_or_err("action", &action)?;
+        self.get()?
+            .append_frame(&state, &action, t)
+            .map_err(hal_err)
+    }
+    fn finalize_episode(&mut self) -> PyResult<()> {
+        self.get()?.finalize_episode().map_err(hal_err)
+    }
+    /// Finalize the dataset (writes meta/) and return its path. Consumes the recorder.
+    fn close(&mut self) -> PyResult<String> {
+        let rec = self
+            .inner
+            .take()
+            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("recorder already closed"))?;
+        rec.close()
+            .map(|p| p.display().to_string())
+            .map_err(hal_err)
+    }
+}
+
+impl Recorder {
+    fn get(&mut self) -> PyResult<&mut EngineRecorder> {
+        self.inner
+            .as_mut()
+            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("recorder is closed"))
+    }
+}
+
+/// Reads a LeRobotDataset v2.1 from disk.
+#[pyclass]
+struct DatasetReader {
+    inner: EngineReader,
+}
+
+#[pymethods]
+impl DatasetReader {
+    #[staticmethod]
+    fn open(path: &str) -> PyResult<Self> {
+        EngineReader::open(path)
+            .map(|inner| DatasetReader { inner })
+            .map_err(hal_err)
+    }
+    #[getter]
+    fn total_episodes(&self) -> usize {
+        self.inner.total_episodes
+    }
+    #[getter]
+    fn ndof(&self) -> usize {
+        self.inner.ndof
+    }
+    #[getter]
+    fn fps(&self) -> u32 {
+        self.inner.fps
+    }
+    /// Read an episode → (states, actions, timestamps).
+    #[allow(clippy::type_complexity)]
+    fn read_episode(&self, episode: usize) -> PyResult<(Vec<Vec<f64>>, Vec<Vec<f64>>, Vec<f64>)> {
+        let e = self.inner.read_episode(episode).map_err(hal_err)?;
+        Ok((e.states, e.actions, e.timestamps))
+    }
+}
+
+/// Configuration-space collision checker (self + world).
+#[pyclass]
+struct CollisionModel {
+    inner: EngineCollision,
+}
+
+#[pymethods]
+impl CollisionModel {
+    #[new]
+    #[pyo3(signature = (robot, ground=None, boxes=None, margin=0.0))]
+    fn new(
+        robot: &Robot,
+        ground: Option<f64>,
+        boxes: Option<Vec<([f64; 3], [f64; 3])>>,
+        margin: f64,
+    ) -> PyResult<Self> {
+        let model = Arc::new(robot.inner.model.clone());
+        let mut scene = WorldScene::new();
+        if let Some(z) = ground {
+            scene = scene.with_ground(z);
+        }
+        for (c, h) in boxes.unwrap_or_default() {
+            scene = scene.add_box(c, h);
+        }
+        Ok(CollisionModel {
+            inner: EngineCollision::new(model, scene, margin),
+        })
+    }
+    #[getter]
+    fn num_colliders(&self) -> usize {
+        self.inner.num_colliders()
+    }
+    #[getter]
+    fn uncovered_frames(&self) -> usize {
+        self.inner.uncovered_frames()
+    }
+    /// Query at `q` → dict(collision, self_pairs, world_hits, colliding_frames).
+    fn query(&self, py: Python<'_>, q: Vec<f64>) -> PyResult<Py<PyDict>> {
+        finite_or_err("q", &q)?;
+        let r = self.inner.query(&q).map_err(col_err)?;
+        let d = PyDict::new(py);
+        d.set_item("collision", r.has_collision())?;
+        let pairs: Vec<(usize, usize)> = r.self_pairs.clone();
+        d.set_item("self_pairs", pairs)?;
+        d.set_item("world_hits", r.world_hits.clone())?;
+        d.set_item("colliding_frames", r.colliding_frames.clone())?;
+        Ok(d.into())
+    }
+}
+
+/// The pure safety monitor: position clamp, velocity rate-limit, e-stop latch.
+#[pyclass]
+struct SafetyMonitor {
+    inner: EngineMonitor,
+    dt: f64,
+}
+
+#[pymethods]
+impl SafetyMonitor {
+    #[new]
+    #[pyo3(signature = (robot, q0, dt=1e-3))]
+    fn new(robot: &Robot, q0: Vec<f64>, dt: f64) -> PyResult<Self> {
+        if q0.len() != robot.inner.model.ndof {
+            return Err(pyo3::exceptions::PyValueError::new_err("q0 length != ndof"));
+        }
+        finite_or_err("q0", &q0)?;
+        let cfg = SafetyConfig::from_model(&robot.inner.model);
+        Ok(SafetyMonitor {
+            inner: EngineMonitor::new(cfg, &q0),
+            dt,
+        })
+    }
+    /// Sanitize a desired target → (safe_q, dict(clamped_position, limited_velocity, estopped, ok)).
+    fn gate(&mut self, py: Python<'_>, desired: Vec<f64>) -> PyResult<(Vec<f64>, Py<PyDict>)> {
+        finite_or_err("desired", &desired)?;
+        let (safe, v) = self.inner.gate(&desired, self.dt);
+        let d = PyDict::new(py);
+        d.set_item("clamped_position", v.clamped_position)?;
+        d.set_item("limited_velocity", v.limited_velocity)?;
+        d.set_item("estopped", v.estopped)?;
+        d.set_item("ok", v.ok())?;
+        Ok((safe, d.into()))
+    }
+    fn estop(&mut self) {
+        self.inner.estop();
+    }
+    fn clear_estop(&mut self) {
+        self.inner.clear_estop();
+    }
+    #[getter]
+    fn is_estopped(&self) -> bool {
+        self.inner.is_estopped()
+    }
+    #[getter]
+    fn warn_count(&self) -> u64 {
+        self.inner.warn_count
+    }
+}
+
+/// Leader-follower teleop in pure sim: a follower control loop tracks a leader.
+/// `unsendable` because it holds a `Box<dyn RobotBackend>` (Send but not Sync);
+/// the object is GIL-bound, which is fine for a single-threaded teleop demo.
+#[pyclass(unsendable)]
+struct LeaderFollower {
+    loopy: EngineLoop<SimBackend>,
+    src: LeaderFollowerSource,
+    ndof: usize,
+}
+
+#[pymethods]
+impl LeaderFollower {
+    #[new]
+    #[pyo3(signature = (robot, dt=1e-3))]
+    fn new(robot: &Robot, dt: f64) -> PyResult<Self> {
+        let n = robot.inner.model.ndof;
+        let model = Arc::new(robot.inner.model.clone());
+        let follower = SimBackend::new(n);
+        let leader = Box::new(SimBackend::new(n));
+        let src = LeaderFollowerSource::new(leader, JointMap::identity(n));
+        let loopy = EngineLoop::new(follower, model, dt).map_err(hal_err)?;
+        Ok(LeaderFollower {
+            loopy,
+            src,
+            ndof: n,
+        })
+    }
+    /// Move the leader to `lead`, step the follower once, return the follower q.
+    fn step(&mut self, lead: Vec<f64>) -> PyResult<Vec<f64>> {
+        if lead.len() != self.ndof {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "lead length != ndof",
+            ));
+        }
+        finite_or_err("lead", &lead)?;
+        self.src
+            .leader_mut()
+            .command_joint_positions(&lead)
+            .map_err(hal_err)?;
+        self.loopy.step(&mut self.src, None).map_err(hal_err)?;
+        Ok(self.loopy.backend().joint_positions())
+    }
+}
+
 #[pymodule]
 fn _caliper(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", caliper::VERSION)?;
@@ -769,5 +1133,11 @@ fn _caliper(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Trajectory>()?;
     m.add_class::<MotionLimits>()?;
     m.add_class::<Simulator>()?;
+    m.add_class::<ControlLoop>()?;
+    m.add_class::<Recorder>()?;
+    m.add_class::<DatasetReader>()?;
+    m.add_class::<CollisionModel>()?;
+    m.add_class::<SafetyMonitor>()?;
+    m.add_class::<LeaderFollower>()?;
     Ok(())
 }

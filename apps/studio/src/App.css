@@ -390,6 +390,10 @@ body,
 .sim-panel .badge.ok {
   color: #5aff7a;
 }
+.sim-panel .badge.bad {
+  color: #ff6b6b;
+  background: #2a1414;
+}
 .sim-panel .hint {
   margin: 0;
   color: #6c6c7a;

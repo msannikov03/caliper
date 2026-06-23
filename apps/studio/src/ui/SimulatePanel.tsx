@@ -7,6 +7,9 @@ export function SimulatePanel() {
   const simDamping = useStore((s) => s.simDamping);
   const simTraj = useStore((s) => s.simTraj);
   const run = useStore((s) => s.runGravityDrop);
+  const runControl = useStore((s) => s.runControl);
+  const checkCollision = useStore((s) => s.checkCollision);
+  const collision = useStore((s) => s.collision);
   if (mode !== "simulate" || !robot) return null;
   const noInertia = !robot.hasInertia;
   const driftPct = simTraj ? (simTraj.energyDrift * 100).toFixed(3) : null;
@@ -21,6 +24,31 @@ export function SimulatePanel() {
       >
         ⤓ Gravity drop
       </button>
+      <button
+        disabled={noInertia}
+        title={noInertia ? "robot has no inertial data" : "computed-torque control back to home"}
+        onClick={() => void runControl(new Array(robot.ndof).fill(0))}
+      >
+        ⌖ Drive to home
+      </button>
+      <button onClick={() => void checkCollision(null)}>⚠ Check collision</button>
+      {collision && (
+        <div className="sim-badges">
+          <span className={collision.collision ? "badge bad" : "badge ok"}>
+            {collision.collision ? "COLLISION" : "clear"}
+          </span>
+          {collision.selfPairs.map(([a, b], i) => (
+            <span className="badge bad" key={i}>
+              {a} ↔ {b}
+            </span>
+          ))}
+          {collision.worldHits.map((f, i) => (
+            <span className="badge bad" key={`w${i}`}>
+              {f} · world
+            </span>
+          ))}
+        </div>
+      )}
       <label>
         <input
           type="checkbox"

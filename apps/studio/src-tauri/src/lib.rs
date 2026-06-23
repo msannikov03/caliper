@@ -11,6 +11,7 @@
 //! (`m[col*4 + row]`). `col_major_from_se3` / `se3_from_col_major` are exact
 //! inverses (round-trip ≈ 4.5e-16, verified by `mat_roundtrip` below).
 use caliper::dynamics::{Simulator, GRAVITY_EARTH};
+use caliper::hal::{ControlLoop, Gains, HoldSetpoint, PhysicsSimBackend, RobotBackend};
 use caliper::ik::{ik, IkOpts};
 use caliper::kinematics::{
     fk_frame, fk_joints, frame_pose, jacobian, JacFrame, Jacobian, SingularityGovernor,
@@ -21,6 +22,7 @@ use caliper::motion::{
     move_j, move_l, CartesianMoveOpts, MotionLimits, MotionLimitsConfig, PoseLibrary,
 };
 use caliper::spatial::Se3;
+use caliper_collision::{CollisionModel, WorldScene};
 use nalgebra::{
     Cholesky, DVector, Isometry3, Matrix3, SymmetricEigen, Translation3, UnitQuaternion, Vector3,
 };
@@ -1045,6 +1047,200 @@ fn dynamics_at(
     })
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ControlRunReq {
+    q_start: Vec<f64>,
+    goal: Vec<f64>,
+    kp: Option<f64>,
+    kd: Option<f64>,
+    gravity: Option<[f64; 3]>,
+    duration: Option<f64>,
+    dt: Option<f64>, // render dt; control runs internally at 1 kHz
+}
+
+/// Drive the arm to `goal` with the computed-torque control loop, baking the
+/// closed-loop motion into a render-only trajectory the frontend plays through
+/// the SAME Phase-3 transport (kind = "control").
+#[tauri::command]
+fn control_run(
+    req: ControlRunReq,
+    state: tauri::State<'_, AppState>,
+) -> Result<SimTrajectoryDto, String> {
+    let guard = state.model.lock().map_err(|_| "state lock poisoned")?;
+    let model = guard.as_ref().ok_or("no robot loaded")?;
+    if !model.has_inertia {
+        return Err(
+            "this robot has no inertial data — load one with <inertial> (showcase6 or dyn_pendulum2)"
+                .into(),
+        );
+    }
+    let n = model.ndof;
+    if req.q_start.len() != n || req.goal.len() != n {
+        return Err(format!("expected {n} joint values for q_start and goal"));
+    }
+    if req.q_start.iter().chain(&req.goal).any(|x| !x.is_finite()) {
+        return Err("q_start/goal contains a non-finite value".into());
+    }
+    if let Some(g) = req.gravity {
+        if g.iter().any(|x| !x.is_finite()) {
+            return Err("gravity contains a non-finite value".into());
+        }
+    }
+    let render_dt = req.dt.unwrap_or(0.02).clamp(2e-3, 0.1);
+    let duration = req.duration.unwrap_or(3.0).clamp(0.1, 30.0);
+    let kp = req.kp.unwrap_or(100.0);
+    let kd = req.kd.unwrap_or(20.0);
+    let gravity = req
+        .gravity
+        .map(|g| Vector3::new(g[0], g[1], g[2]))
+        .unwrap_or(GRAVITY_EARTH);
+
+    let arc = Arc::new(model.clone());
+    let mut backend = PhysicsSimBackend::new(arc.clone()).map_err(|e| e.to_string())?;
+    backend
+        .set_state(&req.q_start, &vec![0.0; n])
+        .map_err(|e| e.to_string())?;
+    let ctrl_dt = 1e-3;
+    let mut loopy = ControlLoop::new(backend, arc, ctrl_dt)
+        .map_err(|e| e.to_string())?
+        .with_gains(Gains { kp, kd })
+        .with_gravity(gravity);
+    let mut sp = HoldSetpoint::new(req.goal.clone());
+    let steps_per_sample = ((render_dt / ctrl_dt).round() as usize).max(1);
+    let nsamp = ((duration / render_dt).ceil() as usize).max(1);
+
+    let (mut times, mut qs, mut qds) = (vec![], vec![], vec![]);
+    let (mut tip_path, mut frames, mut energy) = (vec![], vec![], vec![]);
+    // sampler that does NOT capture the output vecs (so we can read them outside)
+    #[allow(clippy::type_complexity)]
+    let sample = |loopy: &mut ControlLoop<PhysicsSimBackend>| -> Result<
+        (f64, Vec<f64>, Vec<f64>, [f64; 3], Vec<[f64; 16]>, f64),
+        String,
+    > {
+        let q = loopy.backend().joint_positions();
+        let qd = loopy
+            .backend_mut()
+            .read_state()
+            .map_err(|e| e.to_string())?
+            .qd_or_zero();
+        let (fr, tp) = bake_frame_row(model, &q);
+        let e = loopy.backend().sim().total_energy();
+        Ok((loopy.time(), q, qd, tp, fr, e))
+    };
+    let (t, q, qd, tp, fr, e) = sample(&mut loopy)?;
+    times.push(t);
+    qs.push(q);
+    qds.push(qd);
+    tip_path.push(tp);
+    frames.push(fr);
+    energy.push(e);
+    let mut settled = false;
+    for _ in 0..nsamp {
+        for _ in 0..steps_per_sample {
+            loopy.step(&mut sp, None).map_err(|e| e.to_string())?;
+        }
+        let (t, q, qd, tp, fr, e) = sample(&mut loopy)?;
+        let qdmax = qd.iter().fold(0.0f64, |a, &x| a.max(x.abs()));
+        let qerr = q
+            .iter()
+            .zip(&req.goal)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f64::max);
+        times.push(t);
+        qs.push(q);
+        qds.push(qd);
+        tip_path.push(tp);
+        frames.push(fr);
+        energy.push(e);
+        if qdmax < 1e-3 && qerr < 1e-3 && loopy.time() > 0.1 {
+            settled = true;
+            break;
+        }
+    }
+    let e0 = energy.first().copied().unwrap_or(0.0);
+    let drift = (energy.last().copied().unwrap_or(e0) - e0).abs() / e0.abs().max(1e-6);
+    Ok(SimTrajectoryDto {
+        kind: "control".into(),
+        duration: *times.last().unwrap_or(&0.0),
+        ndof: n,
+        dt: render_dt,
+        times,
+        q: qs,
+        qd: qds,
+        tip_path,
+        frames,
+        energy,
+        energy_drift: drift,
+        settled,
+        gravity: gravity.into(),
+        damping: 0.0,
+        ok: true,
+        reached: 1.0,
+        max_jerk_ratio: 0.0,
+    })
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CollisionReq {
+    q: Vec<f64>,
+    ground: Option<f64>,
+    margin: Option<f64>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CollisionDto {
+    collision: bool,
+    /// Names of every link frame involved in a collision (for highlighting/labels).
+    colliding_frames: Vec<String>,
+    self_pairs: Vec<[String; 2]>,
+    world_hits: Vec<String>,
+    num_colliders: usize,
+    uncovered_frames: usize,
+}
+
+/// Check self/world collisions at a configuration (passive overlay query).
+#[tauri::command]
+fn check_collision(
+    req: CollisionReq,
+    state: tauri::State<'_, AppState>,
+) -> Result<CollisionDto, String> {
+    let guard = state.model.lock().map_err(|_| "state lock poisoned")?;
+    let model = guard.as_ref().ok_or("no robot loaded")?;
+    let n = model.ndof;
+    if req.q.len() != n {
+        return Err(format!("expected {n} joint values"));
+    }
+    if req.q.iter().any(|x| !x.is_finite()) {
+        return Err("q contains a non-finite value".into());
+    }
+    let arc = Arc::new(model.clone());
+    let mut scene = WorldScene::new();
+    if let Some(z) = req.ground {
+        if !z.is_finite() {
+            return Err("ground must be finite".into());
+        }
+        scene = scene.with_ground(z);
+    }
+    let cm = CollisionModel::new(arc, scene, req.margin.unwrap_or(0.0).max(0.0));
+    let rep = cm.query(&req.q).map_err(|e| e.to_string())?;
+    let name = |f: usize| model.frame_name(f).to_string();
+    Ok(CollisionDto {
+        collision: rep.has_collision(),
+        colliding_frames: rep.colliding_frames.iter().map(|&f| name(f)).collect(),
+        self_pairs: rep
+            .self_pairs
+            .iter()
+            .map(|&(a, b)| [name(a), name(b)])
+            .collect(),
+        world_hits: rep.world_hits.iter().map(|&f| name(f)).collect(),
+        num_colliders: cm.num_colliders(),
+        uncovered_frames: cm.uncovered_frames(),
+    })
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -1066,7 +1262,9 @@ pub fn run() {
             delete_pose,
             plan_move_to_pose,
             sim_drop,
-            dynamics_at
+            dynamics_at,
+            control_run,
+            check_collision
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -1204,5 +1402,52 @@ mod tests {
             "arm did not fall"
         );
         assert!(sim.total_energy() <= e0 + 1e-6, "damped energy increased");
+    }
+
+    #[test]
+    fn control_run_drives_toward_goal() {
+        // mirrors the control_run command path: computed-torque loop + bake.
+        let m = load("showcase6.urdf");
+        let arc = std::sync::Arc::new(m.clone());
+        let mut backend = PhysicsSimBackend::new(arc.clone()).unwrap();
+        let goal = vec![0.2, -0.1, 0.3, 0.0, 0.1, 0.0];
+        backend
+            .set_state(&vec![0.0; m.ndof], &vec![0.0; m.ndof])
+            .unwrap();
+        let mut loopy = ControlLoop::new(backend, arc, 1e-3).unwrap();
+        let mut sp = HoldSetpoint::new(goal.clone());
+        loopy.run_to(&mut sp, 8000).unwrap();
+        let q = loopy.backend().joint_positions();
+        let err = q
+            .iter()
+            .zip(&goal)
+            .map(|(a, b)| (a - b).powi(2))
+            .sum::<f64>()
+            .sqrt();
+        assert!(err < 1e-2, "control did not reach goal: err={err:e}");
+        // the bake the command uses yields one render matrix per drawn frame
+        let (fr, _tp) = bake_frame_row(&m, &q);
+        assert_eq!(fr.len(), frames_at(&m, &q).len());
+    }
+
+    #[test]
+    fn check_collision_names_folded_pair() {
+        let m = load("collide_arm.urdf");
+        let cm = CollisionModel::new(std::sync::Arc::new(m.clone()), WorldScene::new(), 0.0);
+        let rep = cm
+            .query(&[0.0, std::f64::consts::PI, std::f64::consts::PI])
+            .unwrap();
+        assert!(rep.has_collision());
+        let names: Vec<[String; 2]> = rep
+            .self_pairs
+            .iter()
+            .map(|&(a, b)| [m.frame_name(a).to_string(), m.frame_name(b).to_string()])
+            .collect();
+        assert!(
+            names
+                .iter()
+                .any(|p| p.contains(&"l1".to_string()) && p.contains(&"l3".to_string())),
+            "expected an l1<->l3 self-collision pair, got {names:?}"
+        );
     }
 }

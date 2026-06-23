@@ -15,6 +15,7 @@ test = false
 doctest = false
 
 [dependencies]
-caliper.workspace = true
+caliper = { workspace = true, features = ["dataset"] }
+caliper-collision.workspace = true
 pyo3.workspace = true
 nalgebra.workspace = true

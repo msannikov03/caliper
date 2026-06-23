@@ -6,6 +6,12 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = []
+# Opt-in LeRobotDataset record/replay (forwards to caliper-hal). OFF by default,
+# so the lean facade tree stays free of arrow/parquet.
+dataset = ["caliper-hal/dataset"]
+
 [dependencies]
 caliper-spatial.workspace = true
 caliper-model.workspace = true

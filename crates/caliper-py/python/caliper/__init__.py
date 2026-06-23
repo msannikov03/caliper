@@ -1,8 +1,14 @@
 """Caliper — a modern, open robotics engine (Python face)."""
 
 from ._caliper import (
+    CollisionModel,
+    ControlLoop,
+    DatasetReader,
+    LeaderFollower,
     MotionLimits,
+    Recorder,
     Robot,
+    SafetyMonitor,
     Simulator,
     Trajectory,
     __version__,
@@ -14,6 +20,12 @@ __all__ = [
     "Trajectory",
     "MotionLimits",
     "Simulator",
+    "ControlLoop",
+    "Recorder",
+    "DatasetReader",
+    "CollisionModel",
+    "SafetyMonitor",
+    "LeaderFollower",
     "version",
     "__version__",
 ]

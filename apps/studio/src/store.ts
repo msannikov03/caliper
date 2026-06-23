@@ -73,6 +73,14 @@ export interface SimTrajectoryDto extends TrajectoryDto {
   gravity: [number, number, number];
   damping: number;
 }
+export interface CollisionDto {
+  collision: boolean;
+  collidingFrames: string[];
+  selfPairs: [string, string][];
+  worldHits: string[];
+  numColliders: number;
+  uncoveredFrames: number;
+}
 export type StudioMode = "jog" | "motion" | "simulate";
 export interface NamedPoseDto {
   name: string;
@@ -131,6 +139,12 @@ interface StudioState {
   simTorque: number[];
   runGravityDrop: () => Promise<void>;
   clearSim: () => void;
+
+  // control + collision (Phase 5)
+  collision: CollisionDto | null;
+  runControl: (goal: number[]) => Promise<void>;
+  checkCollision: (ground?: number | null) => Promise<void>;
+  clearCollision: () => void;
 }
 
 export const useStore = create<StudioState>((set, get) => ({
@@ -153,6 +167,7 @@ export const useStore = create<StudioState>((set, get) => ({
   simGravity: true,
   simDamping: 0.2,
   simTorque: [],
+  collision: null,
 
   async loadRobot(path) {
     set({ loading: true, error: null });
@@ -400,6 +415,45 @@ export const useStore = create<StudioState>((set, get) => ({
     stopClock();
     set({ simTraj: null, playing: false, playhead: 0 });
     void get().refreshFrames();
+  },
+
+  // ---- control + collision (Phase 5) ----
+  async runControl(goal) {
+    const { q, robot } = get();
+    if (!robot) return;
+    if (!robot.hasInertia) {
+      set({ error: "this robot has no inertial data" });
+      return;
+    }
+    if (goal.length !== robot.ndof) {
+      set({ error: `goal needs ${robot.ndof} values` });
+      return;
+    }
+    try {
+      const simTraj = await invoke<SimTrajectoryDto>("control_run", {
+        req: { qStart: q, goal, duration: 4.0 },
+      });
+      set({ simTraj, traj: null, playhead: 0, playing: false });
+      get()._applyTrajAt(0);
+      get().play();
+    } catch (e) {
+      set({ error: String(e) });
+    }
+  },
+  async checkCollision(ground = null) {
+    const { q, robot } = get();
+    if (!robot) return;
+    try {
+      const collision = await invoke<CollisionDto>("check_collision", {
+        req: { q, ground },
+      });
+      set({ collision });
+    } catch (e) {
+      set({ error: String(e) });
+    }
+  },
+  clearCollision() {
+    set({ collision: null });
   },
 }));
 

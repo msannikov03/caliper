@@ -459,6 +459,13 @@ dependencies = [
 [[package]]
 name = "caliper-dynamics"
 version = "0.1.0"
+dependencies = [
+ "caliper-kinematics",
+ "caliper-model",
+ "caliper-spatial",
+ "nalgebra",
+ "thiserror 2.0.18",
+]
 
 [[package]]
 name = "caliper-hal"

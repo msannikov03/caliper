@@ -161,6 +161,53 @@ pub fn exp_prismatic(axis: &Vector3<f64>, q: f64) -> Se3 {
     Se3::exp(&Twist::from_vw(axis * q, Vector3::zeros()))
 }
 
+/// 6×6 spatial (rigid-body) inertia in **[v;ω]** block order, matching `Twist`.
+/// `G = [[ m·I₃, −m·[c]× ], [ m·[c]×, I_o ]]`, symmetric. Kinetic energy is
+/// `½·ξᵀ·G·ξ` for a body twist `ξ = [v;ω]` in this frame.
+#[derive(Clone, Copy, Debug)]
+pub struct SpatialInertia(pub Matrix6<f64>);
+
+impl SpatialInertia {
+    pub fn zero() -> Self {
+        SpatialInertia(Matrix6::zeros())
+    }
+
+    /// Build from mass, COM offset `c` (link frame), and the 3×3 inertia tensor
+    /// already expressed about the COM in LINK axes (caller did `Rc·Icom·Rcᵀ`).
+    /// Parallel-axis to the link origin: `I_o = i_com − m·[c]×[c]×`.
+    pub fn from_mass_com_inertia(m: f64, c: Vector3<f64>, i_com: Matrix3<f64>) -> Self {
+        let cx = skew(&c);
+        let i_o = i_com - m * (cx * cx);
+        let mut g = Matrix6::zeros();
+        g.fixed_view_mut::<3, 3>(0, 0)
+            .copy_from(&(m * Matrix3::identity()));
+        g.fixed_view_mut::<3, 3>(0, 3).copy_from(&(-(m * cx)));
+        g.fixed_view_mut::<3, 3>(3, 0).copy_from(&(m * cx));
+        g.fixed_view_mut::<3, 3>(3, 3).copy_from(&i_o);
+        SpatialInertia(g)
+    }
+
+    /// Re-express in a frame related by `X` (covariant congruence):
+    /// `G' = Ad(X)⁻ᵀ · G · Ad(X)⁻¹`. With `X = T_{parent←link}` this folds a
+    /// child link's inertia into the parent (anchor) frame.
+    pub fn transform(&self, x: &Se3) -> Self {
+        let adi = x.adjoint_inv();
+        SpatialInertia(adi.transpose() * self.0 * adi)
+    }
+    #[inline]
+    pub fn matrix(&self) -> &Matrix6<f64> {
+        &self.0
+    }
+    #[inline]
+    pub fn add(&self, o: &SpatialInertia) -> SpatialInertia {
+        SpatialInertia(self.0 + o.0)
+    }
+    #[inline]
+    pub fn mass(&self) -> f64 {
+        self.0[(0, 0)]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -291,5 +338,23 @@ mod tests {
         let offset = Se3::from_parts(Vector3::new(1.0, 0.0, 0.0), UnitQuaternion::identity());
         let p = (exp_revolute(&Vector3::z(), PI / 2.0) * offset).translation();
         assert!((p[0]).abs() < 1e-12 && (p[1] - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn spatial_inertia_transform_preserves_ke() {
+        // ½ξᵀGξ is frame-invariant under the physical twist re-expression ξ→Ad(X)⁻¹ξ.
+        let mut r = Rng(0x5111);
+        let g = SpatialInertia::from_mass_com_inertia(
+            2.3,
+            Vector3::new(0.1, -0.2, 0.05),
+            Matrix3::from_diagonal(&Vector3::new(0.04, 0.05, 0.03)),
+        );
+        let x = Se3::exp(&r.twist());
+        let gp = g.transform(&x);
+        let xi = r.twist().0; // twist in the parent frame
+        let xi_child = x.adjoint_inv() * xi; // same physical twist in child frame
+        let ke_parent = 0.5 * (xi.transpose() * gp.0 * xi)[(0, 0)];
+        let ke_child = 0.5 * (xi_child.transpose() * g.0 * xi_child)[(0, 0)];
+        assert!((ke_parent - ke_child).abs() < 1e-9);
     }
 }

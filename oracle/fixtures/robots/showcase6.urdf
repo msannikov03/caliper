@@ -5,10 +5,14 @@
   render. ~0.45m typical reach. Z-up base.
 
   NOTE: the <visual> primitive geometry below is IGNORED by the engine — caliper's
-  compile() reads ONLY joint type / origin / axis / limit (see crates/caliper-model).
-  Visuals exist purely so an optional urdf-loader cross-render has something to draw;
-  the engine-driven procedural render is the source of truth. Adding/removing visuals
-  cannot change the Pinocchio-validated kinematics.
+  compile() reads ONLY joint type / origin / axis / limit / inertial. Visuals exist
+  purely so an optional urdf-loader cross-render has something to draw; the engine-
+  driven procedural render is the source of truth. Adding/removing visuals cannot
+  change the Pinocchio-validated kinematics.
+
+  Phase 4: each link carries an <inertial> (solid-primitive inertia about its COM)
+  so RNEA/CRBA/forward-dynamics have mass to work with. compile() does not read
+  <inertial> for kinematics, so FK/Jacobian/IK/analysis stay byte-identical.
 -->
 <robot name="showcase6">
   <link name="base">
@@ -16,42 +20,56 @@
       <origin xyz="0 0 0.007" rpy="0 0 0"/>
       <geometry><cylinder radius="0.09" length="0.014"/></geometry>
     </visual>
+    <inertial><origin xyz="0 0 0.007" rpy="0 0 0"/><mass value="2.0"/>
+      <inertia ixx="0.00408" ixy="0" ixz="0" iyy="0.00408" iyz="0" izz="0.00810"/></inertial>
   </link>
   <link name="shoulder">
     <visual>
       <origin xyz="0 0 0" rpy="0 0 0"/>
       <geometry><cylinder radius="0.05" length="0.12"/></geometry>
     </visual>
+    <inertial><origin xyz="0 0 0" rpy="0 0 0"/><mass value="1.6"/>
+      <inertia ixx="0.00288" ixy="0" ixz="0" iyy="0.00288" iyz="0" izz="0.00200"/></inertial>
   </link>
   <link name="upper_arm">
     <visual>
       <origin xyz="0 0 0.09" rpy="0 0 0"/>
       <geometry><box size="0.06 0.06 0.18"/></geometry>
     </visual>
+    <inertial><origin xyz="0 0 0.09" rpy="0 0 0"/><mass value="1.2"/>
+      <inertia ixx="0.00360" ixy="0" ixz="0" iyy="0.00360" iyz="0" izz="0.00072"/></inertial>
   </link>
   <link name="forearm">
     <visual>
       <origin xyz="0 0 0.08" rpy="0 0 0"/>
       <geometry><box size="0.05 0.05 0.16"/></geometry>
     </visual>
+    <inertial><origin xyz="0 0 0.08" rpy="0 0 0"/><mass value="0.9"/>
+      <inertia ixx="0.00211" ixy="0" ixz="0" iyy="0.00211" iyz="0" izz="0.000375"/></inertial>
   </link>
   <link name="wrist1">
     <visual>
       <origin xyz="0 0 0" rpy="0 0 0"/>
       <geometry><cylinder radius="0.035" length="0.06"/></geometry>
     </visual>
+    <inertial><origin xyz="0 0 0" rpy="0 0 0"/><mass value="0.5"/>
+      <inertia ixx="0.000303" ixy="0" ixz="0" iyy="0.000303" iyz="0" izz="0.000306"/></inertial>
   </link>
   <link name="wrist2">
     <visual>
       <origin xyz="0 0 0" rpy="1.5708 0 0"/>
       <geometry><cylinder radius="0.035" length="0.05"/></geometry>
     </visual>
+    <inertial><origin xyz="0 0 0" rpy="1.5708 0 0"/><mass value="0.4"/>
+      <inertia ixx="0.0002058" ixy="0" ixz="0" iyy="0.0002058" iyz="0" izz="0.000245"/></inertial>
   </link>
   <link name="flange">
     <visual>
       <origin xyz="0 0 0.015" rpy="0 0 0"/>
       <geometry><cylinder radius="0.03" length="0.03"/></geometry>
     </visual>
+    <inertial><origin xyz="0 0 0.015" rpy="0 0 0"/><mass value="0.3"/>
+      <inertia ixx="0.00009" ixy="0" ixz="0" iyy="0.00009" iyz="0" izz="0.000135"/></inertial>
   </link>
 
   <joint name="j1" type="revolute">

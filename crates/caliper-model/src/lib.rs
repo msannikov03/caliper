@@ -4,8 +4,8 @@
 //! topological order (parent index < own index), fixed joints folded away, and
 //! every link exposed as a queryable/renderable frame. Algorithms (FK, Jacobian,
 //! IK) are free functions over `(&Model, &[f64])`.
-use caliper_spatial::Se3;
-use nalgebra::{Isometry3, Translation3, UnitQuaternion, Vector3};
+use caliper_spatial::{Se3, SpatialInertia};
+use nalgebra::{Isometry3, Matrix3, Translation3, UnitQuaternion, Vector3};
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -68,6 +68,13 @@ pub struct Model {
     pub effort_limit: Vec<Option<f64>>,
     pub frames: Vec<LinkFrame>,
     pub frame_index: HashMap<String, usize>,
+    /// Per-movable-link spatial inertia (len == ndof), expressed in that joint's
+    /// OWN frame at q=0, with all fixed-welded descendant links folded in. Zero
+    /// for any movable link whose `<inertial>` (or a folded descendant's) was absent.
+    pub inertia: Vec<SpatialInertia>,
+    /// True iff every movable link AND every fixed link folded onto a movable
+    /// parent carried a real `<inertial>` (mass>0). Dynamics entry points gate on this.
+    pub has_inertia: bool,
 }
 
 impl Model {
@@ -141,6 +148,8 @@ struct EditJoint {
 struct RobotTree {
     name: String,
     links: Vec<String>,
+    /// Parallel to `links`: parsed `<inertial>` (None when absent).
+    link_inertia: Vec<Option<SpatialInertia>>,
     joints: Vec<EditJoint>,
     link_index: HashMap<String, usize>,
 }
@@ -155,6 +164,7 @@ impl RobotTree {
         for l in &u.links {
             t.link_index.insert(l.name.clone(), t.links.len());
             t.links.push(l.name.clone());
+            t.link_inertia.push(parse_inertial(&l.inertial));
         }
         for j in &u.joints {
             let parent = *t
@@ -207,6 +217,29 @@ fn pose_to_se3(p: &urdf_rs::Pose) -> Se3 {
         Translation3::new(x, y, z),
         UnitQuaternion::from_euler_angles(r, pi, ya),
     ))
+}
+
+/// Parse a urdf-rs `<inertial>` into a link-frame `SpatialInertia`, or `None` when
+/// the block was absent. urdf-rs defaults a MISSING `<inertial>` to mass=0 + zero
+/// tensor (`Link.inertial` is non-Option, `#[serde(default)]`) — so `mass<=0` means
+/// "absent", which is exactly what gates `has_inertia`.
+fn parse_inertial(inr: &urdf_rs::Inertial) -> Option<SpatialInertia> {
+    let m = inr.mass.value;
+    if !(m.is_finite() && m > 0.0) {
+        return None; // missing, NaN, or non-physical mass → treat as absent
+    }
+    let [cx, cy, cz] = inr.origin.xyz.0;
+    let [rr, rp, ry] = inr.origin.rpy.0;
+    let com = Vector3::new(cx, cy, cz);
+    let i = &inr.inertia;
+    // tensor about the COM, in the COM-rpy-rotated axes
+    let i_com = Matrix3::new(
+        i.ixx, i.ixy, i.ixz, i.ixy, i.iyy, i.iyz, i.ixz, i.iyz, i.izz,
+    );
+    // rotate into LINK axes: Ic = Rc · Icom · Rcᵀ
+    let rc = UnitQuaternion::from_euler_angles(rr, rp, ry).to_rotation_matrix();
+    let i_link = rc.into_inner() * i_com * rc.into_inner().transpose();
+    Some(SpatialInertia::from_mass_com_inertia(m, com, i_link))
 }
 
 /// A URDF limit is meaningful only when `lower < upper`; otherwise treat the
@@ -262,9 +295,15 @@ fn compile(t: &RobotTree) -> Result<Model, CompileError> {
         effort_limit: vec![],
         frames: vec![],
         frame_index: HashMap::new(),
+        inertia: vec![],
+        has_inertia: false,
     };
     // per link: (nearest movable-joint ancestor, accumulated fixed offset from it)
     let mut anchor: Vec<(Option<usize>, Se3)> = vec![(None, Se3::identity()); nlinks];
+    // per-MOVABLE-joint composite spatial inertia in that joint's frame, summed over
+    // the movable link itself + every fixed-welded descendant (folded). Grows with ndof.
+    let mut inertia_accum: Vec<SpatialInertia> = Vec::new();
+    let mut full_inertia = true; // false if any contributing link lacked <inertial>
     register_frame(&mut m, &t.links[root], None, Se3::identity());
 
     let mut stack = vec![root];
@@ -277,6 +316,16 @@ fn compile(t: &RobotTree) -> Result<Model, CompileError> {
                 RawKind::Fixed => {
                     anchor[j.child] = (anc, placement);
                     register_frame(&mut m, &t.links[j.child], anc, placement);
+                    // fold this fixed link's inertia onto its movable anchor (if any);
+                    // anc == None means a fixed chain off the world → dropped (fixed-base).
+                    if let Some(ai) = anc {
+                        match t.link_inertia[j.child] {
+                            Some(g) => {
+                                inertia_accum[ai] = inertia_accum[ai].add(&g.transform(&placement))
+                            }
+                            None => full_inertia = false,
+                        }
+                    }
                 }
                 RawKind::Revolute | RawKind::Prismatic => {
                     let mi = m.ndof;
@@ -296,6 +345,15 @@ fn compile(t: &RobotTree) -> Result<Model, CompileError> {
                     m.effort_limit.push(j.effort);
                     anchor[j.child] = (Some(mi), Se3::identity());
                     register_frame(&mut m, &t.links[j.child], Some(mi), Se3::identity());
+                    // seed this movable joint's composite with its own child link
+                    // (placement is identity in the joint's own frame).
+                    match t.link_inertia[j.child] {
+                        Some(g) => inertia_accum.push(g),
+                        None => {
+                            inertia_accum.push(SpatialInertia::zero());
+                            full_inertia = false;
+                        }
+                    }
                     m.ndof += 1;
                 }
             }
@@ -311,6 +369,8 @@ fn compile(t: &RobotTree) -> Result<Model, CompileError> {
             .unwrap_or_default();
         return Err(CompileError::Disconnected(orphan));
     }
+    m.inertia = inertia_accum;
+    m.has_inertia = full_inertia && m.ndof > 0;
     Ok(m)
 }
 
@@ -354,6 +414,45 @@ mod tests {
         let p = load("prismatic.urdf");
         assert_eq!(p.vel_limit, vec![Some(3.0), Some(1.0)]);
         assert_eq!(p.effort_limit, vec![Some(10.0), Some(10.0)]);
+    }
+
+    #[test]
+    fn inertia_does_not_change_kinematics() {
+        // adding <inertial> to showcase6 leaves every kinematic array intact.
+        let m = load("showcase6.urdf");
+        assert_eq!(m.ndof, 6);
+        assert_eq!(m.joint_names, vec!["j1", "j2", "j3", "j4", "j5", "j6"]);
+        assert_eq!(
+            m.parent,
+            vec![None, Some(0), Some(1), Some(2), Some(3), Some(4)]
+        );
+        assert!(
+            m.has_inertia,
+            "showcase6 must carry inertial data after Phase 4"
+        );
+        assert_eq!(m.inertia.len(), 6);
+        for g in &m.inertia {
+            assert!(g.mass() > 0.0);
+        }
+    }
+
+    #[test]
+    fn bare_fixture_reports_no_inertia() {
+        let m = load("toy.urdf");
+        assert!(!m.has_inertia);
+        assert_eq!(m.inertia.len(), m.ndof);
+        for g in &m.inertia {
+            assert_eq!(g.mass(), 0.0);
+        }
+    }
+
+    #[test]
+    fn fold_conserves_mass() {
+        // dyn_welded folds l2 (m=0.5) onto j1's composite with l1 (m=1.0) → 1.5.
+        let m = load("dyn_welded.urdf");
+        assert_eq!(m.ndof, 1);
+        assert!(m.has_inertia);
+        assert!((m.inertia[0].mass() - 1.5).abs() < 1e-12, "folded mass");
     }
 
     #[test]

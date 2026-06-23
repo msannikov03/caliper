@@ -1,0 +1,25 @@
+<?xml version="1.0"?>
+<!-- dyn_welded — a movable revolute (j1 about Y, child l1 with mass) plus a FIXED
+     weld (f1) hanging a second mass l2 at offset 0.2 along x. Exercises the
+     fixed-link inertia FOLD onto the movable parent (showcase6 has no fixed joints,
+     so this is the fold's only cross-val — checked against Pinocchio). -->
+<robot name="dyn_welded">
+  <link name="base"/>
+  <link name="l1">
+    <inertial><origin xyz="0 0 0.1" rpy="0 0 0"/><mass value="1.0"/>
+      <inertia ixx="0.004" ixy="0" ixz="0" iyy="0.004" iyz="0" izz="0.001"/></inertial>
+  </link>
+  <link name="l2">
+    <inertial><origin xyz="0 0 0" rpy="0 0 0"/><mass value="0.5"/>
+      <inertia ixx="0.001" ixy="0" ixz="0" iyy="0.001" iyz="0" izz="0.001"/></inertial>
+  </link>
+  <joint name="j1" type="revolute">
+    <parent link="base"/><child link="l1"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/><axis xyz="0 1 0"/>
+    <limit lower="-3" upper="3" effort="10" velocity="5"/>
+  </joint>
+  <joint name="f1" type="fixed">
+    <parent link="l1"/><child link="l2"/>
+    <origin xyz="0.2 0 0" rpy="0 0 0"/>
+  </joint>
+</robot>

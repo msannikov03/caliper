@@ -101,10 +101,10 @@ pub fn rnea(
         // a_i = X·a_parent + S·qdd + ad_{v_i}(S·qd) (Featherstone velocity-product term).
         let advs = small_adjoint(&Twist(v[i])) * (s * qd[i]);
         a[i] = xi * ap + s * qdd[i] + advs;
-        // Newton–Euler: f = G·a + ad_vᵀ·(G·v)
+        // Newton–Euler: f = G·a + v×*(G·v), where the force cross v×* = −crm(v)ᵀ.
         let g = model.inertia[i].matrix();
         let adv_t = small_adjoint(&Twist(v[i])).transpose();
-        f[i] = g * a[i] + adv_t * (g * v[i]);
+        f[i] = g * a[i] - adv_t * (g * v[i]);
     }
 
     // BACKWARD pass: τ_i = Sᵀ f_i ; propagate force to parent by Adᵀ.

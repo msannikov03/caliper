@@ -1,4 +1,5 @@
 //! Python bindings (`import caliper`) — the scripting / analysis face.
+use caliper::dynamics::{self, DynError, GRAVITY_EARTH};
 use caliper::ik::{IkOpts, ik};
 use caliper::kinematics::{JacFrame, Jacobian, SingularityKind, SingularityParams, jacobian};
 use caliper::motion::{
@@ -337,6 +338,96 @@ impl Robot {
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
     }
 
+    /// Inverse dynamics (RNEA): tau = ID(q,qd,qdd) incl. gravity + Coriolis (ndof).
+    #[pyo3(signature = (q, qd, qdd, gravity=None))]
+    fn rnea(
+        &self,
+        q: Vec<f64>,
+        qd: Vec<f64>,
+        qdd: Vec<f64>,
+        gravity: Option<[f64; 3]>,
+    ) -> PyResult<Vec<f64>> {
+        let m = &self.inner.model;
+        for (l, x) in [("q", &q), ("qd", &qd), ("qdd", &qdd)] {
+            if x.len() != m.ndof {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "{l} length {} != ndof {}",
+                    x.len(),
+                    m.ndof
+                )));
+            }
+            finite_or_err(l, x)?;
+        }
+        dynamics::rnea(m, &q, &qd, &qdd, &grav(gravity))
+            .map(|t| t.as_slice().to_vec())
+            .map_err(dyn_err)
+    }
+
+    /// Joint-space mass matrix M(q) (CRBA): ndof×ndof symmetric PD, row-major.
+    fn crba(&self, q: Vec<f64>) -> PyResult<Vec<Vec<f64>>> {
+        let m = &self.inner.model;
+        if q.len() != m.ndof {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "q length {} != ndof {}",
+                q.len(),
+                m.ndof
+            )));
+        }
+        finite_or_err("q", &q)?;
+        dynamics::crba(m, &q)
+            .map(|mm| dmatrix_to_rows(&mm))
+            .map_err(dyn_err)
+    }
+
+    /// Forward dynamics: qdd = M(q)⁻¹ (tau − C(q,qd)qd − g(q)) (ndof).
+    #[pyo3(signature = (q, qd, tau, gravity=None))]
+    fn forward_dynamics(
+        &self,
+        q: Vec<f64>,
+        qd: Vec<f64>,
+        tau: Vec<f64>,
+        gravity: Option<[f64; 3]>,
+    ) -> PyResult<Vec<f64>> {
+        let m = &self.inner.model;
+        for (l, x) in [("q", &q), ("qd", &qd), ("tau", &tau)] {
+            if x.len() != m.ndof {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "{l} length {} != ndof {}",
+                    x.len(),
+                    m.ndof
+                )));
+            }
+            finite_or_err(l, x)?;
+        }
+        dynamics::forward_dynamics(m, &q, &qd, &tau, &grav(gravity))
+            .map(|a| a.as_slice().to_vec())
+            .map_err(dyn_err)
+    }
+
+    /// Gravity torque only: g(q) = rnea(q,0,0,gravity) (ndof).
+    #[pyo3(signature = (q, gravity=None))]
+    fn gravity_torque(&self, q: Vec<f64>, gravity: Option<[f64; 3]>) -> PyResult<Vec<f64>> {
+        let m = &self.inner.model;
+        if q.len() != m.ndof {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "q length {} != ndof {}",
+                q.len(),
+                m.ndof
+            )));
+        }
+        finite_or_err("q", &q)?;
+        let z = vec![0.0; m.ndof];
+        dynamics::rnea(m, &q, &z, &z, &grav(gravity))
+            .map(|t| t.as_slice().to_vec())
+            .map_err(dyn_err)
+    }
+
+    /// True iff the URDF carried `<inertial>` on every link (dynamics available).
+    #[getter]
+    fn has_inertia(&self) -> bool {
+        self.inner.model.has_inertia
+    }
+
     fn __repr__(&self) -> String {
         format!(
             "Robot(name='{}', ndof={})",
@@ -515,6 +606,127 @@ fn kind_str(k: SingularityKind) -> &'static str {
     }
 }
 
+fn grav(g: Option<[f64; 3]>) -> Vector3<f64> {
+    g.map(|a| Vector3::new(a[0], a[1], a[2]))
+        .unwrap_or(GRAVITY_EARTH)
+}
+fn dyn_err(e: DynError) -> PyErr {
+    pyo3::exceptions::PyValueError::new_err(e.to_string())
+}
+
+/// A torque-driven gravity simulator (fixed-base, no contact).
+#[pyclass]
+struct Simulator {
+    inner: dynamics::Simulator,
+    dt: f64,
+}
+
+#[pymethods]
+impl Simulator {
+    #[new]
+    #[pyo3(signature = (robot, dt=1e-3, gravity=None, damping=0.0, substeps=4))]
+    fn new(
+        robot: &Robot,
+        dt: f64,
+        gravity: Option<[f64; 3]>,
+        damping: f64,
+        substeps: usize,
+    ) -> PyResult<Self> {
+        let model = std::sync::Arc::new(robot.inner.model.clone());
+        let mut inner = dynamics::Simulator::new(model).map_err(dyn_err)?;
+        inner.set_gravity(grav(gravity));
+        inner
+            .set_damping(&vec![damping; robot.inner.model.ndof])
+            .map_err(dyn_err)?;
+        inner.h_max = (dt / substeps.max(1) as f64).max(1e-6);
+        Ok(Simulator {
+            inner,
+            dt: if dt.is_finite() && dt > 0.0 { dt } else { 1e-3 },
+        })
+    }
+    fn step(&mut self) -> PyResult<()> {
+        self.inner.step(self.dt).map_err(dyn_err)
+    }
+    fn step_n(&mut self, n: usize) -> PyResult<()> {
+        for _ in 0..n {
+            self.inner.step(self.dt).map_err(dyn_err)?;
+        }
+        Ok(())
+    }
+    #[getter]
+    fn q(&self) -> Vec<f64> {
+        self.inner.q().to_vec()
+    }
+    #[getter]
+    fn qd(&self) -> Vec<f64> {
+        self.inner.qd().to_vec()
+    }
+    #[getter]
+    fn time(&self) -> f64 {
+        self.inner.time()
+    }
+    #[getter]
+    fn energy(&self) -> f64 {
+        self.inner.total_energy()
+    }
+    fn set_torque(&mut self, tau: Vec<f64>) -> PyResult<()> {
+        finite_or_err("tau", &tau)?;
+        self.inner.set_torque(&tau).map_err(dyn_err)
+    }
+    fn set_gravity(&mut self, g: [f64; 3]) {
+        self.inner.set_gravity(Vector3::new(g[0], g[1], g[2]));
+    }
+    fn set_damping(&mut self, d: Vec<f64>) -> PyResult<()> {
+        self.inner.set_damping(&d).map_err(dyn_err)
+    }
+    #[pyo3(signature = (q0=None, qd0=None))]
+    fn reset(&mut self, q0: Option<Vec<f64>>, qd0: Option<Vec<f64>>) -> PyResult<()> {
+        match (q0, qd0) {
+            (None, None) => {
+                self.inner.reset();
+                Ok(())
+            }
+            (q, v) => {
+                let n = self.inner.ndof();
+                let q = q.unwrap_or_else(|| vec![0.0; n]);
+                let v = v.unwrap_or_else(|| vec![0.0; n]);
+                self.inner.reset_to(&q, &v).map_err(dyn_err)
+            }
+        }
+    }
+    /// Bake a rollout: (times[N], q[N][ndof], qd[N][ndof]) over `horizon`.
+    #[pyo3(signature = (horizon, sample_dt=None))]
+    #[allow(clippy::type_complexity)]
+    fn rollout(
+        &mut self,
+        horizon: f64,
+        sample_dt: Option<f64>,
+    ) -> PyResult<(Vec<f64>, Vec<Vec<f64>>, Vec<Vec<f64>>)> {
+        let sdt = sample_dt.unwrap_or(self.dt).max(1e-4);
+        let n = ((horizon / sdt).ceil() as usize).max(1);
+        let (mut ts, mut qs, mut qds) = (vec![], vec![], vec![]);
+        ts.push(self.inner.time());
+        qs.push(self.inner.q().to_vec());
+        qds.push(self.inner.qd().to_vec());
+        for _ in 0..n {
+            self.inner.step(sdt).map_err(dyn_err)?;
+            ts.push(self.inner.time());
+            qs.push(self.inner.q().to_vec());
+            qds.push(self.inner.qd().to_vec());
+        }
+        Ok((ts, qs, qds))
+    }
+    fn __repr__(&self) -> String {
+        let qdmax = self.inner.qd().iter().fold(0.0f64, |a, &x| a.max(x.abs()));
+        format!(
+            "Simulator(ndof={}, t={:.3}s, |qd|max={:.3})",
+            self.inner.ndof(),
+            self.inner.time(),
+            qdmax
+        )
+    }
+}
+
 /// Reject non-finite inputs (NaN/Inf) before they reach nalgebra's SVD, which
 /// does not terminate on a non-finite matrix.
 fn finite_or_err(label: &str, xs: &[f64]) -> PyResult<()> {
@@ -539,5 +751,6 @@ fn _caliper(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Robot>()?;
     m.add_class::<Trajectory>()?;
     m.add_class::<MotionLimits>()?;
+    m.add_class::<Simulator>()?;
     Ok(())
 }

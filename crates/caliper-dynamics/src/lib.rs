@@ -284,6 +284,24 @@ impl Simulator {
         self.t = 0.0;
         Ok(())
     }
+    /// Set `(q, qd)` in place WITHOUT touching `t` or the reset home pose.
+    /// Additive helper for a `PhysicsSimBackend` position-teleport; unlike
+    /// [`reset_to`](Self::reset_to) it preserves the simulator clock and home.
+    pub fn set_state(&mut self, q: &[f64], qd: &[f64]) -> Result<(), DynError> {
+        let n = self.model.ndof;
+        if q.len() != n || qd.len() != n {
+            return Err(DynError::Dim {
+                expected: n,
+                got: q.len(),
+            });
+        }
+        if !q.iter().chain(qd.iter()).all(|x| x.is_finite()) {
+            return Err(DynError::Diverged);
+        }
+        self.q = DVector::from_row_slice(q);
+        self.qd = DVector::from_row_slice(qd);
+        Ok(())
+    }
     pub fn q(&self) -> &[f64] {
         self.q.as_slice()
     }

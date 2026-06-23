@@ -1,0 +1,45 @@
+<?xml version="1.0"?>
+<!-- 3-link planar arm (revolute about y, links stacked along z) with box
+     colliders. Adjacent links (l1-l2, l2-l3) always touch at their shared joint
+     and are auto-allowlisted. Non-adjacent l1 & l3 are separated by two joints:
+     at q=[0,pi,pi] the chain folds back so l3's box overlaps l1's box (a real
+     self-collision); at q=[0,0,0] they are 0.6 m apart (clear). Inertial present
+     so a PhysicsSimBackend can also drive it. -->
+<robot name="collide_arm">
+  <link name="base"/>
+
+  <link name="l1">
+    <inertial><origin xyz="0 0 0.15"/><mass value="1.0"/>
+      <inertia ixx="0.01" ixy="0" ixz="0" iyy="0.01" iyz="0" izz="0.002"/></inertial>
+    <collision><origin xyz="0 0 0.15"/>
+      <geometry><box size="0.12 0.12 0.3"/></geometry></collision>
+  </link>
+  <link name="l2">
+    <inertial><origin xyz="0 0 0.15"/><mass value="1.0"/>
+      <inertia ixx="0.01" ixy="0" ixz="0" iyy="0.01" iyz="0" izz="0.002"/></inertial>
+    <collision><origin xyz="0 0 0.15"/>
+      <geometry><box size="0.12 0.12 0.3"/></geometry></collision>
+  </link>
+  <link name="l3">
+    <inertial><origin xyz="0 0 0.15"/><mass value="1.0"/>
+      <inertia ixx="0.01" ixy="0" ixz="0" iyy="0.01" iyz="0" izz="0.002"/></inertial>
+    <collision><origin xyz="0 0 0.15"/>
+      <geometry><box size="0.12 0.12 0.3"/></geometry></collision>
+  </link>
+
+  <joint name="j1" type="revolute">
+    <parent link="base"/><child link="l1"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/><axis xyz="0 1 0"/>
+    <limit lower="-3.3" upper="3.3" effort="20" velocity="5"/>
+  </joint>
+  <joint name="j2" type="revolute">
+    <parent link="l1"/><child link="l2"/>
+    <origin xyz="0 0 0.3" rpy="0 0 0"/><axis xyz="0 1 0"/>
+    <limit lower="-3.3" upper="3.3" effort="20" velocity="5"/>
+  </joint>
+  <joint name="j3" type="revolute">
+    <parent link="l2"/><child link="l3"/>
+    <origin xyz="0 0 0.3" rpy="0 0 0"/><axis xyz="0 1 0"/>
+    <limit lower="-3.3" upper="3.3" effort="20" velocity="5"/>
+  </joint>
+</robot>

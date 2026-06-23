@@ -47,6 +47,34 @@ pub struct LinkFrame {
     pub offset: Se3,
 }
 
+/// A primitive collision shape (the exact subset; meshes are skipped — see
+/// [`parse_collisions`]). Dimensions are in the shape's own local frame.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum CollisionShape {
+    /// Axis-aligned box; `half` are the half-extents (URDF `size`/2).
+    Box {
+        half: Vector3<f64>,
+    },
+    Sphere {
+        radius: f64,
+    },
+    /// Z-aligned cylinder (URDF convention).
+    Cylinder {
+        radius: f64,
+        length: f64,
+    },
+}
+
+/// A collision primitive attached to a link [`LinkFrame`]. Its world pose is
+/// `fk_frame(model, q, frame) · origin` — the frame already carries any folded
+/// fixed-chain offset, so collision needs no separate fold.
+#[derive(Clone, Debug)]
+pub struct CollisionGeom {
+    pub frame: usize,
+    pub origin: Se3,
+    pub shape: CollisionShape,
+}
+
 /// Frozen, struct-of-arrays kinematic model. Movable joints are in topological
 /// order (`parent[i] < i`).
 #[derive(Clone, Debug)]
@@ -75,6 +103,13 @@ pub struct Model {
     /// True iff every movable link AND every fixed link folded onto a movable
     /// parent carried a real `<inertial>` (mass>0). Dynamics entry points gate on this.
     pub has_inertia: bool,
+    /// Parsed `<collision>` primitives (box/sphere/cylinder), each attached to a
+    /// link frame. ⚠ Mesh and capsule collisions are SKIPPED (no geometry loader):
+    /// those links carry NO collider and are therefore NOT collision-checked — a
+    /// query can report "clear" while a mesh-collidered link interpenetrates. Real
+    /// arms are usually mesh-collidered, so callers MUST surface the uncovered count
+    /// (`caliper_collision::CollisionModel::uncovered_frames`). Empty when absent.
+    pub collision: Vec<CollisionGeom>,
 }
 
 impl Model {
@@ -150,6 +185,8 @@ struct RobotTree {
     links: Vec<String>,
     /// Parallel to `links`: parsed `<inertial>` (None when absent).
     link_inertia: Vec<Option<SpatialInertia>>,
+    /// Parallel to `links`: parsed `<collision>` primitives (link-frame local).
+    link_collision: Vec<Vec<(Se3, CollisionShape)>>,
     joints: Vec<EditJoint>,
     link_index: HashMap<String, usize>,
 }
@@ -165,6 +202,7 @@ impl RobotTree {
             t.link_index.insert(l.name.clone(), t.links.len());
             t.links.push(l.name.clone());
             t.link_inertia.push(parse_inertial(&l.inertial));
+            t.link_collision.push(parse_collisions(l));
         }
         for j in &u.joints {
             let parent = *t
@@ -242,6 +280,33 @@ fn parse_inertial(inr: &urdf_rs::Inertial) -> Option<SpatialInertia> {
     Some(SpatialInertia::from_mass_com_inertia(m, com, i_link))
 }
 
+/// Parse a link's `<collision>` primitives into `(link-local origin, shape)`.
+/// Box/sphere/cylinder are exact; meshes and capsules are SKIPPED (no geometry
+/// loader) — such links contribute NO collider and are consequently NOT checked
+/// for collision (unsafe-by-omission; see the `Model::collision` note).
+fn parse_collisions(link: &urdf_rs::Link) -> Vec<(Se3, CollisionShape)> {
+    let mut out = Vec::new();
+    for c in &link.collision {
+        let origin = pose_to_se3(&c.origin);
+        let shape = match &c.geometry {
+            urdf_rs::Geometry::Box { size } => {
+                let [x, y, z] = size.0;
+                CollisionShape::Box {
+                    half: Vector3::new(x / 2.0, y / 2.0, z / 2.0),
+                }
+            }
+            urdf_rs::Geometry::Sphere { radius } => CollisionShape::Sphere { radius: *radius },
+            urdf_rs::Geometry::Cylinder { radius, length } => CollisionShape::Cylinder {
+                radius: *radius,
+                length: *length,
+            },
+            _ => continue, // Mesh / Capsule: no inline geometry → skip (collision-free)
+        };
+        out.push((origin, shape));
+    }
+    out
+}
+
 /// A URDF limit is meaningful only when `lower < upper`; otherwise treat the
 /// joint as unbounded (a missing limit serializes as `0,0`).
 fn valid_limit(lo: f64, hi: f64) -> Option<(f64, f64)> {
@@ -297,6 +362,7 @@ fn compile(t: &RobotTree) -> Result<Model, CompileError> {
         frame_index: HashMap::new(),
         inertia: vec![],
         has_inertia: false,
+        collision: vec![],
     };
     // per link: (nearest movable-joint ancestor, accumulated fixed offset from it)
     let mut anchor: Vec<(Option<usize>, Se3)> = vec![(None, Se3::identity()); nlinks];
@@ -371,6 +437,19 @@ fn compile(t: &RobotTree) -> Result<Model, CompileError> {
     }
     m.inertia = inertia_accum;
     m.has_inertia = full_inertia && m.ndof > 0;
+    // Attach parsed collisions to their link frames (every link is a frame, so the
+    // frame's offset already encodes any folded fixed chain — no separate fold).
+    for (li, geoms) in t.link_collision.iter().enumerate() {
+        if let Some(&frame) = m.frame_index.get(&t.links[li]) {
+            for &(origin, shape) in geoms {
+                m.collision.push(CollisionGeom {
+                    frame,
+                    origin,
+                    shape,
+                });
+            }
+        }
+    }
     Ok(m)
 }
 
@@ -500,6 +579,57 @@ mod tests {
                 assert!(*p < i);
             }
         }
+    }
+
+    #[test]
+    fn parses_box_collisions() {
+        let m = load("collide_arm.urdf");
+        assert_eq!(m.collision.len(), 3, "three box colliders");
+        for g in &m.collision {
+            match g.shape {
+                CollisionShape::Box { half } => {
+                    assert!((half.x - 0.06).abs() < 1e-12); // size 0.12 → half 0.06
+                    assert!((half.z - 0.15).abs() < 1e-12); // size 0.3  → half 0.15
+                }
+                other => panic!("expected box, got {other:?}"),
+            }
+            // origin is the collision <origin> (z=0.15), in the link frame
+            assert!((g.origin.translation()[2] - 0.15).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn parses_shapes_and_skips_mesh() {
+        let m = load("collide_shapes.urdf");
+        // sphere + cylinder parsed; mesh skipped → 2 colliders
+        assert_eq!(m.collision.len(), 2);
+        let mut saw_sphere = false;
+        let mut saw_cyl = false;
+        for g in &m.collision {
+            match g.shape {
+                CollisionShape::Sphere { radius } => {
+                    saw_sphere = true;
+                    assert!((radius - 0.1).abs() < 1e-12);
+                }
+                CollisionShape::Cylinder { radius, length } => {
+                    saw_cyl = true;
+                    assert!((radius - 0.05).abs() < 1e-12 && (length - 0.2).abs() < 1e-12);
+                    // cylinder rides the fixed-welded l2 frame (folded z=0.5 offset)
+                    let f = &m.frames[g.frame];
+                    assert!(
+                        (f.offset.translation()[2] - 0.5).abs() < 1e-12,
+                        "folded offset"
+                    );
+                }
+                CollisionShape::Box { .. } => panic!("no boxes in this fixture"),
+            }
+        }
+        assert!(saw_sphere && saw_cyl);
+    }
+
+    #[test]
+    fn no_collision_geometry_is_empty() {
+        assert!(load("toy.urdf").collision.is_empty());
     }
 
     #[test]

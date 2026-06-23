@@ -1,0 +1,19 @@
+[package]
+name = "caliper-collision"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Pure-nalgebra collision (OBB SAT + sphere/half-space closed forms). No external
+# physics/geometry dependency: the resolved parry 0.28 moved its public query API
+# off nalgebra onto glamx, and an older nalgebra-API parry risks a version split.
+# A self-contained implementation is dependency-light, fully testable, and keeps
+# the lean gate trivially safe. Kept as its own crate for organization.
+[dependencies]
+thiserror.workspace = true
+nalgebra.workspace = true
+caliper-model.workspace = true
+caliper-kinematics.workspace = true
+caliper-hal.workspace = true

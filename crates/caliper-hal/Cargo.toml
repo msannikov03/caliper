@@ -6,5 +6,28 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = []
+# LeRobotDataset v2.1 record/replay (Apache Arrow + Parquet). Heavy, opt-in.
+dataset = ["dep:arrow", "dep:parquet", "dep:serde", "dep:serde_json"]
+# Real hardware backends — compile-checked wire-protocol codecs + HardwareRequired
+# stubs. Marker features (no transport dep yet): the actual socketcan/serialport
+# bus binding requires a robot to validate and is deferred with ROS-bridge/MuJoCo.
+can = []
+dynamixel = []
+
 [dependencies]
 thiserror.workspace = true
+nalgebra.workspace = true
+caliper-model.workspace = true
+caliper-dynamics.workspace = true
+caliper-motion.workspace = true
+caliper-kinematics.workspace = true
+# dataset (optional)
+arrow = { version = "59", default-features = false, optional = true }
+parquet = { version = "59", default-features = false, features = ["arrow", "snap"], optional = true }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+
+[dev-dependencies]
+approx.workspace = true

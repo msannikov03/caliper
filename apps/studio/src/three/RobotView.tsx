@@ -3,6 +3,7 @@ import * as THREE from "three";
 import { useStore } from "../store";
 import type { FrameInfo } from "../store";
 import { DISPLAY_UP } from "../coords";
+import { Ellipsoid } from "./Ellipsoid";
 
 const AX_X = "#ff5a5a";
 const AX_Y = "#5aff7a";
@@ -143,6 +144,7 @@ export function RobotView() {
     <group matrixAutoUpdate={false} matrix={matrix}>
       <BasePlate />
       <Rods />
+      <Ellipsoid />
       {robot.frames.map((_, i) => (
         <FrameNode key={i} index={i} />
       ))}

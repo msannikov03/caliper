@@ -151,3 +151,37 @@ body,
   color: #ff8a8a;
   max-width: 360px;
 }
+
+.hud.sing {
+  bottom: 96px; /* sit above the base tip/IK HUD */
+  min-width: 168px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.hud.sing .badge {
+  align-self: flex-start;
+  padding: 1px 8px;
+  border-radius: 6px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  color: #0a0a0c;
+}
+.hud.sing .bar {
+  height: 6px;
+  width: 100%;
+  background: #1b1b22;
+  border-radius: 4px;
+  overflow: hidden;
+}
+.hud.sing .bar > i {
+  display: block;
+  height: 100%;
+  border-radius: 4px;
+  transition: width 0.08s linear, background 0.08s linear;
+}
+.hud.sing .dim {
+  color: #6c6c7a;
+  font-size: 10px;
+}

@@ -7,6 +7,7 @@ import { IkGizmo } from "./three/IkGizmo";
 import { Toolbar } from "./ui/Toolbar";
 import { JointPanel } from "./ui/JointPanel";
 import { Hud } from "./ui/Hud";
+import { SingularityHud } from "./ui/SingularityHud";
 import "./App.css";
 
 function SceneChrome() {
@@ -57,6 +58,7 @@ export default function App() {
         </Canvas>
         <JointPanel />
         <Hud />
+        <SingularityHud />
       </main>
     </div>
   );

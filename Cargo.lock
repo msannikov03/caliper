@@ -452,6 +452,7 @@ dependencies = [
  "anyhow",
  "caliper",
  "clap",
+ "nalgebra",
 ]
 
 [[package]]
@@ -499,6 +500,7 @@ name = "caliper-py"
 version = "0.1.0"
 dependencies = [
  "caliper",
+ "nalgebra",
  "pyo3",
 ]
 

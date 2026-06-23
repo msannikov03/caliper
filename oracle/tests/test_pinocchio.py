@@ -42,6 +42,7 @@ have not yet been extended with ``fk`` / ``jacobian`` / ``tip_frame`` /
 ``frame_names``.
 """
 import hashlib
+import math
 import pathlib
 
 import numpy as np
@@ -257,3 +258,139 @@ def test_jacobian_matches_pinocchio(name):
         f"[{name}] Jacobian sweep ran {ran}/{N_SAMPLES} samples -- non-vacuity "
         "guard tripped"
     )
+
+
+# ===== Phase 2: singularity / manipulability cross-validation =====
+
+_REQUIRED_ANALYZE = ("analyze", "manipulability")
+
+
+def _have_analyze():
+    return all(hasattr(caliper.Robot, a) for a in _REQUIRED_ANALYZE)
+
+
+# branched is excluded: its tip frame (tipA) is independent of j3, so the tip
+# Jacobian carries a permanent zero column → it is *always* rank-deficient, which
+# has no well-conditioned samples to cross-check κ against. The singular case is
+# covered by the golden tests below; branched's Jacobian itself is already
+# cross-validated against Pinocchio in test_jacobian_matches_pinocchio.
+ANALYSIS_FIXTURES = [f for f in FIXTURES if f != "branched"] + ["showcase6"]
+
+
+@pytest.mark.skipif(
+    not _have_analyze(),
+    reason="caliper.Robot lacks analyze/manipulability -- rebuild bindings after Phase-2",
+)
+@pytest.mark.parametrize("name", ANALYSIS_FIXTURES)
+def test_analysis_matches_numpy_svd(name):
+    """analyze(q).{manipulability,condition_number,sigma_min,sigma} == numpy SVD of
+    the Pinocchio LOCAL_WORLD_ALIGNED Jacobian. Caliper analyze uses World==LWA;
+    geometric-Jacobian singular values are frame-invariant, so they must match."""
+    model, data, robot = _load(name)
+    assert model.nq == robot.ndof and model.nv == robot.ndof, (
+        f"[{name}] multi-DoF joint broke the idx mapping"
+    )
+    fid = model.getFrameId(robot.tip_frame())
+    perm = _column_perm_pin_to_caliper(model, robot)
+    rng = _rng(name)
+    ran = 0
+    saw_well_conditioned = False
+    for s in range(N_SAMPLES):
+        q = _sample_q(rng, model, robot)
+        q_pin = _q_to_pinocchio(model, robot, q)
+        pin.computeJointJacobians(model, data, q_pin)
+        pin.updateFramePlacements(model, data)
+        J = np.asarray(
+            pin.getFrameJacobian(model, data, fid, pin.ReferenceFrame.LOCAL_WORLD_ALIGNED)
+        )[:, perm]
+        sig = np.linalg.svd(J, compute_uv=False)  # descending
+        manip_ref = float(sig.prod())
+        smin_ref = float(sig.min())
+        cond_ref = float(sig.max() / smin_ref) if smin_ref > 0.0 else math.inf
+
+        rep = robot.analyze(list(q))
+        assert math.isclose(rep["sigma_min"], smin_ref, rel_tol=1e-7, abs_tol=1e-9), (
+            f"[{name}] s={s} sigma_min {rep['sigma_min']:.6e} vs numpy {smin_ref:.6e}\nq={q.tolist()}"
+        )
+        assert math.isclose(rep["manipulability"], manip_ref, rel_tol=1e-6, abs_tol=1e-12), (
+            f"[{name}] s={s} manip {rep['manipulability']:.6e} vs numpy {manip_ref:.6e}\nq={q.tolist()}"
+        )
+        ec = rep["condition_number"]
+        if math.isfinite(cond_ref) and cond_ref < 1e6:
+            saw_well_conditioned = True
+            assert math.isclose(ec, cond_ref, rel_tol=1e-6), (
+                f"[{name}] s={s} cond {ec:.6e} vs numpy {cond_ref:.6e}\nq={q.tolist()}"
+            )
+        else:
+            # ill-conditioned / structurally singular: numpy may report ∞ while a
+            # finite-precision SVD reports a huge finite κ — agreement = "both large".
+            assert ec is None or ec > 1e6, (
+                f"[{name}] s={s} ill-cond engine κ={ec} not large (numpy {cond_ref:.3e})"
+            )
+        # engine pads `sigma` to length 3 with trailing zeros (k<3 robots); match it.
+        want_sigma = np.zeros(3)
+        k = min(3, sig.shape[0])
+        want_sigma[:k] = np.sort(sig)[:k]
+        np.testing.assert_allclose(
+            rep["sigma"], want_sigma, rtol=1e-7, atol=1e-9,
+            err_msg=f"[{name}] s={s} sigma-triple mismatch",
+        )
+        assert math.isclose(
+            robot.manipulability(list(q)), manip_ref, rel_tol=1e-6, abs_tol=1e-12
+        )
+        ran += 1
+    assert ran == N_SAMPLES, f"[{name}] analysis sweep ran {ran}/{N_SAMPLES}"
+    assert saw_well_conditioned, (
+        f"[{name}] EVERY sample ill-conditioned -- tight cond cross-check never ran"
+    )
+
+
+# tag, q, robust-offending-anchor (subset that MUST be present), allowed-superset
+GOLDEN_SINGULAR = [
+    ("wrist", [0.3, 0.5, -0.7, 0.4, 0.0, -0.2], {3, 5}, {3, 5}),  # exact: robust
+    ("elbow", [0.2, 0.4, 0.0, 0.3, 0.7, 0.1], {2}, {1, 2}),  # j3 robust; j2 knife-edge
+]
+
+
+@pytest.mark.skipif(
+    not _have_analyze(),
+    reason="caliper.Robot lacks analyze/manipulability -- rebuild bindings after Phase-2",
+)
+@pytest.mark.parametrize("tag,q,must_have,allowed", GOLDEN_SINGULAR)
+def test_golden_singular_showcase6(tag, q, must_have, allowed):
+    model, data, robot = _load("showcase6")
+    assert robot.joint_names == ["j1", "j2", "j3", "j4", "j5", "j6"], (
+        f"showcase6 joint order changed ({robot.joint_names}); golden configs assume j1..j6"
+    )
+    # Independent witness: Pinocchio's own LWA Jacobian is singular here too.
+    fid = model.getFrameId(robot.tip_frame())
+    perm = _column_perm_pin_to_caliper(model, robot)
+    pin.computeJointJacobians(model, data, _q_to_pinocchio(model, robot, np.array(q)))
+    pin.updateFramePlacements(model, data)
+    J = np.asarray(
+        pin.getFrameJacobian(model, data, fid, pin.ReferenceFrame.LOCAL_WORLD_ALIGNED)
+    )[:, perm]
+    s_ref = np.linalg.svd(J, compute_uv=False)
+    assert s_ref.min() < 1e-6, f"[{tag}] not singular in Pinocchio (smin={s_ref.min():.2e})"
+
+    rep = robot.analyze(list(q))
+    assert rep["sigma_min"] < 1e-6, f"[{tag}] engine sigma_min={rep['sigma_min']:.2e} not singular"
+    assert rep["manipulability"] < 1e-9, f"[{tag}] manip={rep['manipulability']:.2e} not ~0"
+    assert rep["condition_number"] > 1e9, f"[{tag}] cond={rep['condition_number']:.2e} not large"
+    assert rep["kind"] != "none", f"[{tag}] kind=none at a singular config"
+    off = set(rep["offending_joints"])
+    # robust joint-space contract: anchor pair MUST be present, no foreign joints leak
+    assert must_have <= off, f"[{tag}] offending {off} missing anchor {must_have}"
+    assert off <= allowed, f"[{tag}] offending {off} leaked outside {allowed}"
+    # numpy and engine agree the config is (equally) singular
+    assert math.isclose(rep["sigma_min"], float(s_ref.min()), rel_tol=1e-6, abs_tol=1e-9)
+
+
+@pytest.mark.skipif(not _have_analyze(), reason="needs Phase-2 analyze binding")
+def test_showcase6_generic_well_conditioned():
+    _, _, robot = _load("showcase6")
+    rep = robot.analyze([0.3, -0.4, 0.6, 0.2, -0.5, 0.1])
+    assert rep["kind"] == "none"
+    assert rep["sigma_min"] > 1e-2
+    assert rep["condition_number"] < 1e3
+    assert rep["manipulability"] > 1e-5

@@ -17,13 +17,14 @@ import { DISPLAY_UP, DISPLAY_UP_INV } from "../coords";
 export function IkGizmo() {
   const robot = useStore((s) => s.robot);
   const frames = useStore((s) => s.frames);
-  const solveIk = useStore((s) => s.solveIk);
+  const solveIkGoverned = useStore((s) => s.solveIkGoverned);
   const controls = useThree((s) => s.controls) as unknown as
     | { enabled: boolean }
     | undefined;
 
   const groupMatrix = useMemo(() => DISPLAY_UP.clone(), []);
   const raf = useRef(0);
+  const lastWorld = useRef(new THREE.Matrix4());
   const tmp = useMemo(() => new THREE.Matrix4(), []);
 
   const tip = robot?.tip ?? -1;
@@ -45,7 +46,7 @@ export function IkGizmo() {
       raf.current = 0;
       // URDF-world target = DISPLAY_UP⁻¹ · (three-world gizmo matrix)
       tmp.copy(DISPLAY_UP_INV).multiply(world);
-      void solveIk(tmp.toArray());
+      void solveIkGoverned(tmp.toArray(), false); // damped live-follow, no snap
     });
   };
 
@@ -62,9 +63,19 @@ export function IkGizmo() {
         onDragStart={() => {
           if (controls) controls.enabled = false;
         }}
-        onDrag={(_l, _dl, w) => queue(w)}
+        onDrag={(_l, _dl, w) => {
+          lastWorld.current.copy(w);
+          queue(w);
+        }}
         onDragEnd={() => {
+          if (raf.current) {
+            cancelAnimationFrame(raf.current);
+            raf.current = 0;
+          }
           if (controls) controls.enabled = true;
+          // exact final snap from the last drag world matrix (same path as queue)
+          tmp.copy(DISPLAY_UP_INV).multiply(lastWorld.current);
+          void solveIkGoverned(tmp.toArray(), true);
         }}
       />
     </group>

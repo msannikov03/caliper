@@ -11,10 +11,15 @@
 //! (`m[col*4 + row]`). `col_major_from_se3` / `se3_from_col_major` are exact
 //! inverses (round-trip ≈ 4.5e-16, verified by `mat_roundtrip` below).
 use caliper::ik::{ik, IkOpts};
-use caliper::kinematics::{fk_joints, frame_pose};
+use caliper::kinematics::{
+    fk_frame, fk_joints, frame_pose, jacobian, JacFrame, Jacobian, SingularityGovernor,
+    SingularityKind, SingularityParams,
+};
 use caliper::model::{JointKind, Model};
 use caliper::spatial::Se3;
-use nalgebra::{Isometry3, Matrix3, Translation3, UnitQuaternion, Vector3};
+use nalgebra::{
+    Cholesky, DVector, Isometry3, Matrix3, SymmetricEigen, Translation3, UnitQuaternion, Vector3,
+};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Mutex;
@@ -83,6 +88,30 @@ struct IkRequest {
     seed: Vec<f64>,
     /// Frame to solve for, by name. `None` → the model's default tip frame.
     frame: Option<String>,
+}
+
+/// Singularity + manipulability report for the HUD and the tip ellipsoid.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SingularityReportDto {
+    manipulability: f64,
+    /// None == ∞ (singular). Frontend renders "∞".
+    condition_number: Option<f64>,
+    sigma_min: f64,
+    /// three smallest singular values, ascending.
+    sigma: [f64; 3],
+    /// "none" | "wrist" | "elbow" | "boundary".
+    kind: String,
+    /// joint indices dominating the escape direction.
+    offending_joints: Vec<usize>,
+    /// engine's σ_min activation threshold; HUD uses it for the distance bar.
+    eps_activate: f64,
+    /// URDF-world tip origin (ellipsoid center; frontend re-nests under DISPLAY_UP).
+    tip_world: [f64; 3],
+    /// 3 unit principal axes (each a column), URDF world.
+    ellipsoid_axes: [[f64; 3]; 3],
+    /// principal radii = sqrt(eig(Jv·Jvᵀ)) = linear singular values.
+    ellipsoid_radii: [f64; 3],
 }
 
 // ===== conversions =====
@@ -383,6 +412,147 @@ fn solve_ik(req: IkRequest, state: tauri::State<'_, AppState>) -> Result<IkSolut
     })
 }
 
+fn kind_str(k: SingularityKind) -> String {
+    match k {
+        SingularityKind::None => "none",
+        SingularityKind::Wrist => "wrist",
+        SingularityKind::Elbow => "elbow",
+        SingularityKind::Boundary => "boundary",
+    }
+    .to_string()
+}
+
+/// Full singularity + ellipsoid report at `q`. One SVD (report) + one 3×3
+/// symmetric eig (ellipsoid), both off the SAME World (LOCAL_WORLD_ALIGNED)
+/// Jacobian — σ are frame-invariant, ellipsoid axes are world-frame.
+#[tauri::command]
+fn analyze(q: Vec<f64>, state: tauri::State<'_, AppState>) -> Result<SingularityReportDto, String> {
+    let guard = state.model.lock().map_err(|_| "state lock poisoned")?;
+    let model = guard.as_ref().ok_or("no robot loaded")?;
+    if q.len() != model.ndof {
+        return Err(format!(
+            "expected {} joint values, got {}",
+            model.ndof,
+            q.len()
+        ));
+    }
+    // clamp does not sanitize NaN (clamp(NaN)=NaN, None-limit joints skip), and a
+    // non-finite Jacobian hangs nalgebra's SVD — reject before any analysis work.
+    if q.iter().any(|x| !x.is_finite()) {
+        return Err("q contains a non-finite value (NaN/Inf)".into());
+    }
+    let mut q = q;
+    model.clamp(&mut q);
+    let tip = model.tip_frame();
+
+    let (ee, jw) = jacobian(model, &q, tip, JacFrame::World);
+    let report = Jacobian(jw.clone()).analyze(&SingularityParams::default());
+
+    // Translational ellipsoid: eig(Jv·Jvᵀ), Jv = top 3 rows. STATIC Matrix3 core
+    // (DMatrix→Matrix3 .into() is absent in nalgebra 0.35).
+    let jv = jw.rows(0, 3).into_owned(); // 3 × ndof
+    let a = Matrix3::from_fn(|r, c| jv.row(r).dot(&jv.row(c)));
+    let eig = SymmetricEigen::new(a);
+    let mut axes = [[0.0_f64; 3]; 3];
+    let mut radii = [0.0_f64; 3];
+    for k in 0..3 {
+        radii[k] = eig.eigenvalues[k].max(0.0).sqrt();
+        let col = eig.eigenvectors.column(k);
+        axes[k] = [col[0], col[1], col[2]];
+    }
+
+    Ok(SingularityReportDto {
+        manipulability: report.manipulability,
+        condition_number: report
+            .condition_number
+            .is_finite()
+            .then_some(report.condition_number),
+        sigma_min: report.sigma_min,
+        sigma: report.sigma,
+        kind: kind_str(report.kind),
+        offending_joints: report.offending_joints,
+        eps_activate: SingularityParams::default().eps_activate,
+        tip_world: ee.translation(),
+        ellipsoid_axes: axes,
+        ellipsoid_radii: radii,
+    })
+}
+
+/// Governor-damped single-pass interactive IK for the gizmo drag. Restart-FREE
+/// (restarts teleport the arm mid-drag) DLS loop using SingularityGovernor's C¹
+/// damping ramp, loose tol, step clamp — stable when pulled past a singularity.
+#[tauri::command]
+fn solve_ik_governed(
+    req: IkRequest,
+    state: tauri::State<'_, AppState>,
+) -> Result<IkSolution, String> {
+    let guard = state.model.lock().map_err(|_| "state lock poisoned")?;
+    let model = guard.as_ref().ok_or("no robot loaded")?;
+    let frame = match req.frame {
+        Some(name) => model
+            .frame_id(&name)
+            .ok_or_else(|| format!("unknown frame `{name}`"))?,
+        None => model.tip_frame(),
+    };
+    if req.seed.len() != model.ndof {
+        return Err(format!(
+            "expected seed of length {}, got {}",
+            model.ndof,
+            req.seed.len()
+        ));
+    }
+    if req
+        .seed
+        .iter()
+        .chain(req.target.iter())
+        .any(|x| !x.is_finite())
+    {
+        return Err("seed/target contains a non-finite value (NaN/Inf)".into());
+    }
+    let target = se3_from_col_major(&req.target);
+    let gov = SingularityGovernor::new(SingularityParams::default());
+    let n = model.ndof;
+    let mut q = req.seed.clone();
+    let mut residual = f64::INFINITY;
+    for _ in 0..12 {
+        let t_cur = fk_frame(model, &q, frame);
+        let e_tw = Se3(t_cur.0.inverse() * target.0).log().0; // [v; ω], body frame
+        let e = DVector::from_iterator(6, e_tw.iter().copied());
+        residual = e.norm();
+        if residual < 1e-6 {
+            break;
+        }
+        let (_, j) = jacobian(model, &q, frame, JacFrame::Body);
+        let sigma_min = Jacobian(j.clone())
+            .analyze(&SingularityParams::default())
+            .sigma_min;
+        let lambda2 = gov.damping_sq(sigma_min).max(1e-10); // C¹ ramp; floor keeps SPD
+        let jt = j.transpose();
+        let mut h = &jt * &j;
+        for i in 0..n {
+            h[(i, i)] += lambda2;
+        }
+        let g = &jt * &e;
+        let mut dq = match Cholesky::new(h) {
+            Some(c) => c.solve(&g),
+            None => DVector::zeros(n),
+        };
+        let mx = dq.amax();
+        if mx > 0.3 {
+            dq *= 0.3 / mx;
+        }
+        for i in 0..n {
+            let (lo, hi) = model.limits.get(i).and_then(|l| *l).unwrap_or((-1e6, 1e6));
+            q[i] = (q[i] + dq[i]).clamp(lo, hi);
+        }
+    }
+    Ok(IkSolution {
+        success: residual < 1e-3,
+        q,
+        residual,
+    })
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -394,7 +564,9 @@ pub fn run() {
             load_robot,
             robot_info,
             get_frames,
-            solve_ik
+            solve_ik,
+            analyze,
+            solve_ik_governed
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

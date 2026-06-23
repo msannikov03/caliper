@@ -38,11 +38,25 @@ export interface IkSolution {
   residual: number;
 }
 
+export interface SingularityReport {
+  manipulability: number;
+  conditionNumber: number | null; // null == ∞
+  sigmaMin: number;
+  sigma: [number, number, number];
+  kind: "none" | "wrist" | "elbow" | "boundary";
+  offendingJoints: number[];
+  epsActivate: number;
+  tipWorld: [number, number, number];
+  ellipsoidAxes: [[number, number, number], [number, number, number], [number, number, number]];
+  ellipsoidRadii: [number, number, number];
+}
+
 interface StudioState {
   // robot + configuration
   robot: RobotInfo | null;
   q: number[]; // length ndof — the single source of truth for configuration
   frames: Mat4[]; // length frames.length — world poses, recomputed by the engine
+  report: SingularityReport | null; // singularity/manipulability at the current q
 
   // status
   loading: boolean;
@@ -52,23 +66,29 @@ interface StudioState {
 
   // internal: monotonic request id so older FK replies can't clobber newer ones
   _reqId: number;
+  // independent guard for analyze() so a slow SVD can't gate the FK frame
+  _analyzeReqId: number;
 
   // actions
   loadRobot: (path: string) => Promise<void>;
   setJoint: (i: number, v: number) => void;
   refreshFrames: () => Promise<void>;
   solveIk: (targetColMajor: Mat4) => Promise<void>;
+  refreshAnalysis: () => Promise<void>;
+  solveIkGoverned: (targetColMajor: Mat4, snap: boolean) => Promise<void>;
 }
 
 export const useStore = create<StudioState>((set, get) => ({
   robot: null,
   q: [],
   frames: [],
+  report: null,
   loading: false,
   error: null,
   ikOk: null,
   ikResidual: null,
   _reqId: 0,
+  _analyzeReqId: 0,
 
   async loadRobot(path) {
     set({ loading: true, error: null });
@@ -78,6 +98,7 @@ export const useStore = create<StudioState>((set, get) => ({
         robot,
         q: new Array(robot.ndof).fill(0),
         frames: [],
+        report: null,
         ikOk: null,
         ikResidual: null,
       });
@@ -106,6 +127,7 @@ export const useStore = create<StudioState>((set, get) => ({
       const frames = await invoke<Mat4[]>("get_frames", { q });
       if (get()._reqId !== reqId) return; // a newer request superseded us
       set({ frames, error: null }); // success clears any prior transient error
+      void get().refreshAnalysis(); // ride each FK refresh → HUD + ellipsoid follow q
     } catch (e) {
       set({ error: String(e) });
     }
@@ -127,6 +149,43 @@ export const useStore = create<StudioState>((set, get) => ({
       // arm follows even on best-effort failure, but flag it for the HUD.
       set({ q: res.q, ikOk: res.success, ikResidual: res.residual, error: null });
       await get().refreshFrames();
+    } catch (e) {
+      set({ error: String(e) });
+    }
+  },
+
+  async refreshAnalysis() {
+    const { q, robot } = get();
+    if (!robot) return;
+    const reqId = get()._analyzeReqId + 1;
+    set({ _analyzeReqId: reqId });
+    try {
+      const report = await invoke<SingularityReport>("analyze", { q });
+      if (get()._analyzeReqId !== reqId) return; // a newer analyze superseded us
+      set({ report });
+    } catch (e) {
+      set({ error: String(e) });
+    }
+  },
+
+  async solveIkGoverned(targetColMajor, snap) {
+    const { q, robot } = get();
+    if (!robot) return;
+    const frameName = robot.frames[robot.tip].name;
+    const reqId = get()._reqId + 1;
+    set({ _reqId: reqId });
+    try {
+      let res = await invoke<IkSolution>("solve_ik_governed", {
+        req: { target: targetColMajor, seed: q, frame: frameName },
+      });
+      if (snap && res.success) {
+        res = await invoke<IkSolution>("solve_ik", {
+          req: { target: targetColMajor, seed: res.q, frame: frameName },
+        });
+      }
+      if (get()._reqId !== reqId) return; // out-of-order drag reply
+      set({ q: res.q, ikOk: res.success, ikResidual: res.residual, error: null });
+      await get().refreshFrames(); // -> refreshAnalysis -> HUD + ellipsoid update live
     } catch (e) {
       set({ error: String(e) });
     }

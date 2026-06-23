@@ -1,7 +1,7 @@
 //! Forward kinematics, Jacobians, and singularity analysis.
 use caliper_model::{JointKind, Model};
 use caliper_spatial::{Se3, exp_prismatic, exp_revolute};
-use nalgebra::{DMatrix, DVector, Matrix3, Vector3, Vector6};
+use nalgebra::{DMatrix, DVector, Matrix3, SymmetricEigen, Vector3, Vector6};
 
 /// Local exp of movable joint `i` at configuration `q`.
 #[inline]
@@ -134,12 +134,17 @@ fn rotate_twist_rows(j: &DMatrix<f64>, rm: &Matrix3<f64>) -> DMatrix<f64> {
 }
 
 /// How the smallest singular direction is lost at a singularity.
+///
+/// `kind` is the TASK-space heuristic (from the smallest left-singular vector):
+/// an *advisory* label. The robust, frame-independent contract is
+/// `offending_joints` (the JOINT-space nullspace). At an exact rank-deficiency
+/// the left-singular vector is numerically arbitrary, so `kind` may read
+/// `Boundary` even at a textbook wrist/elbow lock — assert on `offending_joints`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SingularityKind {
     None,
     Wrist,
     Elbow,
-    Shoulder,
     Boundary,
 }
 
@@ -179,20 +184,129 @@ pub struct SingularityReport {
     pub sigma: [f64; 3],
 }
 
+/// A manipulability ellipsoid: 3 principal axes (unit) + 3 radii (= the singular
+/// values of the sliced Jacobian block), sorted by DESCENDING radius. Axes are in
+/// the frame of the Jacobian passed in — pass a World (LOCAL_WORLD_ALIGNED)
+/// Jacobian to draw it in world space at the tip.
+#[derive(Clone, Copy, Debug)]
+pub struct ManipulabilityEllipsoid {
+    /// Unit principal axes, `axes[0]` = major (fastest tip motion).
+    pub axes: [Vector3<f64>; 3],
+    /// Principal radii (velocity gains), descending. `radii[k]` pairs with `axes[k]`.
+    pub radii: [f64; 3],
+    /// Yoshikawa volume measure of the block, √det(J_b·J_bᵀ) = ∏ radii.
+    pub volume: f64,
+}
+
+impl ManipulabilityEllipsoid {
+    /// Translational (linear-velocity) ellipsoid from rows 0..3 of a 6×n geometric
+    /// Jacobian. The one to draw at the tip.
+    pub fn translational(j6: &DMatrix<f64>) -> Self {
+        Self::from_block(j6, 0)
+    }
+    /// Angular-velocity ellipsoid from rows 3..6 (orientation manipulability).
+    pub fn angular(j6: &DMatrix<f64>) -> Self {
+        Self::from_block(j6, 3)
+    }
+
+    fn from_block(j6: &DMatrix<f64>, row0: usize) -> Self {
+        let n = j6.ncols();
+        if n == 0 || j6.nrows() < row0 + 3 {
+            return Self {
+                axes: [Vector3::x(), Vector3::y(), Vector3::z()],
+                radii: [0.0; 3],
+                volume: 0.0,
+            };
+        }
+        let jb = j6.rows(row0, 3).into_owned(); // 3 × n
+        // Build the 3×3 SPD core as a STATIC Matrix3 so SymmetricEigen's
+        // eigenvectors are Const<3> columns and `.into()` to Vector3 compiles.
+        // (DMatrix→Matrix3 `.into()` does NOT exist in nalgebra 0.35.)
+        let a = Matrix3::from_fn(|r, c| jb.row(r).dot(&jb.row(c)));
+        let eig = SymmetricEigen::new(a);
+        let mut pairs: [(f64, Vector3<f64>); 3] = [
+            (
+                eig.eigenvalues[0].max(0.0).sqrt(),
+                eig.eigenvectors.column(0).into(),
+            ),
+            (
+                eig.eigenvalues[1].max(0.0).sqrt(),
+                eig.eigenvectors.column(1).into(),
+            ),
+            (
+                eig.eigenvalues[2].max(0.0).sqrt(),
+                eig.eigenvectors.column(2).into(),
+            ),
+        ];
+        // descending radius; eigenvalues are finite (real symmetric input), so no NaN.
+        pairs.sort_by(|x, y| y.0.partial_cmp(&x.0).unwrap_or(std::cmp::Ordering::Equal));
+        let fix = |mut v: Vector3<f64>| -> Vector3<f64> {
+            let nrm = v.norm();
+            if nrm > 0.0 {
+                v /= nrm;
+            }
+            // deterministic sign: largest-|component| positive (prevents drag flicker)
+            let k = (0..3)
+                .max_by(|&i, &j| {
+                    v[i].abs()
+                        .partial_cmp(&v[j].abs())
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .unwrap();
+            if v[k] < 0.0 {
+                v = -v;
+            }
+            v
+        };
+        ManipulabilityEllipsoid {
+            axes: [fix(pairs[0].1), fix(pairs[1].1), fix(pairs[2].1)],
+            radii: [pairs[0].0, pairs[1].0, pairs[2].0],
+            volume: pairs[0].0 * pairs[1].0 * pairs[2].0,
+        }
+    }
+}
+
+/// World-frame translational manipulability ellipsoid at `frame`, in one call.
+pub fn manipulability_ellipsoid(model: &Model, q: &[f64], frame: usize) -> ManipulabilityEllipsoid {
+    let (_, j) = jacobian(model, q, frame, JacFrame::World);
+    ManipulabilityEllipsoid::translational(&j)
+}
+
+/// Ergonomic singularity + conditioning report for `frame` at `q`. Convenience
+/// wrapper: builds the World (LOCAL_WORLD_ALIGNED) Jacobian and runs the single-SVD
+/// [`Jacobian::analyze`]. Pinned to World so manipulability / condition_number / σ
+/// match the oracle's Pinocchio LWA cross-check and the Studio world-drawn ellipsoid.
+pub fn analyze(
+    model: &Model,
+    q: &[f64],
+    frame: usize,
+    params: &SingularityParams,
+) -> SingularityReport {
+    let (_, j) = jacobian(model, q, frame, JacFrame::World);
+    Jacobian(j).analyze(params)
+}
+
 /// A geometric Jacobian wrapper carrying the SVD-based singularity analysis.
 pub struct Jacobian(pub DMatrix<f64>);
 
 impl Jacobian {
-    /// Singular values (descending). Empty for a 0-DOF Jacobian.
+    /// True iff every element is finite. nalgebra's Golub–Reinsch SVD does NOT
+    /// terminate on a NaN/Inf matrix, so every SVD path guards on this first.
+    fn all_finite(&self) -> bool {
+        self.0.iter().all(|x| x.is_finite())
+    }
+
+    /// Singular values (descending). Empty for a 0-DOF or non-finite Jacobian.
     pub fn singular_values(&self) -> DVector<f64> {
-        if self.0.ncols() == 0 || self.0.nrows() == 0 {
+        if self.0.ncols() == 0 || self.0.nrows() == 0 || !self.all_finite() {
             return DVector::zeros(0);
         }
         self.0.clone().svd(false, false).singular_values
     }
-    /// Yoshikawa manipulability = product of singular values (0 for a 0-DOF Jacobian).
+    /// Yoshikawa manipulability = product of singular values (0 for a 0-DOF or
+    /// non-finite Jacobian).
     pub fn manipulability(&self) -> f64 {
-        if self.0.ncols() == 0 {
+        if self.0.ncols() == 0 || !self.all_finite() {
             return 0.0;
         }
         self.singular_values().iter().product()
@@ -203,7 +317,8 @@ impl Jacobian {
     pub fn analyze(&self, p: &SingularityParams) -> SingularityReport {
         let j = &self.0;
         let n = j.ncols();
-        if n == 0 || j.nrows() == 0 {
+        // 0-DOF, empty, or non-finite (NaN/Inf would hang the SVD) → degenerate report.
+        if n == 0 || j.nrows() == 0 || !self.all_finite() {
             return SingularityReport {
                 manipulability: 0.0,
                 condition_number: f64::INFINITY,
@@ -518,5 +633,65 @@ mod tests {
         let rep = Jacobian(j).analyze(&SingularityParams::default());
         assert_eq!(rep.kind, SingularityKind::None);
         assert!((fk_tip(&m, &[]).translation()[2] - 0.3).abs() < 1e-12);
+    }
+
+    #[test]
+    fn manipulability_ellipsoid_matches_jv_svd() {
+        // translational ellipsoid radii == singular values of the linear block Jv,
+        // axes are unit + orthogonal + sorted descending.
+        let m = load("showcase6.urdf");
+        let q = [0.3, -0.4, 0.6, 0.2, -0.5, 0.1];
+        let f = m.tip_frame();
+        let (_, j) = jacobian(&m, &q, f, JacFrame::World);
+        let ell = ManipulabilityEllipsoid::translational(&j);
+        // reference: SVD of Jv (top 3 rows)
+        let jv = j.rows(0, 3).into_owned();
+        let mut sv: Vec<f64> = jv
+            .svd(false, false)
+            .singular_values
+            .iter()
+            .copied()
+            .collect();
+        sv.sort_by(|a, b| b.partial_cmp(a).unwrap()); // descending
+        #[allow(clippy::needless_range_loop)] // parallel-index radii/axes/sv reads clearest
+        for k in 0..3 {
+            assert!((ell.radii[k] - sv[k]).abs() < 1e-9, "radius {k}");
+            assert!((ell.axes[k].norm() - 1.0).abs() < 1e-9, "axis {k} unit");
+        }
+        assert!(ell.radii[0] >= ell.radii[1] && ell.radii[1] >= ell.radii[2]);
+        // axes orthonormal (distinct eigenvalues here)
+        assert!(ell.axes[0].dot(&ell.axes[1]).abs() < 1e-7);
+        assert!(ell.axes[0].dot(&ell.axes[2]).abs() < 1e-7);
+        assert!((ell.volume - ell.radii[0] * ell.radii[1] * ell.radii[2]).abs() < 1e-12);
+    }
+
+    #[test]
+    fn free_analyze_matches_world_jacobian_analyze() {
+        let m = load("showcase6.urdf");
+        let q = [0.3, -0.4, 0.6, 0.2, -0.5, 0.1];
+        let f = m.tip_frame();
+        let rep = analyze(&m, &q, f, &SingularityParams::default());
+        let (_, j) = jacobian(&m, &q, f, JacFrame::World);
+        let want = Jacobian(j).analyze(&SingularityParams::default());
+        assert!((rep.manipulability - want.manipulability).abs() < 1e-12);
+        assert!((rep.sigma_min - want.sigma_min).abs() < 1e-12);
+        assert_eq!(rep.kind, SingularityKind::None);
+    }
+
+    /// A NaN/Inf Jacobian must yield a degenerate report immediately — nalgebra's
+    /// SVD never terminates on a non-finite matrix, so the guard is load-bearing.
+    /// (If the guard regresses this test hangs and the suite times out.)
+    #[test]
+    fn analyze_rejects_nonfinite_without_hanging() {
+        let mut j = DMatrix::<f64>::zeros(6, 3);
+        j[(0, 0)] = f64::NAN;
+        j[(2, 1)] = f64::INFINITY;
+        let jac = Jacobian(j);
+        let rep = jac.analyze(&SingularityParams::default());
+        assert_eq!(rep.kind, SingularityKind::None);
+        assert_eq!(rep.sigma_min, 0.0);
+        assert_eq!(rep.manipulability, 0.0);
+        assert_eq!(jac.manipulability(), 0.0);
+        assert_eq!(jac.singular_values().len(), 0);
     }
 }

@@ -17,3 +17,4 @@ doctest = false
 [dependencies]
 caliper.workspace = true
 pyo3.workspace = true
+nalgebra.workspace = true

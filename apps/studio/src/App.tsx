@@ -8,6 +8,8 @@ import { Toolbar } from "./ui/Toolbar";
 import { JointPanel } from "./ui/JointPanel";
 import { Hud } from "./ui/Hud";
 import { SingularityHud } from "./ui/SingularityHud";
+import { Transport } from "./ui/Transport";
+import { PosePanel } from "./ui/PosePanel";
 import "./App.css";
 
 function SceneChrome() {
@@ -57,8 +59,10 @@ export default function App() {
           <IkGizmo />
         </Canvas>
         <JointPanel />
+        <PosePanel />
         <Hud />
         <SingularityHud />
+        <Transport />
       </main>
     </div>
   );

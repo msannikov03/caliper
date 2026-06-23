@@ -16,6 +16,9 @@ use caliper::kinematics::{
     SingularityKind, SingularityParams,
 };
 use caliper::model::{JointKind, Model};
+use caliper::motion::{
+    move_j, move_l, CartesianMoveOpts, MotionLimits, MotionLimitsConfig, PoseLibrary,
+};
 use caliper::spatial::Se3;
 use nalgebra::{
     Cholesky, DVector, Isometry3, Matrix3, SymmetricEigen, Translation3, UnitQuaternion, Vector3,
@@ -28,6 +31,7 @@ use std::sync::Mutex;
 #[derive(Default)]
 struct AppState {
     model: Mutex<Option<Model>>,
+    poses: Mutex<PoseLibrary>,
 }
 
 // ===== wire types (serde-facing; all kinematics live in the engine) =====
@@ -68,6 +72,9 @@ struct RobotInfo {
     joint_kinds: Vec<String>,
     /// Parallel to `jointNames`: `[lo, hi]` or `null` when unbounded.
     limits: Vec<Option<[f64; 2]>>,
+    /// Parallel to `jointNames`: URDF velocity limit or null.
+    #[serde(rename = "velLimit")]
+    vel_limit: Vec<Option<f64>>,
     /// Every link frame, in engine frame order (matches `get_frames` order).
     frames: Vec<FrameInfo>,
     /// Index into `frames` of the default tool/tip frame.
@@ -276,6 +283,7 @@ fn robot_info_from_model(model: &Model) -> RobotInfo {
         joint_names: model.joint_names.clone(),
         joint_kinds,
         limits,
+        vel_limit: model.vel_limit.clone(),
         frames,
         tip: model.tip_frame(),
     }
@@ -358,6 +366,9 @@ fn robot_info(path: String, state: tauri::State<'_, AppState>) -> Result<RobotIn
     }
     let model = Model::from_urdf(p).map_err(|_| "failed to load robot from the given URDF")?;
     let info = robot_info_from_model(&model);
+    if let Ok(mut p) = state.poses.lock() {
+        p.clear();
+    }
     *state.model.lock().map_err(|_| "state lock poisoned")? = Some(model);
     Ok(info)
 }
@@ -553,6 +564,263 @@ fn solve_ik_governed(
     })
 }
 
+// ===== Phase 3: motion planning + named poses =====
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TrajectoryDto {
+    kind: String, // "moveJ" | "moveL"
+    duration: f64,
+    ndof: usize,
+    dt: f64,
+    times: Vec<f64>,
+    q: Vec<Vec<f64>>,            // N x ndof — drives playback
+    qd: Vec<Vec<f64>>,           // N x ndof
+    tip_path: Vec<[f64; 3]>,     // URDF-world tip XYZ (frontend re-nests under DISPLAY_UP)
+    frames: Vec<Vec<[f64; 16]>>, // N x nframes col-major — baked so playback is render-only
+    /// false = best-effort prefix (Cartesian truncated at the wall).
+    ok: bool,
+    /// path fraction realized (1.0 = full).
+    reached: f64,
+    max_jerk_ratio: f64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NamedPoseDto {
+    name: String,
+    q: Vec<f64>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PlanMoveJReq {
+    q_start: Vec<f64>,
+    q_goal: Vec<f64>,
+    dt: Option<f64>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PlanMoveLReq {
+    q_start: Vec<f64>,
+    target: [f64; 16],
+    frame: Option<String>,
+    dt: Option<f64>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PlanMoveToPoseReq {
+    q_start: Vec<f64>,
+    name: String,
+    dt: Option<f64>,
+}
+
+/// Bake every frame's world matrix along the trajectory so the UI plays back
+/// render-only (no per-frame engine round-trips). Uses the SAME FK as get_frames.
+fn sample_to_dto(
+    model: &Model,
+    traj: &caliper::motion::Trajectory,
+    dt: f64,
+    tip: usize,
+    kind: &str,
+) -> TrajectoryDto {
+    // clamp the sample period: dt<=0/NaN would make n overflow / allocate unbounded.
+    let dt = if dt.is_finite() && dt > 1e-4 {
+        dt.min(10.0)
+    } else {
+        0.02
+    };
+    let dur = traj.duration();
+    let n = ((dur / dt).ceil() as usize).max(1) + 1;
+    let mut times = vec![];
+    let mut q = vec![];
+    let mut qd = vec![];
+    let mut tip_path = vec![];
+    let mut frames = vec![];
+    let mut max_jerk_ratio = 0.0f64;
+    let lim = traj.limits();
+    let mut prev_qdd: Option<Vec<f64>> = None;
+    for k in 0..n {
+        let t = (k as f64 * dt).min(dur);
+        let s = traj.sample(t);
+        times.push(t);
+        frames.push(frames_at(model, &s.q));
+        let tp = fk_frame(model, &s.q, tip).translation();
+        tip_path.push([tp[0], tp[1], tp[2]]);
+        if let Some(p) = &prev_qdd {
+            for (i, (&cur, &prev)) in s.qdd.iter().zip(p.iter()).enumerate() {
+                let jerk = (cur - prev) / dt;
+                max_jerk_ratio = max_jerk_ratio.max(jerk.abs() / lim.jmax[i]);
+            }
+        }
+        prev_qdd = Some(s.qdd.clone());
+        q.push(s.q);
+        qd.push(s.qd);
+    }
+    TrajectoryDto {
+        kind: kind.into(),
+        duration: dur,
+        ndof: traj.ndof(),
+        dt,
+        times,
+        q,
+        qd,
+        tip_path,
+        frames,
+        ok: traj.completed,
+        reached: traj.reached,
+        max_jerk_ratio,
+    }
+}
+
+fn default_limits(model: &Model) -> Result<MotionLimits, String> {
+    MotionLimits::from_model(model, &MotionLimitsConfig::default()).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn plan_move_j(
+    req: PlanMoveJReq,
+    state: tauri::State<'_, AppState>,
+) -> Result<TrajectoryDto, String> {
+    let guard = state.model.lock().map_err(|_| "state lock poisoned")?;
+    let model = guard.as_ref().ok_or("no robot loaded")?;
+    if req.q_start.len() != model.ndof || req.q_goal.len() != model.ndof {
+        return Err(format!("expected {} joint values", model.ndof));
+    }
+    if req
+        .q_start
+        .iter()
+        .chain(req.q_goal.iter())
+        .any(|x| !x.is_finite())
+    {
+        return Err("q_start/q_goal contains a non-finite value".into());
+    }
+    let limits = default_limits(model)?;
+    let traj = move_j(model, &req.q_start, &req.q_goal, &limits).map_err(|e| e.to_string())?;
+    Ok(sample_to_dto(
+        model,
+        &traj,
+        req.dt.unwrap_or(0.02),
+        model.tip_frame(),
+        "moveJ",
+    ))
+}
+
+#[tauri::command]
+fn plan_move_l(
+    req: PlanMoveLReq,
+    state: tauri::State<'_, AppState>,
+) -> Result<TrajectoryDto, String> {
+    let guard = state.model.lock().map_err(|_| "state lock poisoned")?;
+    let model = guard.as_ref().ok_or("no robot loaded")?;
+    if req.q_start.len() != model.ndof {
+        return Err(format!("expected {} joint values", model.ndof));
+    }
+    if req.q_start.iter().any(|x| !x.is_finite()) || req.target.iter().any(|x| !x.is_finite()) {
+        return Err("q_start/target contains a non-finite value".into());
+    }
+    let frame = match req.frame {
+        Some(name) => model
+            .frame_id(&name)
+            .ok_or_else(|| format!("unknown frame `{name}`"))?,
+        None => model.tip_frame(),
+    };
+    let goal = se3_from_col_major(&req.target);
+    let limits = default_limits(model)?;
+    let opts = CartesianMoveOpts::defaults(limits);
+    // best-effort: a truncated prefix returns Ok with ok:false; only hard errors Err.
+    let traj = move_l(model, frame, &req.q_start, &goal, &opts).map_err(|e| e.to_string())?;
+    Ok(sample_to_dto(
+        model,
+        &traj,
+        req.dt.unwrap_or(0.02),
+        model.tip_frame(),
+        "moveL",
+    ))
+}
+
+#[tauri::command]
+fn save_pose(name: String, q: Vec<f64>, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let guard = state.model.lock().map_err(|_| "state lock poisoned")?;
+    let model = guard.as_ref().ok_or("no robot loaded")?;
+    if q.len() != model.ndof {
+        return Err(format!("expected {} joint values", model.ndof));
+    }
+    if q.iter().any(|x| !x.is_finite()) {
+        return Err("pose contains a non-finite value (NaN/Inf)".into());
+    }
+    state
+        .poses
+        .lock()
+        .map_err(|_| "pose lock poisoned")?
+        .upsert(name, q);
+    Ok(())
+}
+
+#[tauri::command]
+fn list_poses(state: tauri::State<'_, AppState>) -> Result<Vec<NamedPoseDto>, String> {
+    Ok(state
+        .poses
+        .lock()
+        .map_err(|_| "pose lock poisoned")?
+        .list()
+        .iter()
+        .map(|p| NamedPoseDto {
+            name: p.name.clone(),
+            q: p.q.clone(),
+        })
+        .collect())
+}
+
+#[tauri::command]
+fn delete_pose(name: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    state
+        .poses
+        .lock()
+        .map_err(|_| "pose lock poisoned")?
+        .remove(&name);
+    Ok(())
+}
+
+#[tauri::command]
+fn plan_move_to_pose(
+    req: PlanMoveToPoseReq,
+    state: tauri::State<'_, AppState>,
+) -> Result<TrajectoryDto, String> {
+    let guard = state.model.lock().map_err(|_| "state lock poisoned")?;
+    let model = guard.as_ref().ok_or("no robot loaded")?;
+    // clone q_goal in a tight scope so we never hold both locks across planning.
+    let q_goal = {
+        let p = state.poses.lock().map_err(|_| "pose lock poisoned")?;
+        p.get(&req.name)
+            .ok_or_else(|| format!("unknown pose `{}`", req.name))?
+            .q
+            .clone()
+    };
+    if req.q_start.len() != model.ndof || q_goal.len() != model.ndof {
+        return Err(format!("expected {} joint values", model.ndof));
+    }
+    if req
+        .q_start
+        .iter()
+        .chain(q_goal.iter())
+        .any(|x| !x.is_finite())
+    {
+        return Err("q_start/pose contains a non-finite value".into());
+    }
+    let limits = default_limits(model)?;
+    let traj = move_j(model, &req.q_start, &q_goal, &limits).map_err(|e| e.to_string())?;
+    Ok(sample_to_dto(
+        model,
+        &traj,
+        req.dt.unwrap_or(0.02),
+        model.tip_frame(),
+        "moveJ",
+    ))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -566,7 +834,13 @@ pub fn run() {
             get_frames,
             solve_ik,
             analyze,
-            solve_ik_governed
+            solve_ik_governed,
+            plan_move_j,
+            plan_move_l,
+            save_pose,
+            list_poses,
+            delete_pose,
+            plan_move_to_pose
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

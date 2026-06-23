@@ -1,6 +1,10 @@
 //! Python bindings (`import caliper`) — the scripting / analysis face.
 use caliper::ik::{IkOpts, ik};
 use caliper::kinematics::{JacFrame, Jacobian, SingularityKind, SingularityParams, jacobian};
+use caliper::motion::{
+    CartesianMoveOpts, MotionLimits as EngineLimits, MotionLimitsConfig, Trajectory as EngineTraj,
+    move_j, move_l,
+};
 use caliper::spatial::Se3;
 use nalgebra::{DMatrix, Matrix3, UnitQuaternion, Vector3};
 use pyo3::prelude::*;
@@ -263,12 +267,231 @@ impl Robot {
         Ok((axes, radii))
     }
 
+    /// Rest-to-rest jerk-limited time-synchronized joint move.
+    #[pyo3(signature = (q_start, q_goal, limits=None))]
+    fn move_j(
+        &self,
+        q_start: Vec<f64>,
+        q_goal: Vec<f64>,
+        limits: Option<MotionLimits>,
+    ) -> PyResult<Trajectory> {
+        let model = &self.inner.model;
+        if q_start.len() != model.ndof || q_goal.len() != model.ndof {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "q_start/q_goal must have length ndof={}",
+                model.ndof
+            )));
+        }
+        finite_or_err("q_start", &q_start)?;
+        finite_or_err("q_goal", &q_goal)?;
+        let lim = motion_limits(model, limits)?;
+        move_j(model, &q_start, &q_goal, &lim)
+            .map(|inner| Trajectory { inner })
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
+    /// Cartesian straight line (MOVE_L) from q_start to a 4×4 COLUMN-MAJOR target
+    /// (same convention as ik(): target[col][row]).
+    #[pyo3(signature = (q_start, target, frame=None, limits=None))]
+    fn move_l(
+        &self,
+        q_start: Vec<f64>,
+        target: Vec<Vec<f64>>,
+        frame: Option<&str>,
+        limits: Option<MotionLimits>,
+    ) -> PyResult<Trajectory> {
+        let model = &self.inner.model;
+        if q_start.len() != model.ndof {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "q_start length must be ndof={}",
+                model.ndof
+            )));
+        }
+        if target.len() != 4 || target.iter().any(|c| c.len() != 4) {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "target must be 4x4 column-major",
+            ));
+        }
+        finite_or_err("q_start", &q_start)?;
+        for col in &target {
+            finite_or_err("target", col)?;
+        }
+        let f = resolve_frame(model, frame)?;
+        let rot = Matrix3::new(
+            target[0][0],
+            target[1][0],
+            target[2][0],
+            target[0][1],
+            target[1][1],
+            target[2][1],
+            target[0][2],
+            target[1][2],
+            target[2][2],
+        );
+        let trans = Vector3::new(target[3][0], target[3][1], target[3][2]);
+        let goal = Se3::from_parts(trans, UnitQuaternion::from_matrix(&rot));
+        let lim = motion_limits(model, limits)?;
+        let opts = CartesianMoveOpts::defaults(lim);
+        move_l(model, f, &q_start, &goal, &opts)
+            .map(|inner| Trajectory { inner })
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
     fn __repr__(&self) -> String {
         format!(
             "Robot(name='{}', ndof={})",
             self.inner.name,
             self.inner.ndof()
         )
+    }
+}
+
+/// A planned trajectory you can sample (MATLAB-style for plotting).
+#[pyclass]
+struct Trajectory {
+    inner: EngineTraj,
+}
+
+#[pymethods]
+impl Trajectory {
+    #[getter]
+    fn duration(&self) -> f64 {
+        self.inner.duration()
+    }
+    #[getter]
+    fn ndof(&self) -> usize {
+        self.inner.ndof()
+    }
+    #[getter]
+    fn completed(&self) -> bool {
+        self.inner.completed
+    }
+    #[getter]
+    fn reached(&self) -> f64 {
+        self.inner.reached
+    }
+    #[getter]
+    fn vel_limit(&self) -> Vec<f64> {
+        self.inner.limits().vmax.clone()
+    }
+    #[getter]
+    fn accel_limit(&self) -> Vec<f64> {
+        self.inner.limits().amax.clone()
+    }
+    #[getter]
+    fn jerk_limit(&self) -> Vec<f64> {
+        self.inner.limits().jmax.clone()
+    }
+
+    /// (q, qd, qdd) at time t (clamped to [0,duration]).
+    fn sample(&self, t: f64) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+        let s = self.inner.sample(t);
+        (s.q, s.qd, s.qdd)
+    }
+    fn q_at(&self, t: f64) -> Vec<f64> {
+        self.inner.q_at(t)
+    }
+
+    /// (times, q[N][ndof], qd[N][ndof], qdd[N][ndof]); times[0]=0, last=duration.
+    #[allow(clippy::type_complexity)]
+    fn sample_uniform(&self, dt: f64) -> (Vec<f64>, Vec<Vec<f64>>, Vec<Vec<f64>>, Vec<Vec<f64>>) {
+        // clamp: dt<=0/NaN would make n overflow / allocate unbounded.
+        let dt = if dt.is_finite() && dt > 1e-4 {
+            dt.min(10.0)
+        } else {
+            1e-2
+        };
+        let dur = self.inner.duration();
+        let n = ((dur / dt).ceil() as usize).max(1) + 1;
+        let mut times = Vec::with_capacity(n);
+        let (mut q, mut qd, mut qdd) = (vec![], vec![], vec![]);
+        for k in 0..n {
+            let t = (k as f64 * dt).min(dur);
+            let s = self.inner.sample(t);
+            times.push(t);
+            q.push(s.q);
+            qd.push(s.qd);
+            qdd.push(s.qdd);
+        }
+        (times, q, qd, qdd)
+    }
+    fn __repr__(&self) -> String {
+        format!(
+            "Trajectory(ndof={}, duration={:.3}s, completed={})",
+            self.inner.ndof(),
+            self.inner.duration(),
+            self.inner.completed
+        )
+    }
+}
+
+/// Per-joint motion limits (vel/accel/jerk) — MATLAB-friendly override.
+#[pyclass(from_py_object)]
+#[derive(Clone)]
+struct MotionLimits {
+    inner: EngineLimits,
+}
+
+#[pymethods]
+impl MotionLimits {
+    #[new]
+    fn new(vel: Vec<f64>, accel: Vec<f64>, jerk: Vec<f64>) -> PyResult<Self> {
+        if vel.len() != accel.len() || vel.len() != jerk.len() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "vel/accel/jerk length mismatch",
+            ));
+        }
+        Ok(MotionLimits {
+            inner: EngineLimits {
+                vmax: vel,
+                amax: accel,
+                jmax: jerk,
+            },
+        })
+    }
+    #[staticmethod]
+    #[pyo3(signature = (robot, accel_ratio=5.0, jerk_ratio=10.0, vel_scale=1.0, default_vel=1.0))]
+    fn from_robot(
+        robot: &Robot,
+        accel_ratio: f64,
+        jerk_ratio: f64,
+        vel_scale: f64,
+        default_vel: f64,
+    ) -> PyResult<Self> {
+        let cfg = MotionLimitsConfig {
+            default_vel,
+            accel_ratio,
+            jerk_ratio,
+            vel_scale,
+            overrides: vec![],
+        };
+        EngineLimits::from_model(&robot.inner.model, &cfg)
+            .map(|inner| MotionLimits { inner })
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+    #[getter]
+    fn vel(&self) -> Vec<f64> {
+        self.inner.vmax.clone()
+    }
+    #[getter]
+    fn accel(&self) -> Vec<f64> {
+        self.inner.amax.clone()
+    }
+    #[getter]
+    fn jerk(&self) -> Vec<f64> {
+        self.inner.jmax.clone()
+    }
+}
+
+/// Resolve the limits arg: an explicit MotionLimits, or defaults from the model.
+fn motion_limits(
+    model: &caliper::model::Model,
+    limits: Option<MotionLimits>,
+) -> PyResult<EngineLimits> {
+    match limits {
+        Some(l) => Ok(l.inner),
+        None => EngineLimits::from_model(model, &MotionLimitsConfig::default())
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string())),
     }
 }
 
@@ -314,5 +537,7 @@ fn _caliper(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", caliper::VERSION)?;
     m.add_function(wrap_pyfunction!(version, m)?)?;
     m.add_class::<Robot>()?;
+    m.add_class::<Trajectory>()?;
+    m.add_class::<MotionLimits>()?;
     Ok(())
 }

@@ -185,3 +185,112 @@ body,
   color: #6c6c7a;
   font-size: 10px;
 }
+
+/* ---- Phase 3: transport + pose panel ---- */
+.transport {
+  position: absolute;
+  bottom: 18px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 14px;
+  background: rgba(18, 18, 24, 0.82);
+  backdrop-filter: blur(8px);
+  border: 1px solid #2c2c3a;
+  border-radius: 10px;
+  color: #cfcfe0;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+.transport button {
+  background: #21212b;
+  color: #cfcfe0;
+  border: 1px solid #34343f;
+  border-radius: 6px;
+  padding: 2px 9px;
+  cursor: pointer;
+}
+.transport input[type="range"] {
+  width: 220px;
+  accent-color: #36c6d4;
+}
+.transport .badge {
+  padding: 1px 7px;
+  border-radius: 6px;
+  font-size: 10px;
+  font-weight: 700;
+}
+.transport .badge.ok {
+  color: #5aff7a;
+}
+.transport .badge.bad {
+  color: #ff5a5a;
+}
+
+.pose-panel {
+  position: absolute;
+  top: 64px;
+  left: 16px;
+  width: 184px;
+  padding: 10px 12px;
+  background: rgba(18, 18, 24, 0.82);
+  backdrop-filter: blur(8px);
+  border: 1px solid #2c2c3a;
+  border-radius: 10px;
+  color: #cfcfe0;
+  font-size: 12px;
+}
+.pose-panel .pose-title {
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  color: #9a9aa6;
+  margin-bottom: 6px;
+}
+.pose-panel .pose-add {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+.pose-panel .pose-add input {
+  flex: 1;
+  min-width: 0;
+  background: #15151c;
+  border: 1px solid #34343f;
+  border-radius: 6px;
+  color: #cfcfe0;
+  padding: 3px 6px;
+}
+.pose-panel button {
+  background: #21212b;
+  color: #cfcfe0;
+  border: 1px solid #34343f;
+  border-radius: 6px;
+  padding: 2px 7px;
+  cursor: pointer;
+  font-size: 11px;
+}
+.pose-panel button:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+.pose-panel ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.pose-panel li {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.pose-panel li span {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}

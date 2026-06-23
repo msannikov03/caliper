@@ -51,6 +51,25 @@ export interface SingularityReport {
   ellipsoidRadii: [number, number, number];
 }
 
+export interface TrajectoryDto {
+  kind: string;
+  duration: number;
+  ndof: number;
+  dt: number;
+  times: number[];
+  q: number[][];
+  qd: number[][];
+  tipPath: [number, number, number][];
+  frames: Mat4[][]; // N x nframes col-major — baked, playback is render-only
+  ok: boolean;
+  reached: number;
+  maxJerkRatio: number;
+}
+export interface NamedPoseDto {
+  name: string;
+  q: number[];
+}
+
 interface StudioState {
   // robot + configuration
   robot: RobotInfo | null;
@@ -76,6 +95,23 @@ interface StudioState {
   solveIk: (targetColMajor: Mat4) => Promise<void>;
   refreshAnalysis: () => Promise<void>;
   solveIkGoverned: (targetColMajor: Mat4, snap: boolean) => Promise<void>;
+
+  // motion (Phase 3)
+  traj: TrajectoryDto | null;
+  poses: NamedPoseDto[];
+  playing: boolean;
+  playhead: number; // seconds
+  planMoveJ: (qGoal: number[]) => Promise<void>;
+  planMoveL: (targetColMajor: Mat4, frame?: string) => Promise<void>;
+  planMoveToPose: (name: string) => Promise<void>;
+  clearTraj: () => void;
+  play: () => void;
+  pause: () => void;
+  seek: (t: number) => void;
+  savePose: (name: string) => Promise<void>;
+  deletePose: (name: string) => Promise<void>;
+  refreshPoses: () => Promise<void>;
+  _applyTrajAt: (t: number) => void;
 }
 
 export const useStore = create<StudioState>((set, get) => ({
@@ -89,11 +125,16 @@ export const useStore = create<StudioState>((set, get) => ({
   ikResidual: null,
   _reqId: 0,
   _analyzeReqId: 0,
+  traj: null,
+  poses: [],
+  playing: false,
+  playhead: 0,
 
   async loadRobot(path) {
     set({ loading: true, error: null });
     try {
       const robot = await invoke<RobotInfo>("robot_info", { path });
+      stopClock();
       set({
         robot,
         q: new Array(robot.ndof).fill(0),
@@ -101,8 +142,13 @@ export const useStore = create<StudioState>((set, get) => ({
         report: null,
         ikOk: null,
         ikResidual: null,
+        traj: null,
+        playing: false,
+        playhead: 0,
+        poses: [],
       });
       await get().refreshFrames();
+      await get().refreshPoses();
     } catch (e) {
       set({ error: String(e), robot: null });
     } finally {
@@ -111,6 +157,7 @@ export const useStore = create<StudioState>((set, get) => ({
   },
 
   setJoint(i, v) {
+    if (get().playing) return; // don't fight the playback clock
     const q = get().q.slice();
     q[i] = v;
     // a manual jog invalidates any prior IK status (it described a different pose)
@@ -170,7 +217,7 @@ export const useStore = create<StudioState>((set, get) => ({
 
   async solveIkGoverned(targetColMajor, snap) {
     const { q, robot } = get();
-    if (!robot) return;
+    if (!robot || get().playing) return; // gizmo is inert during playback
     const frameName = robot.frames[robot.tip].name;
     const reqId = get()._reqId + 1;
     set({ _reqId: reqId });
@@ -190,6 +237,106 @@ export const useStore = create<StudioState>((set, get) => ({
       set({ error: String(e) });
     }
   },
+
+  // ---- motion (Phase 3) ----
+  async planMoveJ(qGoal) {
+    const { q, robot } = get();
+    if (!robot) return;
+    try {
+      const traj = await invoke<TrajectoryDto>("plan_move_j", { req: { qStart: q, qGoal } });
+      set({ traj, playhead: 0, playing: false });
+      get()._applyTrajAt(0);
+    } catch (e) {
+      set({ error: String(e) });
+    }
+  },
+  async planMoveL(targetColMajor, frame) {
+    const { q, robot } = get();
+    if (!robot) return;
+    const frameName = frame ?? robot.frames[robot.tip].name;
+    try {
+      const traj = await invoke<TrajectoryDto>("plan_move_l", {
+        req: { qStart: q, target: targetColMajor, frame: frameName },
+      });
+      set({ traj, playhead: 0, playing: false });
+      get()._applyTrajAt(0);
+    } catch (e) {
+      set({ error: String(e) });
+    }
+  },
+  async planMoveToPose(name) {
+    const { q, robot } = get();
+    if (!robot) return;
+    try {
+      const traj = await invoke<TrajectoryDto>("plan_move_to_pose", { req: { qStart: q, name } });
+      set({ traj, playhead: 0, playing: false });
+      get()._applyTrajAt(0);
+      get().play();
+    } catch (e) {
+      set({ error: String(e) });
+    }
+  },
+  clearTraj() {
+    stopClock();
+    set({ traj: null, playing: false, playhead: 0 });
+  },
+  play() {
+    const { traj } = get();
+    if (!traj) return;
+    base = get().playhead >= traj.duration ? 0 : get().playhead;
+    t0 = performance.now();
+    set({ playing: true });
+    if (!rafId) rafId = requestAnimationFrame(() => tick(get, set));
+  },
+  pause() {
+    stopClock();
+    set({ playing: false });
+  },
+  seek(t) {
+    const { traj } = get();
+    if (!traj) return;
+    const tt = Math.max(0, Math.min(t, traj.duration));
+    stopClock();
+    set({ playhead: tt, playing: false });
+    get()._applyTrajAt(tt);
+  },
+  async savePose(name) {
+    const { q, robot } = get();
+    if (!robot) return;
+    try {
+      await invoke("save_pose", { name, q });
+      await get().refreshPoses();
+    } catch (e) {
+      set({ error: String(e) });
+    }
+  },
+  async deletePose(name) {
+    try {
+      await invoke("delete_pose", { name });
+      await get().refreshPoses();
+    } catch (e) {
+      set({ error: String(e) });
+    }
+  },
+  async refreshPoses() {
+    if (!get().robot) return;
+    try {
+      const poses = await invoke<NamedPoseDto[]>("list_poses");
+      set({ poses });
+    } catch (e) {
+      set({ error: String(e) });
+    }
+  },
+  _applyTrajAt(t) {
+    const { traj } = get();
+    if (!traj) return;
+    // pick the nearest baked frame row (render-only; no engine round-trip)
+    let k = Math.round(t / traj.dt);
+    k = Math.max(0, Math.min(k, traj.frames.length - 1));
+    // bump _reqId so any in-flight get_frames/solve_ik reply can't clobber this pose
+    set({ q: traj.q[k], frames: traj.frames[k], _reqId: get()._reqId + 1 });
+    void get().refreshAnalysis(); // HUD/ellipsoid follow; latest-wins via _analyzeReqId
+  },
 }));
 
 // rAF-coalesced refresh so a slider drag fires at most one FK invoke per frame.
@@ -201,4 +348,32 @@ function scheduleRefresh(get: () => StudioState) {
     pending = false;
     void get().refreshFrames();
   });
+}
+
+// ---- trajectory playback clock (performance.now-driven; baked frames only) ----
+let rafId = 0;
+let t0 = 0;
+let base = 0;
+function stopClock() {
+  if (rafId) {
+    cancelAnimationFrame(rafId);
+    rafId = 0;
+  }
+}
+function tick(get: () => StudioState, set: (p: Partial<StudioState>) => void) {
+  const { traj, playing } = get();
+  if (!traj || !playing) {
+    rafId = 0;
+    return;
+  }
+  const t = base + (performance.now() - t0) / 1000;
+  if (t >= traj.duration) {
+    set({ playhead: traj.duration, playing: false });
+    get()._applyTrajAt(traj.duration);
+    rafId = 0;
+    return;
+  }
+  set({ playhead: t });
+  get()._applyTrajAt(t);
+  rafId = requestAnimationFrame(() => tick(get, set));
 }

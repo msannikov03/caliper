@@ -116,7 +116,16 @@ pub fn move_l(
         return Err(MotionError::ZeroLengthSegment);
     }
     let pose_of = |s: f64| move_l_pose(&t0, goal, s, opts.mode);
-    sample_cartesian(model, frame, q_start, &pose_of, l, phi, TrajKind::MoveL, opts)
+    sample_cartesian(
+        model,
+        frame,
+        q_start,
+        &pose_of,
+        l,
+        phi,
+        TrajKind::MoveL,
+        opts,
+    )
 }
 
 pub fn move_c(

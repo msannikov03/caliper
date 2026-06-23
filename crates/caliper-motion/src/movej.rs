@@ -31,7 +31,12 @@ pub fn move_j(
     let mut profiles = Vec::with_capacity(n);
     let mut tmax = 0.0f64;
     for i in 0..n {
-        let p = plan_scurve(q1[i] - q0[i], limits.vmax[i], limits.amax[i], limits.jmax[i]);
+        let p = plan_scurve(
+            q1[i] - q0[i],
+            limits.vmax[i],
+            limits.amax[i],
+            limits.jmax[i],
+        );
         tmax = tmax.max(p.total());
         profiles.push(p);
     }

@@ -40,7 +40,12 @@ fn scurve_matches_analytic_7segment() {
     assert!(p.tv > 0.0, "cruise must exist");
     // total-time identity T = L/v + v/a + a/j
     let tref = 10.0 / 1.5 + 1.5 / 2.0 + 2.0 / 4.0;
-    assert!((p.total() - tref).abs() < 1e-9, "total {} vs {}", p.total(), tref);
+    assert!(
+        (p.total() - tref).abs() < 1e-9,
+        "total {} vs {}",
+        p.total(),
+        tref
+    );
     // displacement integrates to L
     let (dp, v, a) = p.sample(p.total());
     assert!((dp - 10.0).abs() < 1e-9 && v.abs() < 1e-9 && a.abs() < 1e-9);
@@ -72,7 +77,12 @@ fn scurve_short_move_no_cruise() {
 // ---- FEASIBILITY (limits respected over the whole horizon) ----
 #[test]
 fn move_j_respects_limits() {
-    for name in ["toy.urdf", "showcase6.urdf", "redundant7.urdf", "prismatic.urdf"] {
+    for name in [
+        "toy.urdf",
+        "showcase6.urdf",
+        "redundant7.urdf",
+        "prismatic.urdf",
+    ] {
         let m = load(name);
         let l = lim(&m);
         let mut rng = R(0xBEEF);
@@ -100,11 +110,17 @@ fn move_j_respects_limits() {
                 let s = traj.sample(k as f64 * dt);
                 for i in 0..m.ndof {
                     assert!(s.qd[i].abs() <= l.vmax[i] * (1.0 + 1e-6), "{name} vel j{i}");
-                    assert!(s.qdd[i].abs() <= l.amax[i] * (1.0 + 1e-6), "{name} acc j{i}");
+                    assert!(
+                        s.qdd[i].abs() <= l.amax[i] * (1.0 + 1e-6),
+                        "{name} acc j{i}"
+                    );
                     let jk = (traj.sample(k as f64 * dt + dt).qdd[i]
                         - traj.sample(k as f64 * dt - dt).qdd[i])
                         / (2.0 * dt);
-                    assert!(jk.abs() <= l.jmax[i] * (1.0 + 1e-2), "{name} jerk j{i}={jk}");
+                    assert!(
+                        jk.abs() <= l.jmax[i] * (1.0 + 1e-2),
+                        "{name} jerk j{i}={jk}"
+                    );
                 }
             }
         }
@@ -193,7 +209,10 @@ fn move_l_abort_on_unreachable() {
     let l = lim(&m);
     let qa = [0.1, 0.1, 0.1, 0.1, 0.1, 0.1];
     let ta = fk_tip(&m, &qa);
-    let goal = Se3::from_parts(ta.translation_vec() + Vector3::new(5.0, 5.0, 5.0), ta.0.rotation);
+    let goal = Se3::from_parts(
+        ta.translation_vec() + Vector3::new(5.0, 5.0, 5.0),
+        ta.0.rotation,
+    );
     let opts = CartesianMoveOpts {
         on_failure: OnFailure::Abort,
         ..CartesianMoveOpts::defaults(l)
@@ -211,10 +230,17 @@ fn move_l_truncate_returns_prefix() {
     let l = lim(&m);
     let qa = [0.1, 0.1, 0.1, 0.1, 0.1, 0.1];
     let ta = fk_tip(&m, &qa);
-    let goal = Se3::from_parts(ta.translation_vec() + Vector3::new(5.0, 5.0, 5.0), ta.0.rotation);
+    let goal = Se3::from_parts(
+        ta.translation_vec() + Vector3::new(5.0, 5.0, 5.0),
+        ta.0.rotation,
+    );
     let opts = CartesianMoveOpts::defaults(l); // default = Truncate
     let traj = move_l(&m, m.tip_frame(), &qa, &goal, &opts).expect("truncate yields a prefix");
     assert!(!traj.completed, "should be a truncated prefix");
-    assert!(traj.reached < 1.0 && traj.reached >= 0.0, "reached {}", traj.reached);
+    assert!(
+        traj.reached < 1.0 && traj.reached >= 0.0,
+        "reached {}",
+        traj.reached
+    );
     assert!(traj.duration() > 0.0, "prefix must have positive duration");
 }

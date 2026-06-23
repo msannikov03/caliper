@@ -1,6 +1,7 @@
 //! `caliper` — the command-line face of the engine.
 use caliper::ik::{IkOpts, ik};
 use caliper::kinematics::{JacFrame, Jacobian, SingularityParams, jacobian};
+use caliper::motion::{CartesianMoveOpts, MotionLimits, MotionLimitsConfig, move_j, move_l};
 use caliper::spatial::Se3;
 use clap::{Parser, Subcommand};
 use nalgebra::{Matrix3, UnitQuaternion, Vector3};
@@ -57,6 +58,24 @@ enum Cmd {
         #[arg(long, value_delimiter = ',', allow_hyphen_values = true)]
         joints: Vec<f64>,
         /// Optional frame name; defaults to the tip frame.
+        #[arg(long)]
+        frame: Option<String>,
+    },
+    /// Plan a jerk-limited move and print sampled waypoints.
+    Move {
+        urdf: PathBuf,
+        /// MOVE_J goal config (length = ndof). Mutually exclusive with --target.
+        #[arg(long, value_delimiter = ',', allow_hyphen_values = true)]
+        goal: Option<Vec<f64>>,
+        /// MOVE_L Cartesian target: 12 numbers (9 row-major R then tx,ty,tz), as `ik`.
+        #[arg(long, value_delimiter = ',', allow_hyphen_values = true)]
+        target: Option<Vec<f64>>,
+        /// Start config (length = ndof). Defaults to all-zeros (home).
+        #[arg(long, value_delimiter = ',', allow_hyphen_values = true)]
+        start: Option<Vec<f64>>,
+        /// Sample period seconds for the printed table.
+        #[arg(long, default_value_t = 0.05)]
+        dt: f64,
         #[arg(long)]
         frame: Option<String>,
     },
@@ -204,6 +223,74 @@ fn main() -> anyhow::Result<()> {
                     .collect();
                 println!("    [{c}] [{}]", col.join(", "));
             }
+        }
+        Cmd::Move {
+            urdf,
+            goal,
+            target,
+            start,
+            dt,
+            frame,
+        } => {
+            let robot = caliper::model::Robot::from_urdf(&urdf)?;
+            let m = &robot.model;
+            let start = start.unwrap_or_else(|| vec![0.0; m.ndof]);
+            anyhow::ensure!(start.len() == m.ndof, "start needs {} values", m.ndof);
+            anyhow::ensure!(
+                dt.is_finite() && dt > 0.0,
+                "--dt must be a positive finite number"
+            );
+            anyhow::ensure!(
+                goal.is_some() ^ target.is_some(),
+                "pass exactly one of --goal / --target"
+            );
+            let limits = MotionLimits::from_model(m, &MotionLimitsConfig::default())?;
+            let (traj, kind) = if let Some(goal) = goal {
+                anyhow::ensure!(goal.len() == m.ndof, "goal needs {} values", m.ndof);
+                (move_j(m, &start, &goal, &limits)?, "MOVE_J")
+            } else {
+                let t = target.unwrap();
+                anyhow::ensure!(
+                    t.len() == 12,
+                    "target needs 12 values (9 row-major R then tx,ty,tz)"
+                );
+                let rot = Matrix3::new(t[0], t[1], t[2], t[3], t[4], t[5], t[6], t[7], t[8]);
+                let trans = Vector3::new(t[9], t[10], t[11]);
+                let goal_se3 = Se3::from_parts(trans, UnitQuaternion::from_matrix(&rot));
+                let f = resolve_frame(m, &frame)?;
+                let opts = CartesianMoveOpts::defaults(limits.clone());
+                (move_l(m, f, &start, &goal_se3, &opts)?, "MOVE_L")
+            };
+            println!(
+                "{kind} '{}'  duration {:.4}s  ({} dof, completed={})",
+                robot.name,
+                traj.duration(),
+                m.ndof,
+                traj.completed
+            );
+            let mut t = 0.0;
+            let dur = traj.duration();
+            let mut viol = false;
+            loop {
+                let s = traj.sample(t);
+                let qstr: Vec<String> = s.q.iter().map(|v| format!("{v:.4}")).collect();
+                let qdmax = s.qd.iter().fold(0.0f64, |a, &x| a.max(x.abs()));
+                let qddmax = s.qdd.iter().fold(0.0f64, |a, &x| a.max(x.abs()));
+                for (i, &v) in s.qd.iter().enumerate() {
+                    if v.abs() > limits.vmax[i] * 1.001 {
+                        viol = true;
+                    }
+                }
+                println!(
+                    "  {t:7.3}  [{}]   |qd|<={qdmax:6.3} |qdd|<={qddmax:6.3}",
+                    qstr.join(", ")
+                );
+                if t >= dur {
+                    break;
+                }
+                t = (t + dt).min(dur);
+            }
+            println!("  within-limits: {}", if viol { "FAIL" } else { "PASS" });
         }
     }
     Ok(())

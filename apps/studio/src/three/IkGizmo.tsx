@@ -17,6 +17,7 @@ import { DISPLAY_UP, DISPLAY_UP_INV } from "../coords";
 export function IkGizmo() {
   const robot = useStore((s) => s.robot);
   const frames = useStore((s) => s.frames);
+  const playing = useStore((s) => s.playing);
   const solveIkGoverned = useStore((s) => s.solveIkGoverned);
   const controls = useThree((s) => s.controls) as unknown as
     | { enabled: boolean }
@@ -37,7 +38,7 @@ export function IkGizmo() {
     return m;
   }, [tipMat]);
 
-  if (!robot || !tipMat) return null;
+  if (!robot || !tipMat || playing) return null; // gizmo hidden during playback
 
   const queue = (w: THREE.Matrix4) => {
     if (raf.current) return;

@@ -3564,6 +3564,7 @@ name = "studio"
 version = "0.1.0"
 dependencies = [
  "caliper",
+ "nalgebra",
  "serde",
  "serde_json",
  "tauri",

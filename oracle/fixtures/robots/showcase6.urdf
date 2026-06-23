@@ -1,0 +1,87 @@
+<?xml version="1.0"?>
+<!--
+  showcase6 — a believable 6-DOF anthropomorphic arm with a SPHERICAL WRIST
+  (j4,j5,j6 axes intersect at the wrist), authored for Caliper Studio's flagship
+  render. ~0.45m typical reach. Z-up base.
+
+  NOTE: the <visual> primitive geometry below is IGNORED by the engine — caliper's
+  compile() reads ONLY joint type / origin / axis / limit (see crates/caliper-model).
+  Visuals exist purely so an optional urdf-loader cross-render has something to draw;
+  the engine-driven procedural render is the source of truth. Adding/removing visuals
+  cannot change the Pinocchio-validated kinematics.
+-->
+<robot name="showcase6">
+  <link name="base">
+    <visual>
+      <origin xyz="0 0 0.007" rpy="0 0 0"/>
+      <geometry><cylinder radius="0.09" length="0.014"/></geometry>
+    </visual>
+  </link>
+  <link name="shoulder">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><cylinder radius="0.05" length="0.12"/></geometry>
+    </visual>
+  </link>
+  <link name="upper_arm">
+    <visual>
+      <origin xyz="0 0 0.09" rpy="0 0 0"/>
+      <geometry><box size="0.06 0.06 0.18"/></geometry>
+    </visual>
+  </link>
+  <link name="forearm">
+    <visual>
+      <origin xyz="0 0 0.08" rpy="0 0 0"/>
+      <geometry><box size="0.05 0.05 0.16"/></geometry>
+    </visual>
+  </link>
+  <link name="wrist1">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><cylinder radius="0.035" length="0.06"/></geometry>
+    </visual>
+  </link>
+  <link name="wrist2">
+    <visual>
+      <origin xyz="0 0 0" rpy="1.5708 0 0"/>
+      <geometry><cylinder radius="0.035" length="0.05"/></geometry>
+    </visual>
+  </link>
+  <link name="flange">
+    <visual>
+      <origin xyz="0 0 0.015" rpy="0 0 0"/>
+      <geometry><cylinder radius="0.03" length="0.03"/></geometry>
+    </visual>
+  </link>
+
+  <joint name="j1" type="revolute">
+    <parent link="base"/><child link="shoulder"/>
+    <origin xyz="0 0 0.103" rpy="0 0 0"/><axis xyz="0 0 1"/>
+    <limit lower="-2.9" upper="2.9" effort="50" velocity="3"/>
+  </joint>
+  <joint name="j2" type="revolute">
+    <parent link="shoulder"/><child link="upper_arm"/>
+    <origin xyz="0 0.05 0.04" rpy="0 0 0"/><axis xyz="0 1 0"/>
+    <limit lower="-2.0" upper="2.0" effort="50" velocity="3"/>
+  </joint>
+  <joint name="j3" type="revolute">
+    <parent link="upper_arm"/><child link="forearm"/>
+    <origin xyz="0 0 0.18" rpy="0 0 0"/><axis xyz="0 1 0"/>
+    <limit lower="-2.6" upper="2.6" effort="50" velocity="3"/>
+  </joint>
+  <joint name="j4" type="revolute">
+    <parent link="forearm"/><child link="wrist1"/>
+    <origin xyz="0 0 0.16" rpy="0 0 0"/><axis xyz="0 0 1"/>
+    <limit lower="-2.9" upper="2.9" effort="20" velocity="3"/>
+  </joint>
+  <joint name="j5" type="revolute">
+    <parent link="wrist1"/><child link="wrist2"/>
+    <origin xyz="0 0 0.02" rpy="0 0 0"/><axis xyz="0 1 0"/>
+    <limit lower="-2.0" upper="2.0" effort="20" velocity="3"/>
+  </joint>
+  <joint name="j6" type="revolute">
+    <parent link="wrist2"/><child link="flange"/>
+    <origin xyz="0 0 0.02" rpy="0 0 0"/><axis xyz="0 0 1"/>
+    <limit lower="-3.1" upper="3.1" effort="20" velocity="3"/>
+  </joint>
+</robot>

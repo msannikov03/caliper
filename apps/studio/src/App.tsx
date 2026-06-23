@@ -2,14 +2,22 @@ import { useEffect, useState } from "react";
 import { Canvas } from "@react-three/fiber";
 import { Grid, OrbitControls, GizmoHelper, GizmoViewport } from "@react-three/drei";
 import { invoke } from "@tauri-apps/api/core";
+import { RobotView } from "./three/RobotView";
+import { IkGizmo } from "./three/IkGizmo";
+import { Toolbar } from "./ui/Toolbar";
+import { JointPanel } from "./ui/JointPanel";
+import { Hud } from "./ui/Hud";
 import "./App.css";
 
-function Scene() {
+function SceneChrome() {
   return (
     <>
       <color attach="background" args={["#0a0a0c"]} />
-      <ambientLight intensity={0.45} />
-      <directionalLight position={[5, 8, 5]} intensity={1.2} castShadow />
+      {/* hand-rolled studio lighting — no remote HDRI, so a strict CSP holds */}
+      <ambientLight intensity={0.5} />
+      <directionalLight position={[5, 8, 5]} intensity={1.1} />
+      <directionalLight position={[-6, 3, -4]} intensity={0.4} color="#7fb0ff" />
+      <directionalLight position={[3, -2, -6]} intensity={0.3} color="#36c6d4" />
       <Grid
         args={[24, 24]}
         cellSize={0.25}
@@ -40,14 +48,15 @@ export default function App() {
 
   return (
     <div className="app">
-      <header className="topbar" data-tauri-drag-region>
-        <span className="brand">Caliper Studio</span>
-        <span className="engine">engine v{version}</span>
-      </header>
+      <Toolbar version={version} />
       <main className="viewport">
-        <Canvas shadows camera={{ position: [1.6, 1.2, 1.6], fov: 50 }}>
-          <Scene />
+        <Canvas camera={{ position: [0.7, 0.7, 0.7], fov: 50 }}>
+          <SceneChrome />
+          <RobotView />
+          <IkGizmo />
         </Canvas>
+        <JointPanel />
+        <Hud />
       </main>
     </div>
   );

@@ -95,6 +95,17 @@ fn solve_one(
 ) -> IkResult {
     let n = model.ndof;
     for it in 0..opts.max_iters {
+        // A non-finite q (e.g. a divergent step near a singularity on an unbounded
+        // joint) would feed NaN into nalgebra's SVD, which never terminates. Bail.
+        if !q.iter().all(|x| x.is_finite()) {
+            return IkResult {
+                success: false,
+                q,
+                residual: f64::INFINITY,
+                iters: it,
+                restarts_used: restart,
+            };
+        }
         let t_cur = fk_frame(model, &q, frame);
         // local-frame error twist e = log6(T_cur⁻¹ · T_target), [v; ω]
         let twist = Se3(t_cur.0.inverse() * target.0).log().0;
@@ -312,5 +323,25 @@ mod tests {
         let target = fk_frame(&m, &[0.0, 0.0], frame);
         let res = ik(&m, frame, &target, &[0.0, 0.0, 0.0], &IkOpts::default());
         assert!(!res.success && !res.residual.is_finite());
+    }
+
+    /// A non-finite seed must fail fast, never enter the non-terminating SVD.
+    /// (If the solve_one guard regresses, this test hangs and the suite times out.)
+    #[test]
+    fn ik_bails_on_nonfinite_seed_without_hanging() {
+        let m = toy();
+        let f = m.tip_frame();
+        let target = fk_frame(&m, &[0.3, 0.2], f);
+        let res = ik(
+            &m,
+            f,
+            &target,
+            &[f64::NAN, 0.0],
+            &IkOpts {
+                restarts: 1,
+                ..Default::default()
+            },
+        );
+        assert!(!res.success);
     }
 }

@@ -7,6 +7,7 @@ pub use caliper_hal as hal;
 pub use caliper_ik as ik;
 pub use caliper_kinematics as kinematics;
 pub use caliper_model as model;
+pub use caliper_motion as motion;
 pub use caliper_spatial as spatial;
 
 /// Engine version (from Cargo).
@@ -16,5 +17,6 @@ pub mod prelude {
     pub use crate::hal::{RobotBackend, SimBackend};
     pub use crate::kinematics::Jacobian;
     pub use crate::model::Robot;
+    pub use crate::motion::{MotionLimits, Trajectory, move_j};
     pub use crate::spatial::Se3;
 }

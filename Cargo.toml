@@ -6,6 +6,7 @@ members = [
   "crates/caliper-kinematics",
   "crates/caliper-dynamics",
   "crates/caliper-ik",
+  "crates/caliper-motion",
   "crates/caliper-hal",
   "crates/caliper",
   "crates/caliper-cli",
@@ -35,6 +36,7 @@ caliper-model      = { path = "crates/caliper-model", version = "0.1.0" }
 caliper-kinematics = { path = "crates/caliper-kinematics", version = "0.1.0" }
 caliper-dynamics   = { path = "crates/caliper-dynamics", version = "0.1.0" }
 caliper-ik         = { path = "crates/caliper-ik", version = "0.1.0" }
+caliper-motion     = { path = "crates/caliper-motion", version = "0.1.0" }
 caliper-hal        = { path = "crates/caliper-hal", version = "0.1.0" }
 caliper            = { path = "crates/caliper", version = "0.1.0" }
 

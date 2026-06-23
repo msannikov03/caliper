@@ -442,6 +442,7 @@ dependencies = [
  "caliper-ik",
  "caliper-kinematics",
  "caliper-model",
+ "caliper-motion",
  "caliper-spatial",
 ]
 
@@ -493,6 +494,19 @@ dependencies = [
  "nalgebra",
  "thiserror 2.0.18",
  "urdf-rs",
+]
+
+[[package]]
+name = "caliper-motion"
+version = "0.1.0"
+dependencies = [
+ "caliper-ik",
+ "caliper-kinematics",
+ "caliper-model",
+ "caliper-spatial",
+ "nalgebra",
+ "serde",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

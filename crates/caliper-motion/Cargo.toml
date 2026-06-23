@@ -1,5 +1,5 @@
 [package]
-name = "caliper"
+name = "caliper-motion"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,7 +10,7 @@ repository.workspace = true
 caliper-spatial.workspace = true
 caliper-model.workspace = true
 caliper-kinematics.workspace = true
-caliper-dynamics.workspace = true
 caliper-ik.workspace = true
-caliper-motion.workspace = true
-caliper-hal.workspace = true
+nalgebra.workspace = true
+thiserror.workspace = true
+serde.workspace = true

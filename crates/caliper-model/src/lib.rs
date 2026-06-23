@@ -61,6 +61,11 @@ pub struct Model {
     /// Normalized, joint-local axis.
     pub axis: Vec<Vector3<f64>>,
     pub limits: Vec<Option<(f64, f64)>>,
+    /// URDF velocity limit per dof (rad/s revolute | m/s prismatic). `None` when
+    /// the joint is continuous or the URDF omitted a positive velocity.
+    pub vel_limit: Vec<Option<f64>>,
+    /// URDF effort limit per dof. Parsed for later dynamics; UNUSED in Phase 3.
+    pub effort_limit: Vec<Option<f64>>,
     pub frames: Vec<LinkFrame>,
     pub frame_index: HashMap<String, usize>,
 }
@@ -128,6 +133,8 @@ struct EditJoint {
     origin: Se3,
     axis: Vector3<f64>,
     limits: Option<(f64, f64)>,
+    vel: Option<f64>,
+    effort: Option<f64>,
 }
 
 #[derive(Default)]
@@ -170,6 +177,11 @@ impl RobotTree {
                 urdf_rs::JointType::Fixed => (RawKind::Fixed, None),
                 other => return Err(CompileError::UnsupportedJoint(format!("{other:?}"))),
             };
+            // Velocity/effort: 0.0 ⇒ absent (mirrors valid_limit's lower==upper guard).
+            // A present <limit> missing velocity= hard-errors in urdf-rs (no per-field
+            // default) → surfaces as CompileError::Parse, which is correct.
+            let vel = (j.limit.velocity > 0.0).then_some(j.limit.velocity);
+            let effort = (j.limit.effort > 0.0).then_some(j.limit.effort);
             let a = j.axis.xyz.0;
             t.joints.push(EditJoint {
                 name: j.name.clone(),
@@ -179,6 +191,8 @@ impl RobotTree {
                 origin: pose_to_se3(&j.origin),
                 axis: Vector3::new(a[0], a[1], a[2]),
                 limits,
+                vel,
+                effort,
             });
         }
         Ok(t)
@@ -244,6 +258,8 @@ fn compile(t: &RobotTree) -> Result<Model, CompileError> {
         parent_to_joint: vec![],
         axis: vec![],
         limits: vec![],
+        vel_limit: vec![],
+        effort_limit: vec![],
         frames: vec![],
         frame_index: HashMap::new(),
     };
@@ -276,6 +292,8 @@ fn compile(t: &RobotTree) -> Result<Model, CompileError> {
                     m.parent_to_joint.push(placement);
                     m.axis.push(axis);
                     m.limits.push(j.limits);
+                    m.vel_limit.push(j.vel);
+                    m.effort_limit.push(j.effort);
                     anchor[j.child] = (Some(mi), Se3::identity());
                     register_frame(&mut m, &t.links[j.child], Some(mi), Se3::identity());
                     m.ndof += 1;
@@ -327,6 +345,15 @@ mod tests {
         // every link is a frame; the tip is l2
         assert_eq!(m.frame_name(m.tip_frame()), "l2");
         assert!(m.frame_id("base").is_some());
+    }
+
+    #[test]
+    fn parses_velocity_limits() {
+        assert_eq!(toy().vel_limit, vec![Some(3.0), Some(3.0)]);
+        assert_eq!(load("redundant7.urdf").vel_limit, vec![Some(1.0); 7]);
+        let p = load("prismatic.urdf");
+        assert_eq!(p.vel_limit, vec![Some(3.0), Some(1.0)]);
+        assert_eq!(p.effort_limit, vec![Some(10.0), Some(10.0)]);
     }
 
     #[test]

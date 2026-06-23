@@ -10,6 +10,7 @@
 //! **column-major** `[f64; 16]`, i.e. THREE.Matrix4 element order
 //! (`m[col*4 + row]`). `col_major_from_se3` / `se3_from_col_major` are exact
 //! inverses (round-trip ≈ 4.5e-16, verified by `mat_roundtrip` below).
+use caliper::dynamics::{Simulator, GRAVITY_EARTH};
 use caliper::ik::{ik, IkOpts};
 use caliper::kinematics::{
     fk_frame, fk_joints, frame_pose, jacobian, JacFrame, Jacobian, SingularityGovernor,
@@ -25,7 +26,7 @@ use nalgebra::{
 };
 use serde::{Deserialize, Serialize};
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 /// Loaded robot, shared across commands. `None` until `robot_info` succeeds.
 #[derive(Default)]
@@ -75,6 +76,9 @@ struct RobotInfo {
     /// Parallel to `jointNames`: URDF velocity limit or null.
     #[serde(rename = "velLimit")]
     vel_limit: Vec<Option<f64>>,
+    /// True iff every link carried `<inertial>` (the Simulate button gates on this).
+    #[serde(rename = "hasInertia")]
+    has_inertia: bool,
     /// Every link frame, in engine frame order (matches `get_frames` order).
     frames: Vec<FrameInfo>,
     /// Index into `frames` of the default tool/tip frame.
@@ -284,6 +288,7 @@ fn robot_info_from_model(model: &Model) -> RobotInfo {
         joint_kinds,
         limits,
         vel_limit: model.vel_limit.clone(),
+        has_inertia: model.has_inertia,
         frames,
         tip: model.tip_frame(),
     }
@@ -323,10 +328,24 @@ fn fixtures() -> Vec<(String, String)> {
         env!("CARGO_MANIFEST_DIR"),
         "/../../../oracle/fixtures/robots"
     );
-    ["showcase6", "toy", "prismatic", "branched", "redundant7"]
-        .iter()
-        .map(|n| (n.to_string(), format!("{root}/{n}.urdf")))
-        .collect()
+    [
+        "showcase6",
+        "dyn_pendulum2",
+        "toy",
+        "prismatic",
+        "branched",
+        "redundant7",
+    ]
+    .iter()
+    .map(|n| (n.to_string(), format!("{root}/{n}.urdf")))
+    .collect()
+}
+
+/// Baked frame matrices + tip XYZ at `q` (shared by sim_drop with `frames_at`).
+fn bake_frame_row(model: &Model, q: &[f64]) -> (Vec<[f64; 16]>, [f64; 3]) {
+    let frames = frames_at(model, q);
+    let tp = fk_frame(model, q, model.tip_frame()).translation();
+    (frames, tp)
 }
 
 /// Minimal robot summary returned by the legacy `load_robot` command.
@@ -821,6 +840,201 @@ fn plan_move_to_pose(
     ))
 }
 
+// ===== Phase 4: dynamics + gravity simulation =====
+
+/// A baked gravity/torque rollout. Superset of TrajectoryDto so the frontend can
+/// replay it through the SAME Phase-3 playback clock (baked frames, render-only).
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SimTrajectoryDto {
+    kind: String, // "sim"
+    duration: f64,
+    ndof: usize,
+    dt: f64,
+    times: Vec<f64>,
+    q: Vec<Vec<f64>>,
+    qd: Vec<Vec<f64>>,
+    tip_path: Vec<[f64; 3]>,
+    frames: Vec<Vec<[f64; 16]>>,
+    energy: Vec<f64>,
+    energy_drift: f64,
+    settled: bool,
+    gravity: [f64; 3],
+    damping: f64,
+    // playback-union fields so the frontend treats it as a TrajectoryDto:
+    ok: bool,
+    reached: f64,
+    max_jerk_ratio: f64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SimDropReq {
+    q_start: Vec<f64>,
+    tau: Option<Vec<f64>>,
+    gravity: Option<[f64; 3]>,
+    damping: Option<f64>,
+    duration: Option<f64>,
+    dt: Option<f64>,      // render dt
+    step_dt: Option<f64>, // integrator dt
+    settle: Option<bool>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DynamicsDto {
+    tau: Vec<f64>,
+    gravity_torque: Vec<f64>,
+    mass_matrix: Option<Vec<Vec<f64>>>,
+}
+
+/// Bake a gravity/torque rollout into a render-only trajectory.
+#[tauri::command]
+fn sim_drop(
+    req: SimDropReq,
+    state: tauri::State<'_, AppState>,
+) -> Result<SimTrajectoryDto, String> {
+    let guard = state.model.lock().map_err(|_| "state lock poisoned")?;
+    let model = guard.as_ref().ok_or("no robot loaded")?;
+    if !model.has_inertia {
+        return Err(
+            "this robot has no inertial data — load one with <inertial> (showcase6 or dyn_pendulum2)"
+                .into(),
+        );
+    }
+    let n = model.ndof;
+    if req.q_start.len() != n {
+        return Err(format!("expected {n} joint values"));
+    }
+    if req.q_start.iter().any(|x| !x.is_finite()) {
+        return Err("q_start contains a non-finite value".into());
+    }
+    let render_dt = req.dt.unwrap_or(0.02).clamp(1e-3, 0.1);
+    let step_dt = req.step_dt.unwrap_or(1e-3).clamp(1e-4, render_dt);
+    let duration = req.duration.unwrap_or(4.0).clamp(0.1, 30.0);
+    let damping = req.damping.unwrap_or(0.0).max(0.0);
+    let settle = req.settle.unwrap_or(true);
+
+    let mut sim = Simulator::new(Arc::new(model.clone())).map_err(|e| e.to_string())?;
+    sim.h_max = step_dt;
+    sim.set_gravity(
+        req.gravity
+            .map(|g| Vector3::new(g[0], g[1], g[2]))
+            .unwrap_or(GRAVITY_EARTH),
+    );
+    sim.set_damping(&vec![damping; n])
+        .map_err(|e| e.to_string())?;
+    if let Some(tau) = &req.tau {
+        if tau.len() != n {
+            return Err(format!("tau needs {n} values"));
+        }
+        sim.set_torque(tau).map_err(|e| e.to_string())?;
+    }
+    sim.reset_to(&req.q_start, &vec![0.0; n])
+        .map_err(|e| e.to_string())?;
+
+    let e0 = sim.total_energy();
+    let nsamp = ((duration / render_dt).ceil() as usize).max(1);
+    let mut times = vec![];
+    let mut q = vec![];
+    let mut qd = vec![];
+    let mut tip_path = vec![];
+    let mut frames = vec![];
+    let mut energy = vec![];
+    let mut settled = false;
+    let mut record = |sim: &Simulator, t: f64| {
+        let (fr, tp) = bake_frame_row(model, sim.q());
+        times.push(t);
+        q.push(sim.q().to_vec());
+        qd.push(sim.qd().to_vec());
+        tip_path.push(tp);
+        frames.push(fr);
+        energy.push(sim.total_energy());
+    };
+    record(&sim, 0.0);
+    for _ in 0..nsamp {
+        sim.step(render_dt)
+            .map_err(|e| format!("simulation diverged: {e}"))?;
+        let qdmax = sim.qd().iter().fold(0.0f64, |a, &x| a.max(x.abs()));
+        record(&sim, sim.time());
+        if settle && damping > 0.0 && qdmax < 1e-3 && sim.time() > 0.1 {
+            settled = true;
+            break;
+        }
+    }
+    let drift = (energy.last().copied().unwrap_or(e0) - e0).abs() / e0.abs().max(1e-6);
+    Ok(SimTrajectoryDto {
+        kind: "sim".into(),
+        duration: *times.last().unwrap_or(&0.0),
+        ndof: n,
+        dt: render_dt,
+        times,
+        q,
+        qd,
+        tip_path,
+        frames,
+        energy,
+        energy_drift: drift,
+        settled,
+        gravity: sim.gravity.into(),
+        damping,
+        ok: true,
+        reached: 1.0,
+        max_jerk_ratio: 0.0,
+    })
+}
+
+/// Inverse dynamics (+ optional mass matrix) at a configuration.
+#[tauri::command]
+fn dynamics_at(
+    q: Vec<f64>,
+    qd: Option<Vec<f64>>,
+    qdd: Option<Vec<f64>>,
+    gravity: Option<[f64; 3]>,
+    mass_matrix: Option<bool>,
+    state: tauri::State<'_, AppState>,
+) -> Result<DynamicsDto, String> {
+    let guard = state.model.lock().map_err(|_| "state lock poisoned")?;
+    let model = guard.as_ref().ok_or("no robot loaded")?;
+    if !model.has_inertia {
+        return Err("robot has no inertial data".into());
+    }
+    let n = model.ndof;
+    if q.len() != n {
+        return Err(format!("expected {n} joint values"));
+    }
+    let qd = qd.unwrap_or_else(|| vec![0.0; n]);
+    let qdd = qdd.unwrap_or_else(|| vec![0.0; n]);
+    if q.iter()
+        .chain(qd.iter())
+        .chain(qdd.iter())
+        .any(|x| !x.is_finite())
+    {
+        return Err("q/qd/qdd contains a non-finite value".into());
+    }
+    let g = gravity
+        .map(|a| Vector3::new(a[0], a[1], a[2]))
+        .unwrap_or(GRAVITY_EARTH);
+    let z = vec![0.0; n];
+    let tau = caliper::dynamics::rnea(model, &q, &qd, &qdd, &g).map_err(|e| e.to_string())?;
+    let gt = caliper::dynamics::rnea(model, &q, &z, &z, &g).map_err(|e| e.to_string())?;
+    let mm = if mass_matrix.unwrap_or(false) {
+        let m = caliper::dynamics::crba(model, &q).map_err(|e| e.to_string())?;
+        Some(
+            (0..m.nrows())
+                .map(|r| (0..m.ncols()).map(|c| m[(r, c)]).collect())
+                .collect(),
+        )
+    } else {
+        None
+    };
+    Ok(DynamicsDto {
+        tau: tau.as_slice().to_vec(),
+        gravity_torque: gt.as_slice().to_vec(),
+        mass_matrix: mm,
+    })
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -840,7 +1054,9 @@ pub fn run() {
             save_pose,
             list_poses,
             delete_pose,
-            plan_move_to_pose
+            plan_move_to_pose,
+            sim_drop,
+            dynamics_at
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -953,5 +1169,21 @@ mod tests {
         assert_eq!(info.frames.len(), 7);
         let markers = info.frames.iter().filter(|f| f.joint_index >= 0).count();
         assert_eq!(markers, 6);
+    }
+
+    #[test]
+    fn sim_drop_falls_under_gravity() {
+        let m = load("showcase6.urdf");
+        assert!(m.has_inertia);
+        let mut sim = Simulator::new(std::sync::Arc::new(m.clone())).unwrap();
+        sim.set_damping(&vec![0.05; m.ndof]).unwrap();
+        sim.reset_to(&vec![0.0; m.ndof], &vec![0.0; m.ndof])
+            .unwrap();
+        let e0 = sim.total_energy();
+        for _ in 0..200 {
+            sim.step(0.02).unwrap();
+        }
+        assert!(sim.q().iter().any(|&x| x.abs() > 0.05), "arm did not fall");
+        assert!(sim.total_energy() <= e0 + 1e-6, "damped energy increased");
     }
 }

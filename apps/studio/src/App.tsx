@@ -10,7 +10,36 @@ import { Hud } from "./ui/Hud";
 import { SingularityHud } from "./ui/SingularityHud";
 import { Transport } from "./ui/Transport";
 import { PosePanel } from "./ui/PosePanel";
+import { SimulatePanel } from "./ui/SimulatePanel";
+import { useStore } from "./store";
 import "./App.css";
+
+function ModeTabs() {
+  const mode = useStore((s) => s.mode);
+  const setMode = useStore((s) => s.setMode);
+  const robot = useStore((s) => s.robot);
+  if (!robot) return null;
+  const tabs: { id: "jog" | "motion" | "simulate"; label: string; disabled?: boolean }[] = [
+    { id: "jog", label: "Jog" },
+    { id: "motion", label: "Motion" },
+    { id: "simulate", label: "Simulate", disabled: !robot.hasInertia },
+  ];
+  return (
+    <div className="mode-tabs">
+      {tabs.map((t) => (
+        <button
+          key={t.id}
+          disabled={t.disabled}
+          title={t.disabled ? "no inertial data" : ""}
+          className={mode === t.id ? "active" : ""}
+          onClick={() => setMode(t.id)}
+        >
+          {t.label}
+        </button>
+      ))}
+    </div>
+  );
+}
 
 function SceneChrome() {
   return (
@@ -53,6 +82,7 @@ export default function App() {
     <div className="app">
       <Toolbar version={version} />
       <main className="viewport">
+        <ModeTabs />
         <Canvas camera={{ position: [0.7, 0.7, 0.7], fov: 50 }}>
           <SceneChrome />
           <RobotView />
@@ -60,6 +90,7 @@ export default function App() {
         </Canvas>
         <JointPanel />
         <PosePanel />
+        <SimulatePanel />
         <Hud />
         <SingularityHud />
         <Transport />

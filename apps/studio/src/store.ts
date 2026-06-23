@@ -27,6 +27,7 @@ export interface RobotInfo {
   limits: ([number, number] | null)[]; // parallel to jointNames
   frames: FrameInfo[];
   tip: number; // index into frames
+  hasInertia: boolean; // dynamics available (every link has <inertial>)
 }
 
 /** column-major 4x4 (THREE.Matrix4 element order), exactly what fromArray wants. */
@@ -65,6 +66,14 @@ export interface TrajectoryDto {
   reached: number;
   maxJerkRatio: number;
 }
+export interface SimTrajectoryDto extends TrajectoryDto {
+  energy: number[];
+  energyDrift: number;
+  settled: boolean;
+  gravity: [number, number, number];
+  damping: number;
+}
+export type StudioMode = "jog" | "motion" | "simulate";
 export interface NamedPoseDto {
   name: string;
   q: number[];
@@ -112,6 +121,16 @@ interface StudioState {
   deletePose: (name: string) => Promise<void>;
   refreshPoses: () => Promise<void>;
   _applyTrajAt: (t: number) => void;
+
+  // simulation (Phase 4)
+  mode: StudioMode;
+  setMode: (m: StudioMode) => void;
+  simTraj: SimTrajectoryDto | null;
+  simGravity: boolean;
+  simDamping: number;
+  simTorque: number[];
+  runGravityDrop: () => Promise<void>;
+  clearSim: () => void;
 }
 
 export const useStore = create<StudioState>((set, get) => ({
@@ -129,6 +148,11 @@ export const useStore = create<StudioState>((set, get) => ({
   poses: [],
   playing: false,
   playhead: 0,
+  mode: "jog",
+  simTraj: null,
+  simGravity: true,
+  simDamping: 0.2,
+  simTorque: [],
 
   async loadRobot(path) {
     set({ loading: true, error: null });
@@ -143,6 +167,8 @@ export const useStore = create<StudioState>((set, get) => ({
         ikOk: null,
         ikResidual: null,
         traj: null,
+        simTraj: null,
+        mode: "jog",
         playing: false,
         playhead: 0,
         poses: [],
@@ -157,7 +183,7 @@ export const useStore = create<StudioState>((set, get) => ({
   },
 
   setJoint(i, v) {
-    if (get().playing) return; // don't fight the playback clock
+    if (get().playing || get().mode === "simulate") return; // sim/playback own the pose
     const q = get().q.slice();
     q[i] = v;
     // a manual jog invalidates any prior IK status (it described a different pose)
@@ -217,7 +243,7 @@ export const useStore = create<StudioState>((set, get) => ({
 
   async solveIkGoverned(targetColMajor, snap) {
     const { q, robot } = get();
-    if (!robot || get().playing) return; // gizmo is inert during playback
+    if (!robot || get().playing || get().mode === "simulate") return; // gizmo inert
     const frameName = robot.frames[robot.tip].name;
     const reqId = get()._reqId + 1;
     set({ _reqId: reqId });
@@ -278,10 +304,10 @@ export const useStore = create<StudioState>((set, get) => ({
   },
   clearTraj() {
     stopClock();
-    set({ traj: null, playing: false, playhead: 0 });
+    set({ traj: null, simTraj: null, playing: false, playhead: 0 });
   },
   play() {
-    const { traj } = get();
+    const traj = activeClip(get());
     if (!traj) return;
     base = get().playhead >= traj.duration ? 0 : get().playhead;
     t0 = performance.now();
@@ -293,7 +319,7 @@ export const useStore = create<StudioState>((set, get) => ({
     set({ playing: false });
   },
   seek(t) {
-    const { traj } = get();
+    const traj = activeClip(get());
     if (!traj) return;
     const tt = Math.max(0, Math.min(t, traj.duration));
     stopClock();
@@ -328,7 +354,7 @@ export const useStore = create<StudioState>((set, get) => ({
     }
   },
   _applyTrajAt(t) {
-    const { traj } = get();
+    const traj = activeClip(get());
     if (!traj) return;
     // pick the nearest baked frame row (render-only; no engine round-trip)
     let k = Math.round(t / traj.dt);
@@ -337,7 +363,50 @@ export const useStore = create<StudioState>((set, get) => ({
     set({ q: traj.q[k], frames: traj.frames[k], _reqId: get()._reqId + 1 });
     void get().refreshAnalysis(); // HUD/ellipsoid follow; latest-wins via _analyzeReqId
   },
+
+  // ---- simulation (Phase 4) ----
+  setMode(m) {
+    stopClock();
+    set({ mode: m, traj: null, simTraj: null, playing: false, playhead: 0 });
+    void get().refreshFrames();
+  },
+  async runGravityDrop() {
+    const { q, robot, simGravity, simDamping, simTorque } = get();
+    if (!robot) return;
+    if (!robot.hasInertia) {
+      set({ error: "this robot has no inertial data" });
+      return;
+    }
+    const tau = simTorque.length === robot.ndof ? simTorque : new Array(robot.ndof).fill(0);
+    try {
+      const simTraj = await invoke<SimTrajectoryDto>("sim_drop", {
+        req: {
+          qStart: q,
+          tau,
+          gravity: simGravity ? [0, 0, -9.81] : [0, 0, 0],
+          damping: simDamping,
+          duration: 4.0,
+          settle: true,
+        },
+      });
+      set({ simTraj, traj: null, playhead: 0, playing: false });
+      get()._applyTrajAt(0);
+      get().play();
+    } catch (e) {
+      set({ error: String(e) });
+    }
+  },
+  clearSim() {
+    stopClock();
+    set({ simTraj: null, playing: false, playhead: 0 });
+    void get().refreshFrames();
+  },
 }));
+
+/// The active playback clip: a baked sim rollout takes precedence over a motion traj.
+function activeClip(s: StudioState): TrajectoryDto | null {
+  return s.simTraj ?? s.traj;
+}
 
 // rAF-coalesced refresh so a slider drag fires at most one FK invoke per frame.
 let pending = false;
@@ -361,7 +430,8 @@ function stopClock() {
   }
 }
 function tick(get: () => StudioState, set: (p: Partial<StudioState>) => void) {
-  const { traj, playing } = get();
+  const traj = activeClip(get());
+  const playing = get().playing;
   if (!traj || !playing) {
     rafId = 0;
     return;

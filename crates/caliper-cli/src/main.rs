@@ -1,4 +1,5 @@
 //! `caliper` — the command-line face of the engine.
+use caliper::dynamics::{self, GRAVITY_EARTH, Simulator};
 use caliper::ik::{IkOpts, ik};
 use caliper::kinematics::{JacFrame, Jacobian, SingularityParams, jacobian};
 use caliper::motion::{CartesianMoveOpts, MotionLimits, MotionLimitsConfig, move_j, move_l};
@@ -6,6 +7,7 @@ use caliper::spatial::Se3;
 use clap::{Parser, Subcommand};
 use nalgebra::{Matrix3, UnitQuaternion, Vector3};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 #[derive(Parser)]
 #[command(
@@ -79,6 +81,38 @@ enum Cmd {
         #[arg(long)]
         frame: Option<String>,
     },
+    /// Inverse/forward dynamics at a configuration (Phase 4).
+    Dyn {
+        urdf: PathBuf,
+        #[arg(long, value_delimiter = ',', allow_hyphen_values = true)]
+        joints: Vec<f64>,
+        #[arg(long, value_delimiter = ',', allow_hyphen_values = true)]
+        vel: Option<Vec<f64>>,
+        #[arg(long, value_delimiter = ',', allow_hyphen_values = true)]
+        accel: Option<Vec<f64>>,
+        #[arg(long, value_delimiter = ',', allow_hyphen_values = true)]
+        gravity: Option<Vec<f64>>,
+        #[arg(long)]
+        mass_matrix: bool,
+    },
+    /// Time-step the passive/forced dynamics and print q + total energy (Phase 4).
+    Sim {
+        urdf: PathBuf,
+        #[arg(long, value_delimiter = ',', allow_hyphen_values = true)]
+        start: Option<Vec<f64>>,
+        #[arg(long, value_delimiter = ',', allow_hyphen_values = true)]
+        torque: Option<Vec<f64>>,
+        #[arg(long, value_delimiter = ',', allow_hyphen_values = true)]
+        gravity: Option<Vec<f64>>,
+        #[arg(long, default_value_t = 0.0)]
+        damping: f64,
+        #[arg(long, default_value_t = 2.0)]
+        duration: f64,
+        #[arg(long, default_value_t = 1e-3)]
+        dt: f64,
+        #[arg(long, default_value_t = 0.1)]
+        print_dt: f64,
+    },
 }
 
 fn resolve_frame(model: &caliper::model::Model, frame: &Option<String>) -> anyhow::Result<usize> {
@@ -87,6 +121,16 @@ fn resolve_frame(model: &caliper::model::Model, frame: &Option<String>) -> anyho
         Some(name) => model
             .frame_id(name)
             .ok_or_else(|| anyhow::anyhow!("unknown frame `{name}`")),
+    }
+}
+
+fn grav_vec(g: &Option<Vec<f64>>) -> anyhow::Result<Vector3<f64>> {
+    match g {
+        None => Ok(GRAVITY_EARTH),
+        Some(v) => {
+            anyhow::ensure!(v.len() == 3, "--gravity needs 3 values x,y,z");
+            Ok(Vector3::new(v[0], v[1], v[2]))
+        }
     }
 }
 
@@ -291,6 +335,134 @@ fn main() -> anyhow::Result<()> {
                 t = (t + dt).min(dur);
             }
             println!("  within-limits: {}", if viol { "FAIL" } else { "PASS" });
+        }
+        Cmd::Dyn {
+            urdf,
+            joints,
+            vel,
+            accel,
+            gravity,
+            mass_matrix,
+        } => {
+            let robot = caliper::model::Robot::from_urdf(&urdf)?;
+            let m = &robot.model;
+            anyhow::ensure!(
+                m.has_inertia,
+                "model '{}' has no <inertial> data; dynamics needs mass/inertia on every link",
+                robot.name
+            );
+            anyhow::ensure!(
+                joints.len() == m.ndof,
+                "expected {} joint value(s), got {}",
+                m.ndof,
+                joints.len()
+            );
+            let qd = vel.unwrap_or_else(|| vec![0.0; m.ndof]);
+            let qdd = accel.unwrap_or_else(|| vec![0.0; m.ndof]);
+            anyhow::ensure!(
+                qd.len() == m.ndof && qdd.len() == m.ndof,
+                "--vel/--accel must have {} values",
+                m.ndof
+            );
+            let g = grav_vec(&gravity)?;
+            let tau = dynamics::rnea(m, &joints, &qd, &qdd, &g)?;
+            let gq = dynamics::rnea(m, &joints, &vec![0.0; m.ndof], &vec![0.0; m.ndof], &g)?;
+            println!(
+                "DYN '{}'  (g=[{:.3},{:.3},{:.3}])",
+                robot.name, g.x, g.y, g.z
+            );
+            let f = |v: &[f64]| {
+                v.iter()
+                    .map(|x| format!("{x:8.4}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            println!("  tau               = [{}]   (N·m / N)", f(tau.as_slice()));
+            println!("  gravity-only g(q) = [{}]", f(gq.as_slice()));
+            if mass_matrix {
+                let mm = dynamics::crba(m, &joints)?;
+                println!("  M(q) =");
+                for r in 0..mm.nrows() {
+                    let row: Vec<String> = (0..mm.ncols())
+                        .map(|c| format!("{:8.4}", mm[(r, c)]))
+                        .collect();
+                    println!("    [{}]", row.join(", "));
+                }
+            }
+        }
+        Cmd::Sim {
+            urdf,
+            start,
+            torque,
+            gravity,
+            damping,
+            duration,
+            dt,
+            print_dt,
+        } => {
+            let robot = caliper::model::Robot::from_urdf(&urdf)?;
+            let m = &robot.model;
+            anyhow::ensure!(
+                m.has_inertia,
+                "model '{}' has no <inertial> data; sim needs mass/inertia",
+                robot.name
+            );
+            anyhow::ensure!(
+                dt.is_finite() && dt > 0.0 && duration > 0.0,
+                "--dt and --duration must be positive"
+            );
+            let q0 = start.unwrap_or_else(|| vec![0.0; m.ndof]);
+            anyhow::ensure!(q0.len() == m.ndof, "--start needs {} values", m.ndof);
+            let model = Arc::new(m.clone());
+            let mut sim = Simulator::new(model)?;
+            sim.set_gravity(grav_vec(&gravity)?);
+            sim.set_damping(&vec![damping; m.ndof])?;
+            sim.h_max = dt;
+            sim.qd_clamp = None;
+            if let Some(tau) = torque {
+                anyhow::ensure!(tau.len() == m.ndof, "--torque needs {} values", m.ndof);
+                sim.set_torque(&tau)?;
+            }
+            sim.reset_to(&q0, &vec![0.0; m.ndof])?;
+            let e0 = sim.total_energy();
+            println!(
+                "SIM '{}'  (dt={dt}, damping={damping}, g={:?})",
+                robot.name,
+                grav_vec(&gravity)?.as_slice()
+            );
+            println!("    t      q                              |qd|max     E_total");
+            let mut next_print = 0.0;
+            let mut t = 0.0;
+            let mut settled = false;
+            loop {
+                if t >= next_print - 1e-12 {
+                    let qstr = sim
+                        .q()
+                        .iter()
+                        .map(|x| format!("{x:6.3}"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let qdmax = sim.qd().iter().fold(0.0f64, |a, &x| a.max(x.abs()));
+                    println!(
+                        "  {t:6.3}  [{qstr}]   {qdmax:7.3}   {:10.5}",
+                        sim.total_energy()
+                    );
+                    if qdmax < 1e-3 && damping > 0.0 && t > 0.1 {
+                        settled = true;
+                    }
+                    next_print += print_dt;
+                }
+                if t >= duration {
+                    break;
+                }
+                sim.step(dt)?;
+                t += dt;
+            }
+            let drift = (sim.total_energy() - e0).abs() / e0.abs().max(1e-6);
+            println!("  energy drift: {:.3e} ({:.4}%)", drift, drift * 100.0);
+            if settled {
+                println!("  settled (|qd|max < 1e-3)");
+            }
         }
     }
     Ok(())

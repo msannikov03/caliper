@@ -1,0 +1,20 @@
+<?xml version="1.0"?>
+<!-- D1 regression fixture: link l1 has BOTH a primitive (box) collider AND a mesh
+     collider that is DROPPED (no loader). l1 is therefore only PARTIALLY covered:
+     a query can report "clear" for the dropped mesh part. uncovered_frames() must
+     count l1 (partial) in addition to the collider-less `base`. -->
+<robot name="collide_mixed">
+  <link name="base"/>
+  <link name="l1">
+    <collision><origin xyz="0 0 0"/>
+      <geometry><box size="0.1 0.1 0.1"/></geometry></collision>
+    <collision><origin xyz="0 0 0"/>
+      <geometry><mesh filename="hand.stl"/></geometry></collision>
+  </link>
+  <joint name="j1" type="revolute">
+    <parent link="base"/><child link="l1"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-1" upper="1" effort="1" velocity="1"/>
+    <origin xyz="0 0 0.1"/>
+  </joint>
+</robot>

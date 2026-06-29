@@ -126,10 +126,20 @@ impl CollisionModel {
     pub fn num_colliders(&self) -> usize {
         self.model.collision.len()
     }
-    /// Frames carrying NO collider (unsafe-by-omission hint for the UI/docs).
+    /// Frames NOT fully collision-covered (unsafe-by-omission hint for the UI/docs):
+    /// frames with NO collider, PLUS frames that carry a primitive collider but also
+    /// had a mesh/capsule collider DROPPED (only partially covered — a query can still
+    /// report "clear" for the dropped part).
     pub fn uncovered_frames(&self) -> usize {
-        let covered: HashSet<usize> = self.model.collision.iter().map(|g| g.frame).collect();
-        self.model.frames.len() - covered.len()
+        let dropped: HashSet<usize> = self.model.dropped_collider_frames.iter().copied().collect();
+        let fully_covered: HashSet<usize> = self
+            .model
+            .collision
+            .iter()
+            .map(|g| g.frame)
+            .filter(|f| !dropped.contains(f))
+            .collect();
+        self.model.frames.len() - fully_covered.len()
     }
     pub fn allowlisted(&self, a: usize, b: usize) -> bool {
         let key = if a < b { (a, b) } else { (b, a) };
@@ -464,6 +474,25 @@ mod tests {
             )))
             .unwrap(),
         )
+    }
+
+    #[test]
+    fn partially_covered_frame_is_reported_uncovered() {
+        // l1 has a box collider AND a dropped mesh; base has none. Both must count
+        // as not-fully-covered (the OLD count would have been 1 = base only).
+        let m = model("collide_mixed.urdf");
+        assert_eq!(
+            m.dropped_collider_frames.len(),
+            1,
+            "l1's dropped mesh tracked"
+        );
+        let cm = CollisionModel::new(m, WorldScene::new(), 0.0);
+        assert_eq!(cm.num_colliders(), 1, "l1's box is the only primitive");
+        assert_eq!(
+            cm.uncovered_frames(),
+            2,
+            "base (no collider) + l1 (partial: mesh dropped) both uncovered"
+        );
     }
 
     #[test]

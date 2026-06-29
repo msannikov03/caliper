@@ -110,6 +110,12 @@ pub struct Model {
     /// arms are usually mesh-collidered, so callers MUST surface the uncovered count
     /// (`caliper_collision::CollisionModel::uncovered_frames`). Empty when absent.
     pub collision: Vec<CollisionGeom>,
+    /// Frame indices of link frames that had a `<collision>` whose geometry was
+    /// DROPPED (mesh/capsule). Such a frame may carry primitive colliders too, so it
+    /// is only PARTIALLY covered — a query can still report "clear" for its dropped
+    /// part. Callers must treat these as not-fully-covered (see
+    /// `caliper_collision::CollisionModel::uncovered_frames`).
+    pub dropped_collider_frames: Vec<usize>,
 }
 
 impl Model {
@@ -187,6 +193,9 @@ struct RobotTree {
     link_inertia: Vec<Option<SpatialInertia>>,
     /// Parallel to `links`: parsed `<collision>` primitives (link-frame local).
     link_collision: Vec<Vec<(Se3, CollisionShape)>>,
+    /// Parallel to `links`: true if the link had a `<collision>` whose geometry
+    /// was DROPPED (mesh/capsule, no loader) — that link is only partially covered.
+    link_dropped: Vec<bool>,
     joints: Vec<EditJoint>,
     link_index: HashMap<String, usize>,
 }
@@ -202,7 +211,9 @@ impl RobotTree {
             t.link_index.insert(l.name.clone(), t.links.len());
             t.links.push(l.name.clone());
             t.link_inertia.push(parse_inertial(&l.inertial));
-            t.link_collision.push(parse_collisions(l));
+            let (geoms, dropped) = parse_collisions(l);
+            t.link_collision.push(geoms);
+            t.link_dropped.push(dropped);
         }
         for j in &u.joints {
             let parent = *t
@@ -284,8 +295,9 @@ fn parse_inertial(inr: &urdf_rs::Inertial) -> Option<SpatialInertia> {
 /// Box/sphere/cylinder are exact; meshes and capsules are SKIPPED (no geometry
 /// loader) — such links contribute NO collider and are consequently NOT checked
 /// for collision (unsafe-by-omission; see the `Model::collision` note).
-fn parse_collisions(link: &urdf_rs::Link) -> Vec<(Se3, CollisionShape)> {
+fn parse_collisions(link: &urdf_rs::Link) -> (Vec<(Se3, CollisionShape)>, bool) {
     let mut out = Vec::new();
+    let mut dropped = false;
     for c in &link.collision {
         let origin = pose_to_se3(&c.origin);
         let shape = match &c.geometry {
@@ -300,11 +312,14 @@ fn parse_collisions(link: &urdf_rs::Link) -> Vec<(Se3, CollisionShape)> {
                 radius: *radius,
                 length: *length,
             },
-            _ => continue, // Mesh / Capsule: no inline geometry → skip (collision-free)
+            _ => {
+                dropped = true; // Mesh / Capsule: no inline geometry → dropped (NOT checked)
+                continue;
+            }
         };
         out.push((origin, shape));
     }
-    out
+    (out, dropped)
 }
 
 /// A URDF limit is meaningful only when `lower < upper`; otherwise treat the
@@ -363,6 +378,7 @@ fn compile(t: &RobotTree) -> Result<Model, CompileError> {
         inertia: vec![],
         has_inertia: false,
         collision: vec![],
+        dropped_collider_frames: vec![],
     };
     // per link: (nearest movable-joint ancestor, accumulated fixed offset from it)
     let mut anchor: Vec<(Option<usize>, Se3)> = vec![(None, Se3::identity()); nlinks];
@@ -447,6 +463,9 @@ fn compile(t: &RobotTree) -> Result<Model, CompileError> {
                     origin,
                     shape,
                 });
+            }
+            if t.link_dropped.get(li).copied().unwrap_or(false) {
+                m.dropped_collider_frames.push(frame);
             }
         }
     }

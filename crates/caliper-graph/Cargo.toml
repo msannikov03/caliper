@@ -1,0 +1,27 @@
+[package]
+name = "caliper-graph"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Phase-8 dataflow executor: a deterministic, serde-serializable graph IR that
+# composes the existing engine ops (FK/IK/motion/planning/dynamics/control/
+# collision) into a runnable pipeline. NO new math — every compute node dispatches
+# to an existing engine free fn/type. Pure-Rust, lean: serde + the engine crates +
+# nalgebra only (no rand/tokio). This crate IS the `.caliper-graph.json` schema; the
+# three faces (Studio backend, CLI, PyO3) all call `validate` / `run` here.
+[dependencies]
+thiserror.workspace = true
+serde.workspace = true
+nalgebra.workspace = true
+caliper-spatial.workspace = true
+caliper-model.workspace = true
+caliper-kinematics.workspace = true
+caliper-dynamics.workspace = true
+caliper-ik.workspace = true
+caliper-motion.workspace = true
+caliper-hal.workspace = true
+caliper-planning.workspace = true
+caliper-collision.workspace = true

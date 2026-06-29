@@ -5,6 +5,7 @@
 //! point, though they also depend on individual sub-crates directly where they
 //! need types this facade does not re-export.
 pub use caliper_dynamics as dynamics;
+pub use caliper_graph as graph;
 pub use caliper_hal as hal;
 pub use caliper_ik as ik;
 pub use caliper_kinematics as kinematics;

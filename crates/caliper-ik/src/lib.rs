@@ -79,7 +79,7 @@ pub fn ik(model: &Model, frame: usize, target: &Se3, seed: &[f64], opts: &IkOpts
             best = Some(res);
         }
     }
-    best.unwrap()
+    best.expect("restart loop ran at least once")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -135,6 +135,10 @@ fn solve_one(
         .max(opts.lambda_floor_sq); // floor keeps H SPD for redundant (wide-J) arms
 
         // LM normal equations: (JᵀJ + λ²(I + diag(JᵀJ))) dq = Jᵀe
+        // INTENTIONAL: this is the joint-space Levenberg–Marquardt formulation —
+        // damping is applied to the n×n `JᵀJ` (with a Tikhonov SPD floor), NOT the
+        // task-space `JJᵀ`. Both are valid; this one is Pinocchio-cross-validated.
+        // Do not "fix" it to a task-space damped pseudo-inverse.
         let jt = j.transpose();
         let mut h = &jt * &j;
         let g = &jt * &e;

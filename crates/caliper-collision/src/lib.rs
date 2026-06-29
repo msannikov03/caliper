@@ -51,9 +51,24 @@ impl WorldScene {
         self
     }
     pub fn add_box(mut self, center: [f64; 3], half: [f64; 3]) -> Self {
+        // A negative or non-finite half-extent would poison the SAT: `f64::clamp`
+        // panics when `min > max` (negative half flips the bounds) and a `NaN`
+        // extent makes every comparison `false`, so the box would silently "never
+        // separate" (i.e. collide with everything). The builder returns `Self` and
+        // cannot surface an error, so sanitize to a finite, non-negative box.
+        let half = [
+            sanitize_extent(half[0]),
+            sanitize_extent(half[1]),
+            sanitize_extent(half[2]),
+        ];
         self.boxes.push((center, half));
         self
     }
+}
+
+/// Clamp a box half-extent to a finite, non-negative value (NaN/∞/negative → 0).
+fn sanitize_extent(x: f64) -> f64 {
+    if x.is_finite() { x.max(0.0) } else { 0.0 }
 }
 
 /// Result of a collision query. Pairs/hits are canonically sorted → deterministic.
@@ -249,8 +264,14 @@ fn seed_allowlist(model: &Model) -> HashSet<(usize, usize)> {
                 (Some(x), Some(y)) => {
                     x == y || model.parent[x] == Some(y) || model.parent[y] == Some(x)
                 }
+                // Two base/world-fixed frames are one rigid body → always allowed.
                 (None, None) => true,
-                (None, Some(y)) | (Some(y), None) => model.parent[y].is_none(),
+                // A movable-anchored frame vs the base is NOT auto-allowlisted: the
+                // base shares no joint with a movable link in the adjacency sense (a
+                // root link can fold back and genuinely strike the base), so that
+                // pair must stay checked. Only the base itself / base-attached fixed
+                // frames (the (None,None) arm) are co-located with the base.
+                (None, Some(_)) | (Some(_), None) => false,
             };
             if adjacent {
                 let key = if fa < fb { (fa, fb) } else { (fb, fa) };
@@ -556,5 +577,136 @@ mod tests {
             cm.query(&[0.0, f64::NAN, 0.0]),
             Err(CollisionError::NonFinite)
         ));
+    }
+
+    // ---- D2: edge-edge (cross-product) separating axes ----
+
+    /// Two long thin rods crossing at a genuine 3-D skew, chosen so that ALL six
+    /// face axes overlap and the ONLY separating axis is the edge-edge axis
+    /// `A0 × B0`. Rod A lies along x; rod B's long axis is `(0,0.6,0.8)` with its
+    /// cross-section rotated 45° so the cross axis `(0,-0.8,0.6)` coincides with no
+    /// face normal. The combined reach along that axis is ≈0.2814 (per H·0.6), so
+    /// the contact threshold is H≈0.469.
+    fn skew_rods(h: f64) -> bool {
+        let c = std::f64::consts::FRAC_1_SQRT_2;
+        let s8 = 0.8 * c; // 0.565685…
+        let s6 = 0.6 * c; // 0.424264…
+        let i = Matrix3::identity();
+        let rb = Matrix3::from_columns(&[
+            Vector3::new(0.0, 0.6, 0.8),
+            Vector3::new(c, -s8, s6),
+            Vector3::new(c, s8, -s6),
+        ]);
+        let ext = Vector3::new(2.0, 0.1, 0.1);
+        obb_obb(
+            &Vector3::zeros(),
+            &i,
+            &ext,
+            &Vector3::new(0.0, 0.0, h),
+            &rb,
+            &ext,
+        )
+    }
+
+    #[test]
+    fn edge_edge_axis_separates() {
+        // H = 0.6 > 0.469 → the cross axis A0×B0 separates → NO collision. If the
+        // cross-product axes were missing/under-reported, all 6 face axes overlap
+        // and obb_obb would WRONGLY report a collision here.
+        assert!(
+            !skew_rods(0.6),
+            "skew rods separated only along an edge-edge axis must report clear"
+        );
+    }
+
+    #[test]
+    fn edge_edge_axis_contacts() {
+        // H = 0.2 < 0.469 → no axis separates → the rods interpenetrate. Confirms
+        // the edge-edge axis term does not spuriously over-separate (false clear).
+        assert!(
+            skew_rods(0.2),
+            "skew rods inside the edge-edge contact threshold must collide"
+        );
+    }
+
+    #[test]
+    fn parallel_edges_degenerate_no_false_separation() {
+        // Identically-oriented overlapping boxes → every A_i × B_j is ~0 (parallel
+        // edges, degenerate axes). The EPS guard on `absr` must keep those axes from
+        // falsely separating: overlap MUST be reported as a collision.
+        let i = Matrix3::identity();
+        let h = Vector3::new(0.5, 0.5, 0.5);
+        assert!(
+            obb_obb(
+                &Vector3::zeros(),
+                &i,
+                &h,
+                &Vector3::new(0.3, 0.0, 0.0),
+                &i,
+                &h
+            ),
+            "overlapping parallel-edge boxes must not be split by a degenerate axis"
+        );
+    }
+
+    // ---- D3: base is not auto-allowlisted against a movable root link ----
+
+    #[test]
+    fn base_not_allowlisted_against_movable_root() {
+        // Give the (collider-less) base its own collider, then confirm the base is
+        // NOT auto-allowlisted against l1 — a root link folding back onto the base
+        // is a real self-collision that must stay checked. Adjacent movable links
+        // (l1-l2) remain allowlisted; non-adjacent (l1-l3) remain checked.
+        let mut m = Model::from_urdf(Path::new(&format!(
+            "{}/../../oracle/fixtures/robots/collide_arm.urdf",
+            env!("CARGO_MANIFEST_DIR")
+        )))
+        .unwrap();
+        let base = m.frame_id("base").unwrap();
+        let l1 = m.frame_id("l1").unwrap();
+        let l2 = m.frame_id("l2").unwrap();
+        let l3 = m.frame_id("l3").unwrap();
+        // clone an existing box collider and re-anchor it to the base frame
+        let mut g = m.collision[0].clone();
+        g.frame = base;
+        m.collision.push(g);
+        let cm = CollisionModel::new(Arc::new(m), WorldScene::new(), 0.0);
+        assert!(
+            !cm.allowlisted(base, l1),
+            "base must NOT be auto-allowlisted against a movable root link"
+        );
+        assert!(
+            cm.allowlisted(l1, l2),
+            "adjacent movable links stay allowlisted"
+        );
+        assert!(!cm.allowlisted(l1, l3), "non-adjacent links stay checked");
+    }
+
+    // ---- B13: degenerate world-box extents are sanitized ----
+
+    #[test]
+    fn add_box_sanitizes_degenerate_extents() {
+        let m = model("collide_shapes.urdf");
+        // A non-finite extent must not turn the SAT into a blanket "collide with
+        // everything": it is clamped to a finite zero box, so a far box stays clear.
+        let cm = CollisionModel::new(
+            m.clone(),
+            WorldScene::new().add_box([10.0, 10.0, 10.0], [f64::NAN, 0.2, 0.2]),
+            0.0,
+        );
+        assert!(
+            !cm.query(&[0.0]).unwrap().has_collision(),
+            "a NaN-extent box far from the arm must not register a collision"
+        );
+        // Negative extents clamp to zero (and must not panic via f64::clamp bounds).
+        let cm2 = CollisionModel::new(
+            m,
+            WorldScene::new().add_box([10.0, 0.0, 0.0], [-5.0, -5.0, -5.0]),
+            0.0,
+        );
+        assert!(
+            !cm2.query(&[0.0]).unwrap().has_collision(),
+            "negative extents must clamp to a degenerate, non-colliding box"
+        );
     }
 }

@@ -69,6 +69,16 @@ pub enum PlanError {
     Dim { expected: usize, got: usize },
     #[error("non-finite value in {0}")]
     NonFinite(&'static str),
+    #[error("invalid planner config: {0}")]
+    InvalidConfig(&'static str),
+    #[error("{which} joint {joint} = {value} is outside bounds [{lo}, {hi}]")]
+    OutOfBounds {
+        which: &'static str,
+        joint: usize,
+        value: f64,
+        lo: f64,
+        hi: f64,
+    },
     #[error("start configuration is in collision: {0}")]
     StartInCollision(String),
     #[error("goal configuration is in collision: {0}")]
@@ -129,6 +139,7 @@ impl Planner {
     /// collision-free at the planner resolution (verify independently with
     /// [`verify_path`](Self::verify_path)).
     pub fn plan(&self, start: &[f64], goal: &[f64]) -> Result<Vec<Vec<f64>>, PlanError> {
+        self.validate_cfg()?;
         let n = self.model.ndof;
         for (name, q) in [("start", start), ("goal", goal)] {
             if q.len() != n {
@@ -141,6 +152,8 @@ impl Planner {
                 return Err(PlanError::NonFinite(name));
             }
         }
+        self.check_bounds(start, "start")?;
+        self.check_bounds(goal, "goal")?;
         self.check_endpoint(start, true)?;
         self.check_endpoint(goal, false)?;
 
@@ -242,6 +255,47 @@ impl Planner {
     }
 
     // ---- internals ----
+
+    /// Reject a config that would livelock or overflow the planner. `edge_resolution`
+    /// of 0 turns `(d/0).ceil() as usize` into `usize::MAX` (an effectively infinite
+    /// collision-check loop); a `step` of 0 does the same in `connect`.
+    fn validate_cfg(&self) -> Result<(), PlanError> {
+        let c = &self.cfg;
+        if !(c.step.is_finite() && c.step > 0.0) {
+            return Err(PlanError::InvalidConfig("step must be finite and > 0"));
+        }
+        if !(c.edge_resolution.is_finite() && c.edge_resolution > 0.0) {
+            return Err(PlanError::InvalidConfig(
+                "edge_resolution must be finite and > 0",
+            ));
+        }
+        if !(c.goal_bias.is_finite() && (0.0..=1.0).contains(&c.goal_bias)) {
+            return Err(PlanError::InvalidConfig("goal_bias must be in [0, 1]"));
+        }
+        if !(c.unbounded_range.is_finite() && c.unbounded_range > 0.0) {
+            return Err(PlanError::InvalidConfig(
+                "unbounded_range must be finite and > 0",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Reject an endpoint outside the configured per-joint bounds (random samples are
+    /// already bounded; user-supplied endpoints are not).
+    fn check_bounds(&self, q: &[f64], which: &'static str) -> Result<(), PlanError> {
+        for (i, (&v, &(lo, hi))) in q.iter().zip(self.bounds.iter()).enumerate() {
+            if v < lo || v > hi {
+                return Err(PlanError::OutOfBounds {
+                    which,
+                    joint: i,
+                    value: v,
+                    lo,
+                    hi,
+                });
+            }
+        }
+        Ok(())
+    }
 
     fn check_endpoint(&self, q: &[f64], is_start: bool) -> Result<(), PlanError> {
         match self.collision.query(q) {
@@ -446,6 +500,56 @@ mod tests {
             assert!((s0[i] - start[i]).abs() < 1e-6, "start joint {i}");
             assert!((s1[i] - goal[i]).abs() < 1e-3, "goal joint {i}");
         }
+    }
+
+    #[test]
+    fn invalid_config_errors() {
+        let start = vec![0.0, 0.0, 0.0];
+        let goal = vec![0.4, -0.4, 0.4];
+        let bad = |mutate: fn(&mut PlannerConfig)| {
+            let mut cfg = PlannerConfig::default();
+            mutate(&mut cfg);
+            Planner::new(model("collide_arm.urdf"), WorldScene::new(), cfg).plan(&start, &goal)
+        };
+        // each of these would livelock/overflow without validation
+        for res in [
+            bad(|c| c.edge_resolution = 0.0),
+            bad(|c| c.edge_resolution = -0.05),
+            bad(|c| c.edge_resolution = f64::NAN),
+            bad(|c| c.step = 0.0),
+            bad(|c| c.step = -0.3),
+            bad(|c| c.goal_bias = -0.1),
+            bad(|c| c.goal_bias = 1.5),
+            bad(|c| c.unbounded_range = 0.0),
+            bad(|c| c.unbounded_range = f64::INFINITY),
+        ] {
+            assert!(
+                matches!(res, Err(PlanError::InvalidConfig(_))),
+                "expected InvalidConfig, got {res:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn endpoint_out_of_bounds_errors() {
+        let p = arm_planner(WorldScene::new());
+        // collide_arm joints are revolute with finite limits; push well past them.
+        let far = vec![100.0, 0.0, 0.0];
+        let start = vec![0.0, 0.0, 0.0];
+        assert!(
+            matches!(
+                p.plan(&far, &start),
+                Err(PlanError::OutOfBounds { which: "start", .. })
+            ),
+            "out-of-bounds start must error"
+        );
+        assert!(
+            matches!(
+                p.plan(&start, &far),
+                Err(PlanError::OutOfBounds { which: "goal", .. })
+            ),
+            "out-of-bounds goal must error"
+        );
     }
 
     #[test]

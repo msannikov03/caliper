@@ -238,8 +238,8 @@ impl ManipulabilityEllipsoid {
                 eig.eigenvectors.column(2).into(),
             ),
         ];
-        // descending radius; eigenvalues are finite (real symmetric input), so no NaN.
-        pairs.sort_by(|x, y| y.0.partial_cmp(&x.0).unwrap_or(std::cmp::Ordering::Equal));
+        // descending radius; total_cmp is infallible (eigenvalues are finite reals).
+        pairs.sort_by(|x, y| y.0.total_cmp(&x.0));
         let fix = |mut v: Vector3<f64>| -> Vector3<f64> {
             let nrm = v.norm();
             if nrm > 0.0 {
@@ -289,6 +289,21 @@ pub fn analyze(
 /// A geometric Jacobian wrapper carrying the SVD-based singularity analysis.
 pub struct Jacobian(pub DMatrix<f64>);
 
+/// Degenerate (no-information) report for an `n`-column Jacobian: used for a legal
+/// 0-DOF / empty / non-finite Jacobian, or if nalgebra fails to return SVD factors.
+fn degenerate_report(n: usize) -> SingularityReport {
+    SingularityReport {
+        manipulability: 0.0,
+        condition_number: f64::INFINITY,
+        sigma_min: 0.0,
+        kind: SingularityKind::None,
+        offending_joints: vec![],
+        nullspace_basis: DMatrix::zeros(n, 0),
+        escape_direction: DVector::zeros(n),
+        sigma: [0.0; 3],
+    }
+}
+
 impl Jacobian {
     /// True iff every element is finite. nalgebra's Golub–Reinsch SVD does NOT
     /// terminate on a NaN/Inf matrix, so every SVD path guards on this first.
@@ -319,22 +334,18 @@ impl Jacobian {
         let n = j.ncols();
         // 0-DOF, empty, or non-finite (NaN/Inf would hang the SVD) → degenerate report.
         if n == 0 || j.nrows() == 0 || !self.all_finite() {
-            return SingularityReport {
-                manipulability: 0.0,
-                condition_number: f64::INFINITY,
-                sigma_min: 0.0,
-                kind: SingularityKind::None,
-                offending_joints: vec![],
-                nullspace_basis: DMatrix::zeros(n, 0),
-                escape_direction: DVector::zeros(n),
-                sigma: [0.0; 3],
-            };
+            return degenerate_report(n);
         }
         let svd = j.clone().svd(true, true);
         let s = &svd.singular_values;
         let k = s.len();
-        let u = svd.u.as_ref().expect("u");
-        let vt = svd.v_t.as_ref().expect("v_t");
+        // Recoverable: if nalgebra somehow fails to return the SVD factors (it
+        // should not, given the all_finite guard above), fall back to a degenerate
+        // report rather than panicking.
+        let (u, vt) = match (svd.u.as_ref(), svd.v_t.as_ref()) {
+            (Some(u), Some(vt)) => (u, vt),
+            _ => return degenerate_report(n),
+        };
 
         let sigma_max = s[0];
         let sigma_min = s[k - 1];
@@ -350,12 +361,19 @@ impl Jacobian {
             *slot = if k > i { s[k - 1 - i] } else { 0.0 };
         }
 
+        // Nullspace via the n×n symmetric eigendecomposition of JᵀJ. The compact SVD
+        // of a 6×n Jacobian only yields min(6,n) right-singular vectors in `vt`, so for
+        // a redundant (n>6) arm it omits the structural self-motion modes (σ=0 directions
+        // beyond the 6 tracked). JᵀJ has eigenvalues σ², INCLUDING those zeros, so its
+        // eigenvectors span the FULL right nullspace. Select σ² below (eps_null·σ_max)².
         let tol = p.eps_null * sigma_max;
-        let null_idx: Vec<usize> = (0..k).filter(|&i| s[i] < tol).collect();
+        let tol_sq = tol * tol;
+        let jtj = j.transpose() * j; // n × n, symmetric PSD; eigenvalues = σ²
+        let eig = SymmetricEigen::new(jtj);
+        let null_idx: Vec<usize> = (0..n).filter(|&i| eig.eigenvalues[i] < tol_sq).collect();
         let mut nullspace_basis = DMatrix::<f64>::zeros(n, null_idx.len());
         for (c, &i) in null_idx.iter().enumerate() {
-            let col = DVector::from_iterator(n, vt.row(i).iter().copied());
-            nullspace_basis.set_column(c, &col);
+            nullspace_basis.set_column(c, &eig.eigenvectors.column(i).into_owned());
         }
 
         let escape_direction = DVector::from_iterator(n, vt.row(k - 1).iter().copied());
@@ -429,6 +447,11 @@ impl SingularityGovernor {
         prev_sigma_min: f64,
     ) -> Vector6<f64> {
         let k = s.len();
+        // Guard the empty / dim-mismatched SVD (e.g. a 0-DOF robot): there is no
+        // direction to project onto or scale, so pass the command through unchanged.
+        if k == 0 || u.ncols() < k {
+            return *v_cmd;
+        }
         let lambda2 = self.damping_sq(s[k - 1]);
         let approaching = s[k - 1] < prev_sigma_min;
         let mut out = Vector6::zeros();
@@ -585,6 +608,36 @@ mod tests {
     }
 
     #[test]
+    fn redundant_arm_has_structural_nullspace() {
+        // A 7-DOF arm at a GENERIC (full task-rank) config still has a 1-D self-motion
+        // nullspace: dim ker(J) = n - rank(J) = 7 - 6 = 1. The compact 6×7 SVD's v_t
+        // only carries 6 right vectors and would report 0 columns; the JᵀJ
+        // eigendecomposition must recover the structural σ=0 direction.
+        let m = load("redundant7.urdf");
+        assert_eq!(m.ndof, 7);
+        let f = m.tip_frame();
+        let q = [0.3, -0.4, 0.6, 0.2, -0.5, 0.1, 0.35]; // generic, non-singular
+        let (_, j) = jacobian(&m, &q, f, JacFrame::World);
+        let rep = Jacobian(j.clone()).analyze(&SingularityParams::default());
+        // full task rank here ⇒ not flagged singular, yet a self-motion mode exists
+        assert_eq!(rep.kind, SingularityKind::None);
+        assert!(
+            rep.nullspace_basis.ncols() >= 1,
+            "redundant arm must expose >=1 nullspace column (got {})",
+            rep.nullspace_basis.ncols()
+        );
+        // every reported nullspace column is genuinely in ker(J): ‖J·n‖ ≈ 0
+        for c in 0..rep.nullspace_basis.ncols() {
+            let n_c = rep.nullspace_basis.column(c).into_owned();
+            assert!((n_c.norm() - 1.0).abs() < 1e-9, "nullspace col {c} unit");
+            assert!(
+                (&j * &n_c).norm() < 1e-9,
+                "‖J·n‖ for nullspace col {c} must vanish"
+            );
+        }
+    }
+
+    #[test]
     fn governor_damping_is_continuous_and_monotone() {
         let g = SingularityGovernor::new(SingularityParams::default());
         let e = g.params.eps_activate;
@@ -652,7 +705,7 @@ mod tests {
             .iter()
             .copied()
             .collect();
-        sv.sort_by(|a, b| b.partial_cmp(a).unwrap()); // descending
+        sv.sort_by(|a, b| b.total_cmp(a)); // descending (infallible)
         #[allow(clippy::needless_range_loop)] // parallel-index radii/axes/sv reads clearest
         for k in 0..3 {
             assert!((ell.radii[k] - sv[k]).abs() < 1e-9, "radius {k}");

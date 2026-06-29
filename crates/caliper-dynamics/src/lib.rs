@@ -327,6 +327,18 @@ impl Simulator {
         ke + pe
     }
 
+    /// Clamp `|qd| ≤ qd_clamp` in place. A non-finite or negative bound is a
+    /// no-op (guards against `f64::clamp(min>max)` panicking on a bad `Some(c)`).
+    #[inline]
+    fn apply_qd_clamp(&mut self) {
+        if let Some(c) = self.qd_clamp
+            && c.is_finite()
+            && c >= 0.0
+        {
+            self.qd.iter_mut().for_each(|v| *v = v.clamp(-c, c));
+        }
+    }
+
     fn micro_step(&mut self, h: f64) -> Result<(), DynError> {
         // tau_total = tau_applied − damping ⊙ qd  (viscous, folded into FD input)
         let tau = &self.tau_applied - self.damping.component_mul(&self.qd);
@@ -341,9 +353,7 @@ impl Simulator {
             return Err(DynError::Diverged);
         }
         self.qd += h * &qdd; // semi-implicit: velocity first
-        if let Some(c) = self.qd_clamp {
-            self.qd.iter_mut().for_each(|v| *v = v.clamp(-c, c));
-        }
+        self.apply_qd_clamp();
         let qd_new = self.qd.clone();
         self.q += h * &qd_new; // position from the NEW velocity
         if !self.q.iter().chain(self.qd.iter()).all(|x| x.is_finite()) {
@@ -354,8 +364,25 @@ impl Simulator {
     }
 
     /// Advance by `dt` with internal substeps (`h ≤ h_max`, clamped to max_substeps).
+    ///
+    /// Rejects invalid public inputs up front (B5): a non-finite `dt`, a
+    /// non-finite/non-positive `h_max`, or `max_substeps == 0` would otherwise
+    /// produce a degenerate substep count or `NaN` state — all surface as
+    /// [`DynError::Diverged`]. If honoring `h ≤ h_max` would need more than
+    /// `max_substeps` substeps the step is rejected rather than silently
+    /// coarsening `h` past `h_max` (C4).
     pub fn step(&mut self, dt: f64) -> Result<(), DynError> {
-        let n = ((dt / self.h_max).ceil() as usize).clamp(1, self.max_substeps);
+        if !dt.is_finite() || !self.h_max.is_finite() || self.h_max <= 0.0 || self.max_substeps < 1
+        {
+            return Err(DynError::Diverged);
+        }
+        let n_ideal = (dt / self.h_max).ceil();
+        if n_ideal > self.max_substeps as f64 {
+            // Would require h > h_max to fit the substep budget; refuse instead
+            // of silently coarsening the integration step.
+            return Err(DynError::Diverged);
+        }
+        let n = (n_ideal as usize).clamp(1, self.max_substeps);
         let h = dt / n as f64;
         match self.integrator {
             IntegratorKind::Symplectic => {
@@ -402,6 +429,7 @@ impl Simulator {
         let (k4q, k4v) = (&v0 + h * &k3v, a4);
         self.q = &q0 + (h / 6.0) * (&k1q + 2.0 * &k2q + 2.0 * &k3q + &k4q);
         self.qd = &v0 + (h / 6.0) * (&k1v + 2.0 * &k2v + 2.0 * &k3v + &k4v);
+        self.apply_qd_clamp(); // C3: honor qd_clamp here too, matching micro_step
         if !self.q.iter().chain(self.qd.iter()).all(|x| x.is_finite()) {
             return Err(DynError::Diverged);
         }
@@ -520,5 +548,74 @@ mod tests {
             assert!(moved > 0.1, "{name} swing didn't move");
             assert!(worst < 3e-3, "{name} energy drift {worst:e}");
         }
+    }
+
+    // B5: step must reject invalid public inputs with an Err (never panic / NaN).
+    #[test]
+    fn step_rejects_invalid_params() {
+        let m = Arc::new(load("dyn_pendulum2.urdf"));
+        // max_substeps == 0
+        let mut s = Simulator::new(m.clone()).unwrap();
+        s.max_substeps = 0;
+        assert!(s.step(1e-3).is_err());
+        // non-finite dt
+        let mut s = Simulator::new(m.clone()).unwrap();
+        assert!(s.step(f64::NAN).is_err());
+        assert!(s.step(f64::INFINITY).is_err());
+        // non-positive / non-finite h_max
+        let mut s = Simulator::new(m.clone()).unwrap();
+        s.h_max = 0.0;
+        assert!(s.step(1e-3).is_err());
+        let mut s = Simulator::new(m.clone()).unwrap();
+        s.h_max = -1e-3;
+        assert!(s.step(1e-3).is_err());
+        let mut s = Simulator::new(m).unwrap();
+        s.h_max = f64::NAN;
+        assert!(s.step(1e-3).is_err());
+    }
+
+    // C4: needing more than max_substeps to honor h_max surfaces as an error
+    // instead of silently coarsening h beyond h_max.
+    #[test]
+    fn step_surfaces_excessive_substeps() {
+        let m = Arc::new(load("dyn_pendulum2.urdf"));
+        let mut s = Simulator::new(m).unwrap();
+        s.h_max = 1e-4;
+        s.max_substeps = 2;
+        assert!(s.step(1e-3).is_err()); // dt/h_max = 10 > 2 substeps
+        assert!(s.step(2e-4).is_ok()); // dt/h_max = 2 fits the budget exactly
+    }
+
+    // B8: a negative qd_clamp must NOT panic (would be f64::clamp(min>max));
+    // clamping is simply skipped for a non-finite/negative bound.
+    #[test]
+    fn qd_clamp_negative_does_not_panic() {
+        let m = Arc::new(load("dyn_pendulum2.urdf"));
+        let mut s = Simulator::new(m.clone()).unwrap();
+        s.qd_clamp = Some(-5.0);
+        s.set_torque(&vec![1.0; s.ndof()]).unwrap();
+        assert!(s.step(1e-3).is_ok());
+        let mut s = Simulator::new(m).unwrap();
+        s.qd_clamp = Some(f64::NAN);
+        s.set_torque(&vec![1.0; s.ndof()]).unwrap();
+        assert!(s.step(1e-3).is_ok());
+    }
+
+    // C3: rk4_step must honor qd_clamp just like micro_step.
+    #[test]
+    fn rk4_honors_qd_clamp() {
+        let m = Arc::new(load("dyn_pendulum2.urdf"));
+        let mut s = Simulator::new(m).unwrap();
+        s.integrator = IntegratorKind::Rk4;
+        s.qd_clamp = Some(0.5);
+        s.set_torque(&vec![100.0; s.ndof()]).unwrap();
+        for _ in 0..50 {
+            s.step(1e-3).unwrap();
+        }
+        assert!(
+            s.qd().iter().all(|&v| v.abs() <= 0.5 + 1e-9),
+            "rk4_step ignored qd_clamp: {:?}",
+            s.qd()
+        );
     }
 }

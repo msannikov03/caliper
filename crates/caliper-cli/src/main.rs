@@ -7,6 +7,9 @@ use caliper::hal::{
 use caliper::ik::{IkOpts, ik};
 use caliper::kinematics::{JacFrame, Jacobian, SingularityParams, jacobian};
 use caliper::motion::{CartesianMoveOpts, MotionLimits, MotionLimitsConfig, move_j, move_l};
+use caliper::planning::path_length;
+use caliper::planning::reach::{ReachChecker, ReachConfig, ReachStatus};
+use caliper::planning::{Planner, PlannerConfig};
 use caliper::spatial::Se3;
 use caliper_collision::{CollisionModel, WorldScene};
 use clap::{Parser, Subcommand};
@@ -175,11 +178,49 @@ enum Cmd {
         #[arg(long, value_delimiter = ',', allow_hyphen_values = true)]
         joints: Vec<f64>,
         /// Add a solid ground half-space at z = <ground>.
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         ground: Option<f64>,
         /// Collider inflation margin (m).
         #[arg(long, default_value_t = 0.0)]
         margin: f64,
+    },
+    /// Plan a collision-free path to a joint goal or Cartesian --target (Phase 6).
+    Plan {
+        urdf: PathBuf,
+        /// Joint-space goal (length = ndof). Mutually exclusive with --target.
+        #[arg(long, value_delimiter = ',', allow_hyphen_values = true)]
+        goal: Option<Vec<f64>>,
+        /// Cartesian goal: 12 numbers (9 row-major R then tx,ty,tz), as `ik`.
+        #[arg(long, value_delimiter = ',', allow_hyphen_values = true)]
+        target: Option<Vec<f64>>,
+        /// Start config (length = ndof). Defaults to all-zeros.
+        #[arg(long, value_delimiter = ',', allow_hyphen_values = true)]
+        start: Option<Vec<f64>>,
+        /// Solid ground half-space at z = <ground>.
+        #[arg(long, allow_hyphen_values = true)]
+        ground: Option<f64>,
+        /// Obstacle box: 6 numbers cx,cy,cz,hx,hy,hz.
+        #[arg(long, value_delimiter = ',', allow_hyphen_values = true)]
+        obstacle: Option<Vec<f64>>,
+        /// PRNG seed (determinism).
+        #[arg(long, default_value_t = 0xCA11)]
+        seed: u64,
+        /// Frame for a Cartesian --target; defaults to the tip frame.
+        #[arg(long)]
+        frame: Option<String>,
+    },
+    /// Collision-aware reachability of a Cartesian pose (Phase 6).
+    Reach {
+        urdf: PathBuf,
+        /// Cartesian pose: 12 numbers (9 row-major R then tx,ty,tz).
+        #[arg(long, value_delimiter = ',', allow_hyphen_values = true)]
+        target: Vec<f64>,
+        #[arg(long, allow_hyphen_values = true)]
+        ground: Option<f64>,
+        #[arg(long, value_delimiter = ',', allow_hyphen_values = true)]
+        obstacle: Option<Vec<f64>>,
+        #[arg(long)]
+        frame: Option<String>,
     },
 }
 
@@ -753,8 +794,123 @@ fn main() -> anyhow::Result<()> {
                 println!("  world: {}", m.frame_name(*f));
             }
         }
+        Cmd::Plan {
+            urdf,
+            goal,
+            target,
+            start,
+            ground,
+            obstacle,
+            seed,
+            frame,
+        } => {
+            let robot = caliper::model::Robot::from_urdf(&urdf)?;
+            let m = &robot.model;
+            anyhow::ensure!(
+                goal.is_some() ^ target.is_some(),
+                "pass exactly one of --goal / --target"
+            );
+            let start = start.unwrap_or_else(|| vec![0.0; m.ndof]);
+            anyhow::ensure!(start.len() == m.ndof, "--start needs {} values", m.ndof);
+            anyhow::ensure!(
+                start.iter().all(|x| x.is_finite()),
+                "--start contains a non-finite value"
+            );
+            let model = Arc::new(m.clone());
+            let scene = world_scene(ground, &obstacle)?;
+            let cfg = PlannerConfig {
+                seed,
+                ..PlannerConfig::default()
+            };
+            let planner = Planner::new(model, scene, cfg);
+            let path = if let Some(goal) = goal {
+                anyhow::ensure!(goal.len() == m.ndof, "--goal needs {} values", m.ndof);
+                planner.plan(&start, &goal)?
+            } else {
+                let t = target.unwrap();
+                let goal_se3 = target_to_se3(&t)?;
+                let f = resolve_frame(m, &frame)?;
+                planner.plan_to_pose(&start, &goal_se3, f, &start)?
+            };
+            let free = planner.verify_path(&path);
+            println!("PLAN '{}'  seed={seed}", robot.name);
+            println!("  waypoints   : {}", path.len());
+            println!("  path length : {:.4} rad", path_length(&path));
+            if planner.uncovered_frames() > 0 {
+                println!(
+                    "  ⚠ {} frame(s) have NO collider (mesh/none) — not collision-checked",
+                    planner.uncovered_frames()
+                );
+            }
+            println!(
+                "  collision-free (re-verified): {}",
+                if free { "PASS" } else { "FAIL" }
+            );
+        }
+        Cmd::Reach {
+            urdf,
+            target,
+            ground,
+            obstacle,
+            frame,
+        } => {
+            let robot = caliper::model::Robot::from_urdf(&urdf)?;
+            let m = &robot.model;
+            let pose = target_to_se3(&target)?;
+            let f = resolve_frame(m, &frame)?;
+            let model = Arc::new(m.clone());
+            let scene = world_scene(ground, &obstacle)?;
+            let rc = ReachChecker::new(
+                model,
+                scene,
+                ReachConfig {
+                    frame: Some(f),
+                    ..ReachConfig::default()
+                },
+            );
+            let v = rc.status(&pose);
+            let label = match v.status {
+                ReachStatus::Reachable => "REACHABLE",
+                ReachStatus::Blocked => "BLOCKED (collision)",
+                ReachStatus::Unreachable => "UNREACHABLE (out of workspace)",
+            };
+            println!("REACH '{}' -> frame '{}'", robot.name, m.frame_name(f));
+            println!("  status   : {label}");
+            println!("  residual : {:.3e}", v.residual);
+            if let Some(q) = v.q {
+                println!("  config   : [{}]", fmt_vec(&q));
+            }
+        }
     }
     Ok(())
+}
+
+/// Build a `WorldScene` from optional `--ground` + a 6-number `--obstacle`.
+fn world_scene(ground: Option<f64>, obstacle: &Option<Vec<f64>>) -> anyhow::Result<WorldScene> {
+    let mut scene = WorldScene::new();
+    if let Some(z) = ground {
+        anyhow::ensure!(z.is_finite(), "--ground must be finite");
+        scene = scene.with_ground(z);
+    }
+    if let Some(b) = obstacle {
+        anyhow::ensure!(
+            b.len() == 6 && b.iter().all(|x| x.is_finite()),
+            "--obstacle needs 6 finite values cx,cy,cz,hx,hy,hz"
+        );
+        scene = scene.add_box([b[0], b[1], b[2]], [b[3], b[4], b[5]]);
+    }
+    Ok(scene)
+}
+
+/// Parse 12 numbers (9 row-major rotation, then tx,ty,tz) into an `Se3`.
+fn target_to_se3(t: &[f64]) -> anyhow::Result<Se3> {
+    anyhow::ensure!(
+        t.len() == 12 && t.iter().all(|x| x.is_finite()),
+        "target needs 12 finite values (9 row-major R then tx,ty,tz)"
+    );
+    let rot = Matrix3::new(t[0], t[1], t[2], t[3], t[4], t[5], t[6], t[7], t[8]);
+    let trans = Vector3::new(t[9], t[10], t[11]);
+    Ok(Se3::from_parts(trans, UnitQuaternion::from_matrix(&rot)))
 }
 
 fn fmt_vec(v: &[f64]) -> String {

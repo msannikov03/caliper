@@ -6,6 +6,8 @@ from ._caliper import (
     DatasetReader,
     LeaderFollower,
     MotionLimits,
+    Planner,
+    ReachChecker,
     Recorder,
     Robot,
     SafetyMonitor,
@@ -26,6 +28,8 @@ __all__ = [
     "CollisionModel",
     "SafetyMonitor",
     "LeaderFollower",
+    "Planner",
+    "ReachChecker",
     "version",
     "__version__",
 ]

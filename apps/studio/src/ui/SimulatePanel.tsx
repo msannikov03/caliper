@@ -8,6 +8,7 @@ export function SimulatePanel() {
   const simTraj = useStore((s) => s.simTraj);
   const run = useStore((s) => s.runGravityDrop);
   const runControl = useStore((s) => s.runControl);
+  const runPlan = useStore((s) => s.runPlan);
   const checkCollision = useStore((s) => s.checkCollision);
   const collision = useStore((s) => s.collision);
   if (mode !== "simulate" || !robot) return null;
@@ -30,6 +31,12 @@ export function SimulatePanel() {
         onClick={() => void runControl(new Array(robot.ndof).fill(0))}
       >
         ⌖ Drive to home
+      </button>
+      <button
+        title="collision-free RRT plan back to home"
+        onClick={() => void runPlan(new Array(robot.ndof).fill(0))}
+      >
+        ⛬ Plan to home
       </button>
       <button onClick={() => void checkCollision(null)}>⚠ Check collision</button>
       {collision && (

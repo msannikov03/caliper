@@ -19,8 +19,11 @@ use caliper::kinematics::{
 };
 use caliper::model::{JointKind, Model};
 use caliper::motion::{
-    move_j, move_l, CartesianMoveOpts, MotionLimits, MotionLimitsConfig, PoseLibrary,
+    move_j, move_l, retime_waypoints, CartesianMoveOpts, MotionLimits, MotionLimitsConfig,
+    PoseLibrary,
 };
+use caliper::planning::reach::{ReachChecker, ReachConfig, ReachStatus};
+use caliper::planning::{Planner, PlannerConfig};
 use caliper::spatial::Se3;
 use caliper_collision::{CollisionModel, WorldScene};
 use nalgebra::{
@@ -1241,6 +1244,171 @@ fn check_collision(
     })
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PlanRunReq {
+    q_start: Vec<f64>,
+    goal: Option<Vec<f64>>,
+    target: Option<[f64; 12]>,
+    ground: Option<f64>,
+    boxes: Option<Vec<([f64; 3], [f64; 3])>>,
+    seed: Option<u64>,
+    dt: Option<f64>, // render dt
+}
+
+fn se3_from_12(t: &[f64; 12]) -> Result<Se3, String> {
+    // reject non-finite BEFORE it reaches IK/SVD (a NaN target hangs golub-reinsch,
+    // which in a command would deadlock the backend — the Phase-2 lesson).
+    if !t.iter().all(|x| x.is_finite()) {
+        return Err("target contains a non-finite value".into());
+    }
+    let rot = Matrix3::new(t[0], t[1], t[2], t[3], t[4], t[5], t[6], t[7], t[8]);
+    Ok(Se3(Isometry3::from_parts(
+        Translation3::new(t[9], t[10], t[11]),
+        UnitQuaternion::from_matrix(&rot),
+    )))
+}
+
+fn scene_from(ground: Option<f64>, boxes: Option<Vec<([f64; 3], [f64; 3])>>) -> WorldScene {
+    let mut s = WorldScene::new();
+    if let Some(z) = ground {
+        s = s.with_ground(z);
+    }
+    for (c, h) in boxes.unwrap_or_default() {
+        s = s.add_box(c, h);
+    }
+    s
+}
+
+/// Plan a collision-free path to a joint goal or Cartesian target, retime it, and
+/// bake it into a render-only trajectory the frontend plays through the SAME
+/// Phase-3 transport (kind = "plan").
+#[tauri::command]
+fn plan_run(
+    req: PlanRunReq,
+    state: tauri::State<'_, AppState>,
+) -> Result<SimTrajectoryDto, String> {
+    let guard = state.model.lock().map_err(|_| "state lock poisoned")?;
+    let model = guard.as_ref().ok_or("no robot loaded")?;
+    let n = model.ndof;
+    if req.q_start.len() != n || !req.q_start.iter().all(|x| x.is_finite()) {
+        return Err(format!("q_start needs {n} finite values"));
+    }
+    if req.goal.is_some() == req.target.is_some() {
+        return Err("pass exactly one of goal / target".into());
+    }
+    let render_dt = req.dt.unwrap_or(0.02).clamp(2e-3, 0.1);
+    let limits = MotionLimits::from_model(model, &MotionLimitsConfig::default())
+        .map_err(|e| e.to_string())?;
+    let arc = Arc::new(model.clone());
+    let cfg = PlannerConfig {
+        seed: req.seed.unwrap_or(0xCA11),
+        ..PlannerConfig::default()
+    };
+    let planner = Planner::new(arc, scene_from(req.ground, req.boxes), cfg);
+
+    let traj = if let Some(goal) = req.goal {
+        if goal.len() != n {
+            return Err(format!("goal needs {n} values"));
+        }
+        planner
+            .plan_trajectory(&req.q_start, &goal, &limits, render_dt)
+            .map_err(|e| e.to_string())?
+    } else {
+        let pose = se3_from_12(&req.target.unwrap())?;
+        let f = model.tip_frame();
+        let path = planner
+            .plan_to_pose(&req.q_start, &pose, f, &req.q_start)
+            .map_err(|e| e.to_string())?;
+        retime_waypoints(&path, &limits, render_dt).map_err(|e| e.to_string())?
+    };
+
+    // bake the trajectory into a render-only clip (same shape as sim/control)
+    let dur = traj.duration();
+    let nsamp = ((dur / render_dt).ceil() as usize).max(1);
+    let (mut times, mut q, mut qd) = (vec![], vec![], vec![]);
+    let (mut tip_path, mut frames) = (vec![], vec![]);
+    for k in 0..=nsamp {
+        let t = (k as f64 * render_dt).min(dur);
+        let s = traj.sample(t);
+        let (fr, tp) = bake_frame_row(model, &s.q);
+        times.push(t);
+        q.push(s.q);
+        qd.push(s.qd);
+        tip_path.push(tp);
+        frames.push(fr);
+    }
+    let energy = vec![0.0; times.len()];
+    Ok(SimTrajectoryDto {
+        kind: "plan".into(),
+        duration: *times.last().unwrap_or(&0.0),
+        ndof: n,
+        dt: render_dt,
+        times,
+        q,
+        qd,
+        tip_path,
+        frames,
+        energy,
+        energy_drift: 0.0,
+        settled: true,
+        gravity: [0.0, 0.0, -9.81],
+        damping: 0.0,
+        ok: true,
+        reached: 1.0,
+        max_jerk_ratio: 0.0,
+    })
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReachReq {
+    target: [f64; 12],
+    ground: Option<f64>,
+    boxes: Option<Vec<([f64; 3], [f64; 3])>>,
+    frame: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ReachDto {
+    status: String,
+    residual: f64,
+}
+
+/// Collision-aware reachability of a Cartesian pose (Phase 6).
+#[tauri::command]
+fn reach_check(req: ReachReq, state: tauri::State<'_, AppState>) -> Result<ReachDto, String> {
+    let guard = state.model.lock().map_err(|_| "state lock poisoned")?;
+    let model = guard.as_ref().ok_or("no robot loaded")?;
+    let f = match &req.frame {
+        None => model.tip_frame(),
+        Some(name) => model
+            .frame_id(name)
+            .ok_or(format!("unknown frame `{name}`"))?,
+    };
+    let pose = se3_from_12(&req.target)?;
+    let arc = Arc::new(model.clone());
+    let rc = ReachChecker::new(
+        arc,
+        scene_from(req.ground, req.boxes),
+        ReachConfig {
+            frame: Some(f),
+            ..ReachConfig::default()
+        },
+    );
+    let v = rc.status(&pose);
+    Ok(ReachDto {
+        status: match v.status {
+            ReachStatus::Reachable => "reachable",
+            ReachStatus::Blocked => "blocked",
+            ReachStatus::Unreachable => "unreachable",
+        }
+        .into(),
+        residual: v.residual,
+    })
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -1264,7 +1432,9 @@ pub fn run() {
             sim_drop,
             dynamics_at,
             control_run,
-            check_collision
+            check_collision,
+            plan_run,
+            reach_check
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -1449,5 +1619,30 @@ mod tests {
                 .any(|p| p.contains(&"l1".to_string()) && p.contains(&"l3".to_string())),
             "expected an l1<->l3 self-collision pair, got {names:?}"
         );
+    }
+
+    #[test]
+    fn plan_run_avoids_box() {
+        // mirrors the plan_run command path: plan with a world box present, then
+        // bake — the planned (and retimed) path must be collision-free.
+        let m = load("collide_arm.urdf");
+        let scene = WorldScene::new()
+            .with_ground(-0.1)
+            .add_box([0.6, 0.0, 0.3], [0.15, 0.15, 0.15]);
+        let planner = Planner::new(
+            std::sync::Arc::new(m.clone()),
+            scene,
+            PlannerConfig::default(),
+        );
+        let start = vec![0.0, 0.0, 0.0];
+        let goal = vec![0.4, -0.4, 0.4];
+        let path = planner.plan(&start, &goal).unwrap();
+        assert!(
+            planner.verify_path(&path),
+            "planned path must be collision-free"
+        );
+        // the bake the command uses yields one render matrix per drawn frame
+        let (fr, _tp) = bake_frame_row(&m, &path[0]);
+        assert_eq!(fr.len(), frames_at(&m, &start).len());
     }
 }

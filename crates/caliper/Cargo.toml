@@ -20,3 +20,4 @@ caliper-dynamics.workspace = true
 caliper-ik.workspace = true
 caliper-motion.workspace = true
 caliper-hal.workspace = true
+caliper-planning.workspace = true

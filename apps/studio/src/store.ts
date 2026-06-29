@@ -143,6 +143,7 @@ interface StudioState {
   // control + collision (Phase 5)
   collision: CollisionDto | null;
   runControl: (goal: number[]) => Promise<void>;
+  runPlan: (goal: number[]) => Promise<void>;
   checkCollision: (ground?: number | null) => Promise<void>;
   clearCollision: () => void;
 }
@@ -432,6 +433,24 @@ export const useStore = create<StudioState>((set, get) => ({
     try {
       const simTraj = await invoke<SimTrajectoryDto>("control_run", {
         req: { qStart: q, goal, duration: 4.0 },
+      });
+      set({ simTraj, traj: null, playhead: 0, playing: false });
+      get()._applyTrajAt(0);
+      get().play();
+    } catch (e) {
+      set({ error: String(e) });
+    }
+  },
+  async runPlan(goal) {
+    const { q, robot } = get();
+    if (!robot) return;
+    if (goal.length !== robot.ndof) {
+      set({ error: `goal needs ${robot.ndof} values` });
+      return;
+    }
+    try {
+      const simTraj = await invoke<SimTrajectoryDto>("plan_run", {
+        req: { qStart: q, goal },
       });
       set({ simTraj, traj: null, playhead: 0, playing: false });
       get()._applyTrajAt(0);

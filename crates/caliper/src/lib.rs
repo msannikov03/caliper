@@ -8,6 +8,7 @@ pub use caliper_ik as ik;
 pub use caliper_kinematics as kinematics;
 pub use caliper_model as model;
 pub use caliper_motion as motion;
+pub use caliper_planning as planning;
 pub use caliper_spatial as spatial;
 
 /// Engine version (from Cargo).

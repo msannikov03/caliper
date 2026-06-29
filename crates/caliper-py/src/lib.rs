@@ -7,10 +7,13 @@ use caliper::hal::{
 };
 use caliper::ik::{IkOpts, ik};
 use caliper::kinematics::{JacFrame, Jacobian, SingularityKind, SingularityParams, jacobian};
+use caliper::model::Model;
 use caliper::motion::{
     CartesianMoveOpts, MotionLimits as EngineLimits, MotionLimitsConfig, Trajectory as EngineTraj,
     move_j, move_l,
 };
+use caliper::planning::reach::{ReachChecker as EngineReach, ReachConfig, ReachStatus};
+use caliper::planning::{PlanError, Planner as EnginePlanner, PlannerConfig};
 use caliper::spatial::Se3;
 use caliper_collision::{CollisionError, CollisionModel as EngineCollision, WorldScene};
 use nalgebra::{DMatrix, Matrix3, UnitQuaternion, Vector3};
@@ -626,6 +629,32 @@ fn hal_err(e: caliper::hal::Error) -> PyErr {
 fn col_err(e: CollisionError) -> PyErr {
     pyo3::exceptions::PyValueError::new_err(e.to_string())
 }
+fn plan_err(e: PlanError) -> PyErr {
+    pyo3::exceptions::PyValueError::new_err(e.to_string())
+}
+fn world_scene(ground: Option<f64>, boxes: Option<Vec<([f64; 3], [f64; 3])>>) -> WorldScene {
+    let mut s = WorldScene::new();
+    if let Some(z) = ground {
+        s = s.with_ground(z);
+    }
+    for (c, h) in boxes.unwrap_or_default() {
+        s = s.add_box(c, h);
+    }
+    s
+}
+/// 12 numbers (9 row-major rotation, then tx,ty,tz) → `Se3`.
+fn se3_from_12(t: &[f64]) -> PyResult<Se3> {
+    if t.len() != 12 || !t.iter().all(|x| x.is_finite()) {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "target needs 12 finite values (9 row-major R then tx,ty,tz)",
+        ));
+    }
+    let rot = Matrix3::new(t[0], t[1], t[2], t[3], t[4], t[5], t[6], t[7], t[8]);
+    Ok(Se3::from_parts(
+        Vector3::new(t[9], t[10], t[11]),
+        UnitQuaternion::from_matrix(&rot),
+    ))
+}
 
 /// A torque-driven gravity simulator (fixed-base, no contact).
 #[pyclass]
@@ -1125,6 +1154,152 @@ impl LeaderFollower {
     }
 }
 
+/// Collision-aware RRT-Connect motion planner (Phase 6).
+#[pyclass]
+struct Planner {
+    inner: EnginePlanner,
+    model: Arc<Model>,
+}
+
+#[pymethods]
+impl Planner {
+    #[new]
+    #[pyo3(signature = (robot, ground=None, boxes=None, seed=0xCA11, step=0.3, margin=0.0))]
+    fn new(
+        robot: &Robot,
+        ground: Option<f64>,
+        boxes: Option<Vec<([f64; 3], [f64; 3])>>,
+        seed: u64,
+        step: f64,
+        margin: f64,
+    ) -> PyResult<Self> {
+        let model = Arc::new(robot.inner.model.clone());
+        let scene = world_scene(ground, boxes);
+        let cfg = PlannerConfig {
+            seed,
+            step,
+            margin,
+            ..PlannerConfig::default()
+        };
+        Ok(Planner {
+            inner: EnginePlanner::new(model.clone(), scene, cfg),
+            model,
+        })
+    }
+    #[getter]
+    fn uncovered_frames(&self) -> usize {
+        self.inner.uncovered_frames()
+    }
+    /// Plan a collision-free waypoint path to a joint goal.
+    fn plan(&self, start: Vec<f64>, goal: Vec<f64>) -> PyResult<Vec<Vec<f64>>> {
+        finite_or_err("start", &start)?;
+        finite_or_err("goal", &goal)?;
+        self.inner.plan(&start, &goal).map_err(plan_err)
+    }
+    /// Plan to a Cartesian goal pose (12 numbers); `frame` index defaults to tip.
+    #[pyo3(signature = (start, target, frame=None))]
+    fn plan_to_pose(
+        &self,
+        start: Vec<f64>,
+        target: Vec<f64>,
+        frame: Option<usize>,
+    ) -> PyResult<Vec<Vec<f64>>> {
+        finite_or_err("start", &start)?;
+        let se3 = se3_from_12(&target)?;
+        let f = frame.unwrap_or_else(|| self.model.tip_frame());
+        self.inner
+            .plan_to_pose(&start, &se3, f, &start)
+            .map_err(plan_err)
+    }
+    /// Plan + retime → (times, q[N][ndof], qd[N][ndof]).
+    #[pyo3(signature = (start, goal, dt=0.02))]
+    #[allow(clippy::type_complexity)]
+    fn plan_trajectory(
+        &self,
+        start: Vec<f64>,
+        goal: Vec<f64>,
+        dt: f64,
+    ) -> PyResult<(Vec<f64>, Vec<Vec<f64>>, Vec<Vec<f64>>)> {
+        finite_or_err("start", &start)?;
+        finite_or_err("goal", &goal)?;
+        let limits = EngineLimits::from_model(&self.model, &MotionLimitsConfig::default())
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        let traj = self
+            .inner
+            .plan_trajectory(&start, &goal, &limits, dt)
+            .map_err(plan_err)?;
+        let dur = traj.duration();
+        let n = ((dur / dt).ceil() as usize).max(1);
+        let (mut ts, mut qs, mut qds) = (vec![], vec![], vec![]);
+        for k in 0..=n {
+            let t = (k as f64 * dt).min(dur);
+            let s = traj.sample(t);
+            ts.push(t);
+            qs.push(s.q);
+            qds.push(s.qd);
+        }
+        Ok((ts, qs, qds))
+    }
+    /// Independently re-verify a path is collision-free (finer resolution).
+    fn verify(&self, path: Vec<Vec<f64>>) -> bool {
+        self.inner.verify_path(&path)
+    }
+}
+
+/// Collision-aware reachability checker (Phase 6).
+#[pyclass]
+struct ReachChecker {
+    inner: EngineReach,
+}
+
+#[pymethods]
+impl ReachChecker {
+    #[new]
+    #[pyo3(signature = (robot, ground=None, boxes=None, frame=None, seeds=8))]
+    fn new(
+        robot: &Robot,
+        ground: Option<f64>,
+        boxes: Option<Vec<([f64; 3], [f64; 3])>>,
+        frame: Option<usize>,
+        seeds: usize,
+    ) -> PyResult<Self> {
+        let model = Arc::new(robot.inner.model.clone());
+        let scene = world_scene(ground, boxes);
+        let cfg = ReachConfig {
+            frame,
+            seeds,
+            ..ReachConfig::default()
+        };
+        Ok(ReachChecker {
+            inner: EngineReach::new(model, scene, cfg),
+        })
+    }
+    /// Reachability of a Cartesian pose (12 numbers) →
+    /// dict(status: "reachable"|"blocked"|"unreachable", residual, q).
+    fn status(&self, py: Python<'_>, target: Vec<f64>) -> PyResult<Py<PyDict>> {
+        let se3 = se3_from_12(&target)?;
+        let v = self.inner.status(&se3);
+        let d = PyDict::new(py);
+        d.set_item(
+            "status",
+            match v.status {
+                ReachStatus::Reachable => "reachable",
+                ReachStatus::Blocked => "blocked",
+                ReachStatus::Unreachable => "unreachable",
+            },
+        )?;
+        d.set_item("residual", v.residual)?;
+        match v.q {
+            Some(q) => d.set_item("q", q)?,
+            None => d.set_item("q", py.None())?,
+        }
+        Ok(d.into())
+    }
+    fn reachable(&self, target: Vec<f64>) -> PyResult<bool> {
+        Ok(self.inner.reachable(&se3_from_12(&target)?))
+    }
+}
+
 #[pymodule]
 fn _caliper(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", caliper::VERSION)?;
@@ -1139,5 +1314,7 @@ fn _caliper(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<CollisionModel>()?;
     m.add_class::<SafetyMonitor>()?;
     m.add_class::<LeaderFollower>()?;
+    m.add_class::<Planner>()?;
+    m.add_class::<ReachChecker>()?;
     Ok(())
 }

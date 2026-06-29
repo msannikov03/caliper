@@ -11,3 +11,8 @@ Cargo.lock.bak
 *.abi3.so
 __pycache__/
 .pytest_cache/
+
+# python build artifacts (caliper_learn editable install)
+*.egg-info/
+build/
+__pycache__/

@@ -15,6 +15,7 @@ export function TipPath() {
     geo.setAttribute("position", new THREE.Float32BufferAttribute(pts, 3));
     ref.current.geometry.dispose();
     ref.current.geometry = geo;
+    return () => geo.dispose(); // free the GPU buffer when the path is replaced/unmounted
   }, [traj]);
   if (!traj) return null;
   return (

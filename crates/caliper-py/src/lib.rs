@@ -502,7 +502,10 @@ impl Trajectory {
 
     /// (times, q[N][ndof], qd[N][ndof], qdd[N][ndof]); times[0]=0, last=duration.
     #[allow(clippy::type_complexity)]
-    fn sample_uniform(&self, dt: f64) -> (Vec<f64>, Vec<Vec<f64>>, Vec<Vec<f64>>, Vec<Vec<f64>>) {
+    fn sample_uniform(
+        &self,
+        dt: f64,
+    ) -> PyResult<(Vec<f64>, Vec<Vec<f64>>, Vec<Vec<f64>>, Vec<Vec<f64>>)> {
         // clamp: dt<=0/NaN would make n overflow / allocate unbounded.
         let dt = if dt.is_finite() && dt > 1e-4 {
             dt.min(10.0)
@@ -510,6 +513,14 @@ impl Trajectory {
             1e-2
         };
         let dur = self.inner.duration();
+        // A non-finite duration (e.g. an inf duration from a degenerate plan)
+        // makes `(dur/dt).ceil() as usize` overflow → panic across FFI. dt is
+        // finite & > 0 by the clamp above; guard dur before the cast.
+        if !dur.is_finite() || dur < 0.0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "trajectory duration is not finite; cannot sample uniformly",
+            ));
+        }
         let n = ((dur / dt).ceil() as usize).max(1) + 1;
         let mut times = Vec::with_capacity(n);
         let (mut q, mut qd, mut qdd) = (vec![], vec![], vec![]);
@@ -521,7 +532,7 @@ impl Trajectory {
             qd.push(s.qd);
             qdd.push(s.qdd);
         }
-        (times, q, qd, qdd)
+        Ok((times, q, qd, qdd))
     }
     fn __repr__(&self) -> String {
         format!(
@@ -548,6 +559,17 @@ impl MotionLimits {
             return Err(pyo3::exceptions::PyValueError::new_err(
                 "vel/accel/jerk length mismatch",
             ));
+        }
+        // Unlike other entry points, the engine never re-validates these — a
+        // non-finite or non-positive limit makes planning produce an inf/NaN
+        // duration, which later overflows the integer step count (see B4). Guard
+        // here so the FFI boundary never admits an unphysical limit.
+        for (label, xs) in [("vel", &vel), ("accel", &accel), ("jerk", &jerk)] {
+            if xs.iter().any(|x| !x.is_finite() || *x <= 0.0) {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "{label} must be finite and > 0"
+                )));
+            }
         }
         Ok(MotionLimits {
             inner: EngineLimits {
@@ -836,6 +858,13 @@ impl ControlLoop {
         if !m.has_inertia {
             return Err(pyo3::exceptions::PyValueError::new_err(
                 "robot has no <inertial> data; control needs dynamics",
+            ));
+        }
+        // A negative kp drives away from the goal; a non-finite gain makes tau NaN
+        // and propagates NaN through the backend. Reject before building Gains.
+        if !kp.is_finite() || kp < 0.0 || !kd.is_finite() || kd < 0.0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "kp/kd must be finite and >= 0",
             ));
         }
         let model = Arc::new(m.clone());
@@ -1251,6 +1280,13 @@ impl Planner {
     ) -> PyResult<(Vec<f64>, Vec<Vec<f64>>, Vec<Vec<f64>>)> {
         finite_or_err("start", &start)?;
         finite_or_err("goal", &goal)?;
+        // dt flows into retime (nsteps = total/dt) and the local sampling cast
+        // below; a non-finite or non-positive dt overflows the step count.
+        if !dt.is_finite() || dt <= 0.0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "dt must be finite and > 0",
+            ));
+        }
         let limits = EngineLimits::from_model(&self.model, &MotionLimitsConfig::default())
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
         let traj = self
@@ -1258,6 +1294,11 @@ impl Planner {
             .plan_trajectory(&start, &goal, &limits, dt)
             .map_err(plan_err)?;
         let dur = traj.duration();
+        if !dur.is_finite() || dur < 0.0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "trajectory duration is not finite",
+            ));
+        }
         let n = ((dur / dt).ceil() as usize).max(1);
         let (mut ts, mut qs, mut qds) = (vec![], vec![], vec![]);
         for k in 0..=n {

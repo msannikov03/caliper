@@ -116,6 +116,7 @@ function Rods() {
     geo.setAttribute("position", new THREE.Float32BufferAttribute(pts, 3));
     ref.current.geometry.dispose();
     ref.current.geometry = geo;
+    return () => geo.dispose(); // free the GPU buffer when this rod set is replaced/unmounted
   }, [frames, info]);
 
   return (

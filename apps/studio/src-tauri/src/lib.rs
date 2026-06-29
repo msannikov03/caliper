@@ -421,8 +421,22 @@ fn get_frames(q: Vec<f64>, state: tauri::State<'_, AppState>) -> Result<Vec<[f64
 /// frame by name; `None` uses the model's default tip. `seed.len() == ndof`.
 #[tauri::command]
 fn solve_ik(req: IkRequest, state: tauri::State<'_, AppState>) -> Result<IkSolution, String> {
-    let guard = state.model.lock().map_err(|_| "state lock poisoned")?;
-    let model = guard.as_ref().ok_or("no robot loaded")?;
+    // Decode + validate the target BEFORE taking the lock: a non-finite target
+    // would feed the iterative SO(3) projection / IK loop garbage, and the lock
+    // must not be held across that heavy work.
+    if req.target.iter().any(|x| !x.is_finite()) {
+        return Err("target contains a non-finite value (NaN/Inf)".into());
+    }
+    let target = se3_from_col_major(&req.target);
+
+    // Clone the model into an Arc and release the state lock BEFORE the IK loop,
+    // so other commands aren't frozen.
+    let arc = {
+        let guard = state.model.lock().map_err(|_| "state lock poisoned")?;
+        let model = guard.as_ref().ok_or("no robot loaded")?;
+        Arc::new(model.clone())
+    };
+    let model: &Model = arc.as_ref();
 
     let frame = match req.frame {
         Some(name) => model
@@ -438,7 +452,6 @@ fn solve_ik(req: IkRequest, state: tauri::State<'_, AppState>) -> Result<IkSolut
         ));
     }
 
-    let target = se3_from_col_major(&req.target);
     let res = ik(model, frame, &target, &req.seed, &IkOpts::default());
     Ok(IkSolution {
         success: res.success,
@@ -925,7 +938,12 @@ fn sim_drop(
     let damping = req.damping.unwrap_or(0.0).max(0.0);
     let settle = req.settle.unwrap_or(true);
 
-    let mut sim = Simulator::new(Arc::new(model.clone())).map_err(|e| e.to_string())?;
+    // Clone the model into an Arc and release the state lock BEFORE the heavy
+    // (up to ~30 s) rollout, so other commands aren't frozen.
+    let arc = Arc::new(model.clone());
+    drop(guard);
+    let model: &Model = arc.as_ref();
+    let mut sim = Simulator::new(arc.clone()).map_err(|e| e.to_string())?;
     sim.h_max = step_dt;
     sim.set_gravity(
         req.gravity
@@ -1094,18 +1112,25 @@ fn control_run(
     let duration = req.duration.unwrap_or(3.0).clamp(0.1, 30.0);
     let kp = req.kp.unwrap_or(100.0);
     let kd = req.kd.unwrap_or(20.0);
+    if !kp.is_finite() || !kd.is_finite() || kp < 0.0 || kd < 0.0 {
+        return Err("kp/kd must be finite and non-negative".into());
+    }
     let gravity = req
         .gravity
         .map(|g| Vector3::new(g[0], g[1], g[2]))
         .unwrap_or(GRAVITY_EARTH);
 
+    // Clone the model into an Arc and release the state lock BEFORE the heavy
+    // (up to ~30 s) closed-loop rollout, so other commands aren't frozen.
     let arc = Arc::new(model.clone());
+    drop(guard);
+    let model: &Model = arc.as_ref();
     let mut backend = PhysicsSimBackend::new(arc.clone()).map_err(|e| e.to_string())?;
     backend
         .set_state(&req.q_start, &vec![0.0; n])
         .map_err(|e| e.to_string())?;
     let ctrl_dt = 1e-3;
-    let mut loopy = ControlLoop::new(backend, arc, ctrl_dt)
+    let mut loopy = ControlLoop::new(backend, arc.clone(), ctrl_dt)
         .map_err(|e| e.to_string())?
         .with_gains(Gains { kp, kd })
         .with_gravity(gravity);

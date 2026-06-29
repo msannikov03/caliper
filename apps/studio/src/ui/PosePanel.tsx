@@ -3,6 +3,7 @@ import { useStore } from "../store";
 
 export function PosePanel() {
   const robot = useStore((s) => s.robot);
+  const mode = useStore((s) => s.mode);
   const poses = useStore((s) => s.poses);
   const savePose = useStore((s) => s.savePose);
   const deletePose = useStore((s) => s.deletePose);
@@ -28,7 +29,12 @@ export function PosePanel() {
         {poses.map((p) => (
           <li key={p.name}>
             <span>{p.name}</span>
-            <button onClick={() => void planMoveToPose(p.name)}>Move to</button>
+            <button
+              disabled={mode === "simulate"}
+              onClick={() => void planMoveToPose(p.name)}
+            >
+              Move to
+            </button>
             <button onClick={() => void deletePose(p.name)}>×</button>
           </li>
         ))}

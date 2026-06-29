@@ -399,14 +399,22 @@ fn main() -> anyhow::Result<()> {
                 "pass exactly one of --goal / --target"
             );
             let limits = MotionLimits::from_model(m, &MotionLimitsConfig::default())?;
+            anyhow::ensure!(
+                start.iter().all(|x| x.is_finite()),
+                "start contains a non-finite value"
+            );
             let (traj, kind) = if let Some(goal) = goal {
                 anyhow::ensure!(goal.len() == m.ndof, "goal needs {} values", m.ndof);
+                anyhow::ensure!(
+                    goal.iter().all(|x| x.is_finite()),
+                    "goal contains a non-finite value"
+                );
                 (move_j(m, &start, &goal, &limits)?, "MOVE_J")
             } else {
                 let t = target.unwrap();
                 anyhow::ensure!(
-                    t.len() == 12,
-                    "target needs 12 values (9 row-major R then tx,ty,tz)"
+                    t.len() == 12 && t.iter().all(|x| x.is_finite()),
+                    "target needs 12 finite values (9 row-major R then tx,ty,tz)"
                 );
                 let rot = Matrix3::new(t[0], t[1], t[2], t[3], t[4], t[5], t[6], t[7], t[8]);
                 let trans = Vector3::new(t[9], t[10], t[11]);
@@ -522,9 +530,14 @@ fn main() -> anyhow::Result<()> {
                 robot.name
             );
             anyhow::ensure!(
-                dt.is_finite() && dt > 0.0 && duration > 0.0,
-                "--dt and --duration must be positive"
+                dt.is_finite() && dt > 0.0 && duration.is_finite() && duration > 0.0,
+                "--dt and --duration must be positive finite numbers"
             );
+            anyhow::ensure!(
+                print_dt.is_finite() && print_dt > 0.0,
+                "--print_dt must be a positive finite number"
+            );
+            anyhow::ensure!(damping.is_finite(), "--damping must be finite");
             let q0 = start.unwrap_or_else(|| vec![0.0; m.ndof]);
             anyhow::ensure!(q0.len() == m.ndof, "--start needs {} values", m.ndof);
             anyhow::ensure!(
@@ -607,6 +620,10 @@ fn main() -> anyhow::Result<()> {
                 "goal/start must be finite"
             );
             anyhow::ensure!(dt.is_finite() && dt > 0.0, "--dt must be > 0");
+            anyhow::ensure!(
+                kp.is_finite() && kd.is_finite(),
+                "--kp and --kd must be finite"
+            );
             let model = Arc::new(m.clone());
             let mut backend = PhysicsSimBackend::new(model.clone())?;
             backend.set_state(&start, &vec![0.0; m.ndof])?;
@@ -769,8 +786,10 @@ fn main() -> anyhow::Result<()> {
                 "joints contains a non-finite value"
             );
             let model = Arc::new(m.clone());
+            anyhow::ensure!(margin.is_finite(), "--margin must be finite");
             let mut scene = WorldScene::new();
             if let Some(z) = ground {
+                anyhow::ensure!(z.is_finite(), "--ground must be finite");
                 scene = scene.with_ground(z);
             }
             let cm = CollisionModel::new(model, scene, margin);
@@ -825,6 +844,10 @@ fn main() -> anyhow::Result<()> {
             let planner = Planner::new(model, scene, cfg);
             let path = if let Some(goal) = goal {
                 anyhow::ensure!(goal.len() == m.ndof, "--goal needs {} values", m.ndof);
+                anyhow::ensure!(
+                    goal.iter().all(|x| x.is_finite()),
+                    "--goal contains a non-finite value"
+                );
                 planner.plan(&start, &goal)?
             } else {
                 let t = target.unwrap();

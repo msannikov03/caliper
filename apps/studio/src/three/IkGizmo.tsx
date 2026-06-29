@@ -1,4 +1,4 @@
-import { useMemo, useRef } from "react";
+import { useEffect, useMemo, useRef } from "react";
 import * as THREE from "three";
 import { PivotControls } from "@react-three/drei";
 import { useThree } from "@react-three/fiber";
@@ -28,6 +28,11 @@ export function IkGizmo() {
   const raf = useRef(0);
   const lastWorld = useRef(new THREE.Matrix4());
   const tmp = useMemo(() => new THREE.Matrix4(), []);
+
+  // cancel any queued drag-follow rAF if we unmount mid-drag.
+  useEffect(() => () => {
+    if (raf.current) cancelAnimationFrame(raf.current);
+  }, []);
 
   const tip = robot?.tip ?? -1;
   const tipMat = tip >= 0 ? frames[tip] : undefined;

@@ -109,7 +109,6 @@ interface StudioState {
   loadRobot: (path: string) => Promise<void>;
   setJoint: (i: number, v: number) => void;
   refreshFrames: () => Promise<void>;
-  solveIk: (targetColMajor: Mat4) => Promise<void>;
   refreshAnalysis: () => Promise<void>;
   solveIkGoverned: (targetColMajor: Mat4, snap: boolean) => Promise<void>;
 
@@ -222,27 +221,6 @@ export const useStore = create<StudioState>((set, get) => ({
     }
   },
 
-  async solveIk(targetColMajor) {
-    const { q, robot } = get();
-    if (!robot) return;
-    const frameName = robot.frames[robot.tip].name;
-    // share the monotonic guard with refreshFrames so an out-of-order IK reply
-    // from a fast drag can't write a stale q (or trigger a stale FK refresh).
-    const reqId = get()._reqId + 1;
-    set({ _reqId: reqId });
-    try {
-      const res = await invoke<IkSolution>("solve_ik", {
-        req: { target: targetColMajor, seed: q, frame: frameName },
-      });
-      if (get()._reqId !== reqId) return; // a newer request superseded us
-      // arm follows even on best-effort failure, but flag it for the HUD.
-      set({ q: res.q, ikOk: res.success, ikResidual: res.residual, error: null });
-      await get().refreshFrames();
-    } catch (e) {
-      set({ error: String(e) });
-    }
-  },
-
   async refreshAnalysis() {
     const { q, robot } = get();
     if (!robot) return;
@@ -267,12 +245,13 @@ export const useStore = create<StudioState>((set, get) => ({
       let res = await invoke<IkSolution>("solve_ik_governed", {
         req: { target: targetColMajor, seed: q, frame: frameName },
       });
+      if (get()._reqId !== reqId) return; // out-of-order drag reply (skip the snap too)
       if (snap && res.success) {
         res = await invoke<IkSolution>("solve_ik", {
           req: { target: targetColMajor, seed: res.q, frame: frameName },
         });
+        if (get()._reqId !== reqId) return; // superseded while snapping
       }
-      if (get()._reqId !== reqId) return; // out-of-order drag reply
       set({ q: res.q, ikOk: res.success, ikResidual: res.residual, error: null });
       await get().refreshFrames(); // -> refreshAnalysis -> HUD + ellipsoid update live
     } catch (e) {
@@ -308,7 +287,7 @@ export const useStore = create<StudioState>((set, get) => ({
   },
   async planMoveToPose(name) {
     const { q, robot } = get();
-    if (!robot) return;
+    if (!robot || get().mode === "simulate") return; // motion-only; sim owns the pose
     try {
       const traj = await invoke<TrajectoryDto>("plan_move_to_pose", { req: { qStart: q, name } });
       set({ traj, playhead: 0, playing: false });
@@ -377,7 +356,13 @@ export const useStore = create<StudioState>((set, get) => ({
     k = Math.max(0, Math.min(k, traj.frames.length - 1));
     // bump _reqId so any in-flight get_frames/solve_ik reply can't clobber this pose
     set({ q: traj.q[k], frames: traj.frames[k], _reqId: get()._reqId + 1 });
-    void get().refreshAnalysis(); // HUD/ellipsoid follow; latest-wins via _analyzeReqId
+    // throttle analysis: only re-run when the baked frame actually changes (or the
+    // clip itself changed), instead of every playback rAF tick.
+    if (k !== lastAnalyzedK || traj !== lastAnalyzedClip) {
+      lastAnalyzedK = k;
+      lastAnalyzedClip = traj;
+      void get().refreshAnalysis(); // HUD/ellipsoid follow; latest-wins via _analyzeReqId
+    }
   },
 
   // ---- simulation (Phase 4) ----
@@ -480,6 +465,11 @@ export const useStore = create<StudioState>((set, get) => ({
 function activeClip(s: StudioState): TrajectoryDto | null {
   return s.simTraj ?? s.traj;
 }
+
+// playback analysis throttle: the last baked frame index (and clip) we analyzed,
+// so _applyTrajAt re-runs analyze only when the frame/clip changes, not every tick.
+let lastAnalyzedK = -1;
+let lastAnalyzedClip: TrajectoryDto | null = null;
 
 // rAF-coalesced refresh so a slider drag fires at most one FK invoke per frame.
 let pending = false;

@@ -9,6 +9,7 @@ members = [
   "crates/caliper-motion",
   "crates/caliper-hal",
   "crates/caliper-collision",
+  "crates/caliper-planning",
   "crates/caliper",
   "crates/caliper-cli",
   "crates/caliper-py",
@@ -40,6 +41,7 @@ caliper-ik         = { path = "crates/caliper-ik", version = "0.1.0" }
 caliper-motion     = { path = "crates/caliper-motion", version = "0.1.0" }
 caliper-hal        = { path = "crates/caliper-hal", version = "0.1.0" }
 caliper-collision  = { path = "crates/caliper-collision", version = "0.1.0" }
+caliper-planning   = { path = "crates/caliper-planning", version = "0.1.0" }
 caliper            = { path = "crates/caliper", version = "0.1.0" }
 
 [profile.release]

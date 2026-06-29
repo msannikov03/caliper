@@ -9,6 +9,9 @@ pub enum TrajKind {
     MoveJ,
     MoveL,
     MoveC,
+    /// A planned (RRT) path, retimed onto a uniform knot grid (samples like the
+    /// Cartesian kinds — via the knot interpolator, not closed-form profiles).
+    Plan,
 }
 
 #[derive(Clone, Debug)]

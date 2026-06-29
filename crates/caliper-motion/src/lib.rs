@@ -10,6 +10,7 @@ mod movej;
 mod poses;
 mod scurve;
 mod trajectory;
+mod waypoints;
 
 pub use cartesian::{CartesianMoveOpts, MoveLMode, OnFailure, move_c, move_l, move_l_pose};
 pub use limits::{JointOverride, MotionLimits, MotionLimitsConfig};
@@ -17,6 +18,7 @@ pub use movej::move_j;
 pub use poses::{NamedPose, PoseLibrary};
 pub use scurve::{ScurveProfile, plan_scurve, plan_scurve_to_duration};
 pub use trajectory::{TrajKind, TrajState, Trajectory};
+pub use waypoints::retime_waypoints;
 
 #[derive(thiserror::Error, Debug, Clone)]
 pub enum MotionError {

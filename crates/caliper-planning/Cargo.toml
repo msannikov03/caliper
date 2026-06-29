@@ -1,0 +1,21 @@
+[package]
+name = "caliper-planning"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Collision-aware motion planning (RRT-Connect + shortcut smoothing) and
+# collision-aware reachability. Pure nalgebra/std — ZERO heavy deps, so the lean
+# `caliper` facade can re-export it. Deterministic: a hand-rolled splitmix64 PRNG
+# (no `rand`), so a given seed always yields the same plan.
+[dependencies]
+thiserror.workspace = true
+nalgebra.workspace = true
+caliper-model.workspace = true
+caliper-kinematics.workspace = true
+caliper-ik.workspace = true
+caliper-spatial.workspace = true
+caliper-collision.workspace = true
+caliper-motion.workspace = true

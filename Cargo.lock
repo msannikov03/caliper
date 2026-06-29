@@ -634,6 +634,7 @@ name = "caliper"
 version = "0.1.0"
 dependencies = [
  "caliper-dynamics",
+ "caliper-graph",
  "caliper-hal",
  "caliper-ik",
  "caliper-kinematics",
@@ -652,6 +653,7 @@ dependencies = [
  "caliper-collision",
  "clap",
  "nalgebra",
+ "serde_json",
 ]
 
 [[package]]
@@ -673,6 +675,24 @@ dependencies = [
  "caliper-model",
  "caliper-spatial",
  "nalgebra",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "caliper-graph"
+version = "0.1.0"
+dependencies = [
+ "caliper-collision",
+ "caliper-dynamics",
+ "caliper-hal",
+ "caliper-ik",
+ "caliper-kinematics",
+ "caliper-model",
+ "caliper-motion",
+ "caliper-planning",
+ "caliper-spatial",
+ "nalgebra",
+ "serde",
  "thiserror 2.0.18",
 ]
 
@@ -757,6 +777,7 @@ dependencies = [
  "caliper-collision",
  "nalgebra",
  "pyo3",
+ "serde_json",
 ]
 
 [[package]]

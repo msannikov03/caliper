@@ -222,6 +222,32 @@ enum Cmd {
         #[arg(long)]
         frame: Option<String>,
     },
+    /// Run or validate a Caliper node graph (.caliper-graph.json) (Phase 8).
+    Graph {
+        #[command(subcommand)]
+        action: GraphCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum GraphCmd {
+    /// Execute a graph against a robot and print a result summary.
+    Run {
+        /// Path to a .urdf file.
+        urdf: PathBuf,
+        /// Path to a .caliper-graph.json document.
+        graph: PathBuf,
+        /// Optional path to write the terminal clip as JSON (ClipData).
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// Validate a graph against a robot (no execution).
+    Validate {
+        /// Path to a .urdf file.
+        urdf: PathBuf,
+        /// Path to a .caliper-graph.json document.
+        graph: PathBuf,
+    },
 }
 
 fn resolve_frame(model: &caliper::model::Model, frame: &Option<String>) -> anyhow::Result<usize> {
@@ -904,8 +930,121 @@ fn main() -> anyhow::Result<()> {
                 println!("  config   : [{}]", fmt_vec(&q));
             }
         }
+        Cmd::Graph { action } => match action {
+            GraphCmd::Run { urdf, graph, out } => {
+                let robot = caliper::model::Robot::from_urdf(&urdf)?;
+                let doc = load_graph(&graph)?;
+                let res = match caliper::graph::run(&doc, &robot) {
+                    Ok(res) => res,
+                    Err(e) => {
+                        print_graph_error(&e);
+                        std::process::exit(1);
+                    }
+                };
+                let name = doc.metadata.name.as_deref().unwrap_or(&robot.name);
+                println!("GRAPH RUN '{}'  ({} node(s))", name, doc.nodes.len());
+                println!("  diagnostics: ok");
+                match &res.terminal_clip {
+                    Some(clip) => {
+                        let dur = clip.times.last().copied().unwrap_or(0.0)
+                            - clip.times.first().copied().unwrap_or(0.0);
+                        println!("  terminal clip: {} sample(s), {:.4}s", clip.len(), dur);
+                    }
+                    None => println!("  terminal clip: (none)"),
+                }
+                if res.scopes.is_empty() {
+                    println!("  scopes: (none)");
+                } else {
+                    println!("  scopes:");
+                    for s in &res.scopes {
+                        let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
+                        for &v in &s.y {
+                            lo = lo.min(v);
+                            hi = hi.max(v);
+                        }
+                        if s.y.is_empty() {
+                            lo = 0.0;
+                            hi = 0.0;
+                        }
+                        println!(
+                            "    {} / {}: {} point(s)  min={:.5} max={:.5}",
+                            s.node_id,
+                            s.signal,
+                            s.y.len(),
+                            lo,
+                            hi
+                        );
+                    }
+                }
+                if let Some(path) = out {
+                    match &res.terminal_clip {
+                        Some(clip) => {
+                            let json = serde_json::to_string_pretty(clip)?;
+                            std::fs::write(&path, json)?;
+                            println!("  wrote terminal clip -> {}", path.display());
+                        }
+                        None => {
+                            anyhow::bail!("--out given but the graph produced no terminal clip")
+                        }
+                    }
+                }
+            }
+            GraphCmd::Validate { urdf, graph } => {
+                let robot = caliper::model::Robot::from_urdf(&urdf)?;
+                let doc = load_graph(&graph)?;
+                let diag = caliper::graph::validate(&doc, &robot.model);
+                let name = doc.metadata.name.as_deref().unwrap_or(&robot.name);
+                println!("GRAPH VALIDATE '{}'  ({} node(s))", name, doc.nodes.len());
+                if diag.is_ok() {
+                    println!("  status: ok");
+                    println!("  topo order: [{}]", diag.topo_order.join(", "));
+                } else {
+                    print_diagnostics(&diag);
+                    std::process::exit(1);
+                }
+            }
+        },
     }
     Ok(())
+}
+
+/// Read + deserialize a `.caliper-graph.json` document.
+fn load_graph(path: &std::path::Path) -> anyhow::Result<caliper::graph::GraphDoc> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| anyhow::anyhow!("failed to read graph `{}`: {e}", path.display()))?;
+    let doc: caliper::graph::GraphDoc = serde_json::from_str(&text)
+        .map_err(|e| anyhow::anyhow!("failed to parse graph `{}`: {e}", path.display()))?;
+    Ok(doc)
+}
+
+/// Print structured validation diagnostics (node/edge errors, cycle, topo order).
+fn print_diagnostics(diag: &caliper::graph::Diagnostics) {
+    println!("  status: INVALID");
+    for e in &diag.node_errors {
+        println!("  node `{}`: {}", e.node_id, e.message);
+    }
+    for e in &diag.edge_errors {
+        println!("  edge [{}]: {}", e.edge_index, e.message);
+    }
+    if !diag.cycle.is_empty() {
+        println!("  cycle: [{}]", diag.cycle.join(", "));
+    }
+    if !diag.topo_order.is_empty() {
+        println!("  topo order: [{}]", diag.topo_order.join(", "));
+    }
+}
+
+/// Print a `GraphError` (node failure or validation diagnostics) to stderr/stdout.
+fn print_graph_error(e: &caliper::graph::GraphError) {
+    match e {
+        caliper::graph::GraphError::Node { node_id, message } => {
+            eprintln!("graph error: node `{node_id}` failed: {message}");
+        }
+        caliper::graph::GraphError::Validation { diagnostics } => {
+            eprintln!("graph error: validation failed");
+            print_diagnostics(diagnostics);
+        }
+    }
 }
 
 /// Build a `WorldScene` from optional `--ground` + a 6-number `--obstacle`.

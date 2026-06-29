@@ -14,6 +14,8 @@ from ._caliper import (
     Simulator,
     Trajectory,
     __version__,
+    run_graph,
+    validate_graph,
     version,
 )
 
@@ -30,6 +32,8 @@ __all__ = [
     "LeaderFollower",
     "Planner",
     "ReachChecker",
+    "run_graph",
+    "validate_graph",
     "version",
     "__version__",
 ]

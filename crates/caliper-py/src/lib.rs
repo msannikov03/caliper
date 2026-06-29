@@ -18,7 +18,7 @@ use caliper::spatial::Se3;
 use caliper_collision::{CollisionError, CollisionModel as EngineCollision, WorldScene};
 use nalgebra::{DMatrix, Matrix3, UnitQuaternion, Vector3};
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
+use pyo3::types::{PyDict, PyList};
 use std::sync::Arc;
 
 /// Engine version string.
@@ -1370,10 +1370,116 @@ impl ReachChecker {
     }
 }
 
+// ===== Phase 8: graph executor face =====
+
+/// Build a Python dict from graph [`Diagnostics`].
+fn diagnostics_dict(py: Python<'_>, d: &caliper::graph::Diagnostics) -> PyResult<Py<PyDict>> {
+    let out = PyDict::new(py);
+    out.set_item("ok", d.is_ok())?;
+    out.set_item("topo_order", d.topo_order.clone())?;
+    out.set_item("cycle", d.cycle.clone())?;
+    let node_errors = PyList::empty(py);
+    for e in &d.node_errors {
+        let ne = PyDict::new(py);
+        ne.set_item("node_id", e.node_id.clone())?;
+        ne.set_item("message", e.message.clone())?;
+        node_errors.append(ne)?;
+    }
+    out.set_item("node_errors", node_errors)?;
+    let edge_errors = PyList::empty(py);
+    for e in &d.edge_errors {
+        let ee = PyDict::new(py);
+        ee.set_item("edge_index", e.edge_index)?;
+        ee.set_item("message", e.message.clone())?;
+        edge_errors.append(ee)?;
+    }
+    out.set_item("edge_errors", edge_errors)?;
+    Ok(out.into())
+}
+
+/// Map a [`GraphError`] to a `PyValueError` (validation diagnostics or node id/message).
+fn graph_err(e: caliper::graph::GraphError) -> PyErr {
+    match e {
+        caliper::graph::GraphError::Validation { diagnostics } => {
+            let nodes: Vec<String> = diagnostics
+                .node_errors
+                .iter()
+                .map(|n| format!("{}: {}", n.node_id, n.message))
+                .collect();
+            let edges: Vec<String> = diagnostics
+                .edge_errors
+                .iter()
+                .map(|n| format!("edge {}: {}", n.edge_index, n.message))
+                .collect();
+            let mut parts = nodes;
+            parts.extend(edges);
+            if !diagnostics.cycle.is_empty() {
+                parts.push(format!("cycle: {}", diagnostics.cycle.join(" -> ")));
+            }
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "graph validation failed: {}",
+                parts.join("; ")
+            ))
+        }
+        caliper::graph::GraphError::Node { node_id, message } => {
+            pyo3::exceptions::PyValueError::new_err(format!("node `{node_id}` failed: {message}"))
+        }
+    }
+}
+
+/// Parse a `.caliper-graph.json` document, mapping a serde error to `PyValueError`.
+fn parse_graph(graph_json: &str) -> PyResult<caliper::graph::GraphDoc> {
+    serde_json::from_str(graph_json)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("invalid graph JSON: {e}")))
+}
+
+/// Execute a Caliper compute graph against `robot`. Returns a dict with
+/// `terminal_clip` ({times, qs, qds} or None), `scopes` (list of
+/// {node_id, signal, t, y}), and `diagnostics`.
+#[pyfunction]
+fn run_graph(py: Python<'_>, robot: &Robot, graph_json: &str) -> PyResult<Py<PyDict>> {
+    let doc = parse_graph(graph_json)?;
+    let res = caliper::graph::run(&doc, &robot.inner).map_err(graph_err)?;
+    let out = PyDict::new(py);
+    match res.terminal_clip {
+        Some(c) => {
+            let clip = PyDict::new(py);
+            clip.set_item("times", c.times)?;
+            clip.set_item("qs", c.qs)?;
+            clip.set_item("qds", c.qds)?;
+            out.set_item("terminal_clip", clip)?;
+        }
+        None => out.set_item("terminal_clip", py.None())?,
+    }
+    let scopes = PyList::empty(py);
+    for s in res.scopes {
+        let sd = PyDict::new(py);
+        sd.set_item("node_id", s.node_id)?;
+        sd.set_item("signal", s.signal)?;
+        sd.set_item("t", s.t)?;
+        sd.set_item("y", s.y)?;
+        scopes.append(sd)?;
+    }
+    out.set_item("scopes", scopes)?;
+    out.set_item("diagnostics", diagnostics_dict(py, &res.diagnostics)?)?;
+    Ok(out.into())
+}
+
+/// Validate a Caliper compute graph against `robot` without executing it.
+/// Returns the diagnostics dict ({ok, topo_order, cycle, node_errors, edge_errors}).
+#[pyfunction]
+fn validate_graph(py: Python<'_>, robot: &Robot, graph_json: &str) -> PyResult<Py<PyDict>> {
+    let doc = parse_graph(graph_json)?;
+    let diag = caliper::graph::validate(&doc, &robot.inner.model);
+    diagnostics_dict(py, &diag)
+}
+
 #[pymodule]
 fn _caliper(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", caliper::VERSION)?;
     m.add_function(wrap_pyfunction!(version, m)?)?;
+    m.add_function(wrap_pyfunction!(run_graph, m)?)?;
+    m.add_function(wrap_pyfunction!(validate_graph, m)?)?;
     m.add_class::<Robot>()?;
     m.add_class::<Trajectory>()?;
     m.add_class::<MotionLimits>()?;

@@ -19,3 +19,4 @@ caliper = { workspace = true, features = ["dataset"] }
 caliper-collision.workspace = true
 pyo3.workspace = true
 nalgebra.workspace = true
+serde_json.workspace = true

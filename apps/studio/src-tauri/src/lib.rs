@@ -30,8 +30,9 @@ use nalgebra::{
     Cholesky, DVector, Isometry3, Matrix3, SymmetricEigen, Translation3, UnitQuaternion, Vector3,
 };
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use tauri::Manager;
 
 /// Loaded robot, shared across commands. `None` until `robot_info` succeeds.
 #[derive(Default)]
@@ -1434,6 +1435,304 @@ fn reach_check(req: ReachReq, state: tauri::State<'_, AppState>) -> Result<Reach
     })
 }
 
+// ===== Phase 8: dataflow graph (caliper-graph executor) =====
+
+/// One `Scope` series extracted from the graph run (camelCase for the FE).
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ScopeDto {
+    node_id: String,
+    signal: String,
+    t: Vec<f64>,
+    y: Vec<f64>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NodeErrDto {
+    node_id: String,
+    message: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct EdgeErrDto {
+    edge_index: usize,
+    message: String,
+}
+
+/// Validation diagnostics for the FE: an explicit `ok` flag plus the engine's
+/// per-node / per-edge errors, topo order, and any cycle.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DiagnosticsDto {
+    ok: bool,
+    node_errors: Vec<NodeErrDto>,
+    edge_errors: Vec<EdgeErrDto>,
+    topo_order: Vec<String>,
+    cycle: Vec<String>,
+}
+
+/// One output port's `{name, type}` (type ∈ config|pose|clip|report) — drives the
+/// FE's edge value badges / handle colours.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PortSummaryDto {
+    name: String,
+    #[serde(rename = "type")]
+    ty: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NodeSummaryDto {
+    id: String,
+    out_ports: Vec<PortSummaryDto>,
+}
+
+/// Full result of `graph_run`: the (optional) terminal clip baked into the EXISTING
+/// `TrajectoryDto` shape so the unchanged Transport/<Canvas> plays it, plus scope
+/// series, validation diagnostics, and per-node out-port summaries.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GraphRunDto {
+    trajectory: Option<TrajectoryDto>,
+    scopes: Vec<ScopeDto>,
+    diagnostics: DiagnosticsDto,
+    node_summaries: Vec<NodeSummaryDto>,
+}
+
+fn port_type_str(t: caliper::graph::PortType) -> &'static str {
+    match t {
+        caliper::graph::PortType::Config => "config",
+        caliper::graph::PortType::Pose => "pose",
+        caliper::graph::PortType::Clip => "clip",
+        caliper::graph::PortType::Report => "report",
+    }
+}
+
+fn diag_to_dto(d: &caliper::graph::Diagnostics) -> DiagnosticsDto {
+    DiagnosticsDto {
+        ok: d.is_ok(),
+        node_errors: d
+            .node_errors
+            .iter()
+            .map(|e| NodeErrDto {
+                node_id: e.node_id.clone(),
+                message: e.message.clone(),
+            })
+            .collect(),
+        edge_errors: d
+            .edge_errors
+            .iter()
+            .map(|e| EdgeErrDto {
+                edge_index: e.edge_index,
+                message: e.message.clone(),
+            })
+            .collect(),
+        topo_order: d.topo_order.clone(),
+        cycle: d.cycle.clone(),
+    }
+}
+
+/// Map a `GraphError` to a STRUCTURED string the FE can parse: the serde JSON of
+/// the error (`{"kind":"validation","diagnostics":...}` or
+/// `{"kind":"node","nodeId":...,"message":...}`), falling back to its Display.
+fn graph_error_str(e: &caliper::graph::GraphError) -> String {
+    serde_json::to_string(e).unwrap_or_else(|_| e.to_string())
+}
+
+/// Bake a face-neutral [`caliper::graph::ClipData`] into the EXISTING `TrajectoryDto`
+/// shape: FK frames + tip XYZ per sample (same `bake_frame_row` the playback path
+/// expects), so the FE plays the graph's terminal clip through the unchanged
+/// Phase-3 transport (kind = "graph").
+fn clip_to_trajectory(model: &Model, clip: &caliper::graph::ClipData) -> TrajectoryDto {
+    let ndof = clip.qs.first().map(|r| r.len()).unwrap_or(model.ndof);
+    let mut tip_path = Vec::with_capacity(clip.qs.len());
+    let mut frames = Vec::with_capacity(clip.qs.len());
+    for q in &clip.qs {
+        let (fr, tp) = bake_frame_row(model, q);
+        frames.push(fr);
+        tip_path.push(tp);
+    }
+    let duration = clip.times.last().copied().unwrap_or(0.0);
+    let dt = if clip.times.len() > 1 {
+        clip.times[1] - clip.times[0]
+    } else {
+        caliper::graph::CLIP_DT
+    };
+    TrajectoryDto {
+        kind: "graph".into(),
+        duration,
+        ndof,
+        dt,
+        times: clip.times.clone(),
+        q: clip.qs.clone(),
+        qd: clip.qds.clone(),
+        tip_path,
+        frames,
+        ok: true,
+        reached: 1.0,
+        max_jerk_ratio: 0.0,
+    }
+}
+
+/// Run a `.caliper-graph.json` document against the loaded robot. Clones the model
+/// under the state lock then RELEASES it before the (potentially heavy) run, bakes
+/// the terminal clip into a render-only trajectory, and returns scopes +
+/// diagnostics + per-node out-port summaries.
+#[tauri::command]
+fn graph_run(graph_json: String, state: tauri::State<'_, AppState>) -> Result<GraphRunDto, String> {
+    let doc: caliper::graph::GraphDoc =
+        serde_json::from_str(&graph_json).map_err(|e| format!("invalid graph JSON: {e}"))?;
+
+    // Clone the cached model and release the lock BEFORE running the graph.
+    let model = {
+        let guard = state.model.lock().map_err(|_| "state lock poisoned")?;
+        guard.as_ref().ok_or("no robot loaded")?.clone()
+    };
+    let robot = caliper::model::Robot {
+        name: model.name.clone(),
+        joint_names: model.joint_names.clone(),
+        model,
+    };
+
+    // Per-node out-port summaries (independent of execution success) for edge badges.
+    let node_summaries: Vec<NodeSummaryDto> = doc
+        .nodes
+        .iter()
+        .map(|n| NodeSummaryDto {
+            id: n.id.clone(),
+            out_ports: n
+                .kind
+                .out_ports()
+                .into_iter()
+                .map(|p| PortSummaryDto {
+                    name: p.name.to_string(),
+                    ty: port_type_str(p.ty).to_string(),
+                })
+                .collect(),
+        })
+        .collect();
+
+    let result = caliper::graph::run(&doc, &robot).map_err(|e| graph_error_str(&e))?;
+    let trajectory = result
+        .terminal_clip
+        .as_ref()
+        .map(|c| clip_to_trajectory(&robot.model, c));
+    let scopes = result
+        .scopes
+        .iter()
+        .map(|s| ScopeDto {
+            node_id: s.node_id.clone(),
+            signal: s.signal.clone(),
+            t: s.t.clone(),
+            y: s.y.clone(),
+        })
+        .collect();
+    let diagnostics = diag_to_dto(&result.diagnostics);
+    Ok(GraphRunDto {
+        trajectory,
+        scopes,
+        diagnostics,
+        node_summaries,
+    })
+}
+
+/// Validate a `.caliper-graph.json` document against the loaded model (no run).
+#[tauri::command]
+fn graph_validate(
+    graph_json: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<DiagnosticsDto, String> {
+    let doc: caliper::graph::GraphDoc =
+        serde_json::from_str(&graph_json).map_err(|e| format!("invalid graph JSON: {e}"))?;
+    let model = {
+        let guard = state.model.lock().map_err(|_| "state lock poisoned")?;
+        guard.as_ref().ok_or("no robot loaded")?.clone()
+    };
+    Ok(diag_to_dto(&caliper::graph::validate(&doc, &model)))
+}
+
+// ----- graph persistence (.caliper-graph.json under the app data dir) -----
+
+/// Sanitize a user-supplied graph name to a safe single-segment filename stem.
+fn sanitize_name(name: &str) -> Result<String, String> {
+    let s: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == ' ' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let s = s.trim().to_string();
+    if s.is_empty() {
+        return Err("graph name must not be empty".into());
+    }
+    Ok(s)
+}
+
+/// `<app_data_dir>/graphs`, created if absent.
+fn graphs_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    let base = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("could not resolve app data dir: {e}"))?;
+    let dir = base.join("graphs");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    Ok(dir)
+}
+
+#[tauri::command]
+fn save_graph(app: tauri::AppHandle, name: String, graph_json: String) -> Result<(), String> {
+    // Reject garbage before persisting so list/load always round-trips a GraphDoc.
+    let _doc: caliper::graph::GraphDoc =
+        serde_json::from_str(&graph_json).map_err(|e| format!("invalid graph JSON: {e}"))?;
+    let dir = graphs_dir(&app)?;
+    let safe = sanitize_name(&name)?;
+    let path = dir.join(format!("{safe}.caliper-graph.json"));
+    std::fs::write(&path, graph_json).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn load_graph(app: tauri::AppHandle, name: String) -> Result<String, String> {
+    let dir = graphs_dir(&app)?;
+    let safe = sanitize_name(&name)?;
+    let path = dir.join(format!("{safe}.caliper-graph.json"));
+    std::fs::read_to_string(&path).map_err(|e| format!("could not load graph `{name}`: {e}"))
+}
+
+#[tauri::command]
+fn list_graphs(app: tauri::AppHandle) -> Result<Vec<String>, String> {
+    let dir = graphs_dir(&app)?;
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(&dir).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let fname = entry.file_name();
+        let fname = fname.to_string_lossy();
+        if let Some(stem) = fname.strip_suffix(".caliper-graph.json") {
+            out.push(stem.to_string());
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+#[tauri::command]
+fn delete_graph(app: tauri::AppHandle, name: String) -> Result<(), String> {
+    let dir = graphs_dir(&app)?;
+    let safe = sanitize_name(&name)?;
+    let path = dir.join(format!("{safe}.caliper-graph.json"));
+    if path.exists() {
+        std::fs::remove_file(&path).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -1459,7 +1758,13 @@ pub fn run() {
             control_run,
             check_collision,
             plan_run,
-            reach_check
+            reach_check,
+            graph_run,
+            graph_validate,
+            save_graph,
+            load_graph,
+            list_graphs,
+            delete_graph
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -1669,5 +1974,130 @@ mod tests {
         // the bake the command uses yields one render matrix per drawn frame
         let (fr, _tp) = bake_frame_row(&m, &path[0]);
         assert_eq!(fr.len(), frames_at(&m, &start).len());
+    }
+
+    // ===== Phase 8: graph backend =====
+
+    fn robot_of(name: &str) -> caliper::model::Robot {
+        let m = load(name);
+        caliper::model::Robot {
+            name: m.name.clone(),
+            joint_names: m.joint_names.clone(),
+            model: m,
+        }
+    }
+
+    /// The terminal clip of a MoveJ graph bakes into the EXISTING TrajectoryDto
+    /// shape: one FK frame-row + tip per clip sample (what playback expects).
+    #[test]
+    fn graph_run_bakes_clip_to_trajectory() {
+        let robot = robot_of("toy.urdf");
+        let json = r#"{
+            "nodes":[
+                {"id":"s","kind":{"type":"startConfig","q":[0.0,0.0]}},
+                {"id":"g","kind":{"type":"startConfig","q":[0.4,-0.3]}},
+                {"id":"mj","kind":{"type":"moveJ"}},
+                {"id":"v","kind":{"type":"view"}}
+            ],
+            "edges":[
+                {"from":"s","fromPort":"config","to":"mj","toPort":"start"},
+                {"from":"g","fromPort":"config","to":"mj","toPort":"goal"},
+                {"from":"mj","fromPort":"clip","to":"v","toPort":"clip"}
+            ]
+        }"#;
+        let doc: caliper::graph::GraphDoc = serde_json::from_str(json).unwrap();
+        let res = caliper::graph::run(&doc, &robot).unwrap();
+        let clip = res.terminal_clip.as_ref().expect("terminal clip");
+        assert!(clip.len() > 1);
+        let traj = clip_to_trajectory(&robot.model, clip);
+        assert_eq!(traj.times.len(), clip.len());
+        assert_eq!(traj.frames.len(), clip.len());
+        assert_eq!(traj.tip_path.len(), clip.len());
+        assert_eq!(traj.q.len(), clip.qs.len());
+        // one render matrix per drawn frame, matching the live FK path.
+        assert_eq!(
+            traj.frames[0].len(),
+            frames_at(&robot.model, &clip.qs[0]).len()
+        );
+        assert!(traj.duration > 0.0);
+        assert_eq!(traj.kind, "graph");
+    }
+
+    /// A failing run returns a STRUCTURED error string (serde JSON of GraphError).
+    #[test]
+    fn graph_error_is_structured_json() {
+        // Control on a non-inertia robot (toy) fails validation inside run().
+        let robot = robot_of("toy.urdf");
+        assert!(!robot.model.has_inertia);
+        let json = r#"{
+            "nodes":[
+                {"id":"s","kind":{"type":"startConfig","q":[0.0,0.0]}},
+                {"id":"g","kind":{"type":"startConfig","q":[0.1,0.1]}},
+                {"id":"c","kind":{"type":"control","kp":100.0,"kd":20.0}},
+                {"id":"v","kind":{"type":"view"}}
+            ],
+            "edges":[
+                {"from":"s","fromPort":"config","to":"c","toPort":"start"},
+                {"from":"g","fromPort":"config","to":"c","toPort":"goal"},
+                {"from":"c","fromPort":"clip","to":"v","toPort":"clip"}
+            ]
+        }"#;
+        let doc: caliper::graph::GraphDoc = serde_json::from_str(json).unwrap();
+        let err = caliper::graph::run(&doc, &robot).unwrap_err();
+        let s = graph_error_str(&err);
+        assert!(
+            s.contains("\"kind\":\"validation\""),
+            "structured kind: {s}"
+        );
+        assert!(s.contains("diagnostics"), "carries diagnostics: {s}");
+    }
+
+    /// `graph_validate`'s DTO reports a clean DAG as ok with a full topo order, and
+    /// a cycle as not-ok.
+    #[test]
+    fn diag_dto_reports_ok_and_cycle() {
+        let robot = robot_of("toy.urdf");
+        let ok_json = r#"{
+            "nodes":[
+                {"id":"s","kind":{"type":"startConfig","q":[0.0,0.0]}},
+                {"id":"g","kind":{"type":"startConfig","q":[0.1,0.1]}},
+                {"id":"mj","kind":{"type":"moveJ"}},
+                {"id":"v","kind":{"type":"view"}}
+            ],
+            "edges":[
+                {"from":"s","fromPort":"config","to":"mj","toPort":"start"},
+                {"from":"g","fromPort":"config","to":"mj","toPort":"goal"},
+                {"from":"mj","fromPort":"clip","to":"v","toPort":"clip"}
+            ]
+        }"#;
+        let doc: caliper::graph::GraphDoc = serde_json::from_str(ok_json).unwrap();
+        let d = diag_to_dto(&caliper::graph::validate(&doc, &robot.model));
+        assert!(d.ok);
+        assert_eq!(d.topo_order.len(), 4);
+        assert!(d.cycle.is_empty());
+
+        // two IK nodes seeding each other form a cycle.
+        let cyc_json = r#"{
+            "nodes":[
+                {"id":"a","kind":{"type":"ik"}},
+                {"id":"b","kind":{"type":"ik"}}
+            ],
+            "edges":[
+                {"from":"a","fromPort":"config","to":"b","toPort":"seed"},
+                {"from":"b","fromPort":"config","to":"a","toPort":"seed"}
+            ]
+        }"#;
+        let doc: caliper::graph::GraphDoc = serde_json::from_str(cyc_json).unwrap();
+        let d = diag_to_dto(&caliper::graph::validate(&doc, &robot.model));
+        assert!(!d.ok);
+        assert!(!d.cycle.is_empty());
+    }
+
+    #[test]
+    fn sanitize_name_strips_unsafe() {
+        assert_eq!(sanitize_name("my/graph..v2").unwrap(), "my_graph__v2");
+        assert_eq!(sanitize_name("ok-name_1").unwrap(), "ok-name_1");
+        assert!(sanitize_name("   ").is_err());
+        assert!(sanitize_name("").is_err());
     }
 }

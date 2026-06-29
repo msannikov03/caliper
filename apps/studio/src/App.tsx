@@ -11,7 +11,9 @@ import { SingularityHud } from "./ui/SingularityHud";
 import { Transport } from "./ui/Transport";
 import { PosePanel } from "./ui/PosePanel";
 import { SimulatePanel } from "./ui/SimulatePanel";
+import { GraphEditor } from "./graph/GraphEditor";
 import { useStore } from "./store";
+import type { StudioMode } from "./store";
 import "./App.css";
 
 function ModeTabs() {
@@ -19,10 +21,11 @@ function ModeTabs() {
   const setMode = useStore((s) => s.setMode);
   const robot = useStore((s) => s.robot);
   if (!robot) return null;
-  const tabs: { id: "jog" | "motion" | "simulate"; label: string; disabled?: boolean }[] = [
+  const tabs: { id: StudioMode; label: string; disabled?: boolean }[] = [
     { id: "jog", label: "Jog" },
     { id: "motion", label: "Motion" },
     { id: "simulate", label: "Simulate", disabled: !robot.hasInertia },
+    { id: "graph", label: "Graph" },
   ];
   return (
     <div className="mode-tabs">
@@ -72,28 +75,44 @@ function SceneChrome() {
 
 export default function App() {
   const [version, setVersion] = useState("…");
+  const mode = useStore((s) => s.mode);
   useEffect(() => {
     invoke<string>("engine_version")
       .then(setVersion)
       .catch(() => setVersion("offline"));
   }, []);
 
+  const isGraph = mode === "graph";
+
   return (
     <div className="app">
       <Toolbar version={version} />
-      <main className="viewport">
-        <ModeTabs />
-        <Canvas camera={{ position: [0.7, 0.7, 0.7], fov: 50 }}>
-          <SceneChrome />
-          <RobotView />
-          <IkGizmo />
-        </Canvas>
-        <JointPanel />
-        <PosePanel />
-        <SimulatePanel />
-        <Hud />
-        <SingularityHud />
-        <Transport />
+      {/*
+        Single persistent <Canvas>: in Graph mode it docks to the right as the live
+        preview the View sink drives; otherwise it fills the viewport. The GL canvas
+        is NEVER unmounted on a mode switch — only resized via CSS.
+      */}
+      <main className={`viewport${isGraph ? " graph-mode" : ""}`}>
+        <ModeTabs key="modetabs" />
+        {isGraph && (
+          <div className="graph-pane" key="graphpane">
+            <GraphEditor />
+          </div>
+        )}
+        {/* keyed so inserting .graph-pane never reconciles/remounts the GL Canvas */}
+        <div className="gl-stage" key="glstage">
+          <Canvas camera={{ position: [0.7, 0.7, 0.7], fov: 50 }}>
+            <SceneChrome />
+            <RobotView />
+            {!isGraph && <IkGizmo />}
+          </Canvas>
+          {!isGraph && <JointPanel />}
+          {!isGraph && <PosePanel />}
+          {!isGraph && <SimulatePanel />}
+          <Hud />
+          <SingularityHud />
+          <Transport />
+        </div>
       </main>
     </div>
   );

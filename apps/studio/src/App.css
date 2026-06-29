@@ -399,3 +399,347 @@ body,
   color: #6c6c7a;
   font-size: 10px;
 }
+
+/* ===== Phase 8: Graph mode (split layout + dataflow editor) ===== */
+
+/* the persistent GL <Canvas> + its overlays live in .gl-stage; it fills the
+   viewport normally, and docks to the right as the preview in Graph mode. */
+.gl-stage {
+  position: absolute;
+  inset: 0;
+}
+.viewport.graph-mode .gl-stage {
+  left: auto;
+  right: 0;
+  width: 36%;
+  border-left: 1px solid #1b1b22;
+}
+.viewport.graph-mode .graph-pane {
+  position: absolute;
+  inset: 0 36% 0 0;
+}
+
+.graph-editor {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  background: #0b0b0e;
+}
+.g-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  padding: 6px 10px;
+  background: #0d0d11;
+  border-bottom: 1px solid #1b1b22;
+  flex: 0 0 auto;
+}
+.g-toolbar button {
+  background: #21212b;
+  color: #cfcfe0;
+  border: 1px solid #34343f;
+  border-radius: 6px;
+  padding: 3px 9px;
+  cursor: pointer;
+  font-size: 11.5px;
+}
+.g-toolbar button:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+.g-run {
+  background: #36c6d4;
+  color: #0a0a0c;
+  font-weight: 700;
+  border: none;
+}
+.g-validate {
+  color: #5aff7a;
+}
+.g-sep {
+  width: 1px;
+  height: 18px;
+  background: #2c2c3a;
+  margin: 0 3px;
+}
+.g-name,
+.g-load {
+  background: #15151b;
+  color: #d7d7e2;
+  border: 1px solid #26262f;
+  border-radius: 6px;
+  padding: 3px 7px;
+  font-size: 11.5px;
+  outline: none;
+}
+.g-name {
+  width: 110px;
+}
+.g-banner {
+  flex: 0 0 auto;
+  padding: 5px 12px;
+  background: #2a1414;
+  color: #ff8a8a;
+  border-bottom: 1px solid #4a1f1f;
+  font-size: 11.5px;
+}
+.g-canvas {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+/* node palette overlay */
+.g-palette {
+  position: absolute;
+  top: 10px;
+  left: 10px;
+  z-index: 6;
+  width: 124px;
+  max-height: calc(100% - 20px);
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 8px;
+  background: rgba(13, 13, 17, 0.92);
+  border: 1px solid #1b1b22;
+  border-radius: 9px;
+  backdrop-filter: blur(8px);
+}
+.g-palette-title {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  color: #9a9aa6;
+  text-transform: uppercase;
+}
+.g-palette-cat {
+  margin: 3px 0 1px;
+  font-size: 9px;
+  letter-spacing: 0.05em;
+  color: #6c6c7a;
+  text-transform: uppercase;
+}
+.g-palette-btn {
+  background: #1a1a22;
+  color: #cfcfe0;
+  border: 1px solid #2c2c3a;
+  border-radius: 6px;
+  padding: 3px 6px;
+  cursor: pointer;
+  font-size: 10.5px;
+  text-align: left;
+}
+.g-palette-btn:hover {
+  border-color: #36c6d4;
+}
+.pb-source {
+  border-left: 3px solid #f5a623;
+}
+.pb-compute {
+  border-left: 3px solid #36c6d4;
+}
+.pb-sink {
+  border-left: 3px solid #5aff7a;
+}
+
+/* custom nodes */
+.gnode {
+  position: relative;
+  min-width: 154px;
+  background: #15151c;
+  border: 1px solid #2c2c3a;
+  border-radius: 8px;
+  color: #cfcfe0;
+  font-size: 11px;
+}
+.gnode-source {
+  border-left: 3px solid #f5a623;
+}
+.gnode-compute {
+  border-left: 3px solid #36c6d4;
+}
+.gnode-sink {
+  border-left: 3px solid #5aff7a;
+}
+.gnode.gn-error {
+  border-color: #ff5a5a;
+}
+.gnode-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 9px;
+  border-bottom: 1px solid #23232c;
+  font-weight: 700;
+  font-size: 11px;
+}
+.gnode-ring {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: #3a3a46;
+  box-shadow: 0 0 0 2px #15151c;
+}
+.gnode-ring.running {
+  background: #f5d76e;
+  animation: gpulse 0.8s infinite alternate;
+}
+.gnode-ring.ok {
+  background: #5aff7a;
+}
+.gnode-ring.error {
+  background: #ff5a5a;
+}
+@keyframes gpulse {
+  from {
+    opacity: 0.35;
+  }
+  to {
+    opacity: 1;
+  }
+}
+.gnode-body {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 7px 9px;
+}
+.gnode-note {
+  color: #6c6c7a;
+  font-size: 10px;
+}
+
+/* typed color-coded handles + their labels */
+.ghandle {
+  width: 9px;
+  height: 9px;
+  border: 1px solid #0a0a0c;
+}
+.ghandle-label {
+  position: absolute;
+  transform: translateY(-50%);
+  font-size: 8.5px;
+  color: #8a8a96;
+  pointer-events: none;
+}
+.ghandle-label.in {
+  left: 11px;
+}
+.ghandle-label.out {
+  right: 11px;
+}
+
+/* inline param controls */
+.gfield {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  font-size: 10.5px;
+  color: #9a9aa6;
+}
+.gfield input,
+.gfield select {
+  width: 86px;
+  background: #0f0f14;
+  border: 1px solid #2c2c3a;
+  border-radius: 5px;
+  color: #cfcfe0;
+  padding: 2px 5px;
+  font-size: 10.5px;
+}
+.gpose-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 4px 8px;
+}
+.gpose-grid .gfield input {
+  width: 56px;
+}
+.gcheck {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 10.5px;
+  color: #9a9aa6;
+}
+.gconf {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  max-height: 168px;
+  overflow-y: auto;
+}
+.gconf-row {
+  display: grid;
+  grid-template-columns: 52px 1fr 30px;
+  align-items: center;
+  gap: 5px;
+}
+.gconf-name {
+  font-size: 9.5px;
+  color: #8a8a96;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.gconf-row input[type="range"] {
+  width: 100%;
+  accent-color: #36c6d4;
+}
+.gconf-val {
+  font-size: 9.5px;
+  text-align: right;
+  color: #cfcfe0;
+  font-variant-numeric: tabular-nums;
+}
+.gboxes {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.gboxes-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 10px;
+  color: #8a8a96;
+}
+.gbox-row {
+  display: flex;
+  gap: 2px;
+}
+.gbox-row input {
+  width: 30px;
+  background: #0f0f14;
+  border: 1px solid #2c2c3a;
+  border-radius: 4px;
+  color: #cfcfe0;
+  font-size: 9px;
+  padding: 1px 2px;
+}
+.gboxes button,
+.gbox-row button {
+  background: #21212b;
+  color: #cfcfe0;
+  border: 1px solid #34343f;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 10px;
+  padding: 0 5px;
+}
+.gscope-empty {
+  padding: 8px;
+  text-align: center;
+  font-size: 10px;
+  color: #6c6c7a;
+}
+.scope-chart {
+  background: #0d0d11;
+  border-radius: 5px;
+  padding: 2px;
+}

@@ -1,5 +1,19 @@
 import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
+import { applyNodeChanges, applyEdgeChanges, addEdge } from "@xyflow/react";
+import type { Connection, NodeChange, EdgeChange } from "@xyflow/react";
+import type {
+  CNode,
+  CEdge,
+  GraphScope,
+  Diagnostics,
+  GraphRunResult,
+  NodeStatus,
+} from "./graph/types";
+import { diagnosticsOk } from "./graph/types";
+import type { KindName } from "./graph/spec";
+import { defaultParams, outPortType, inPortTypes, PORT_COLORS, NODE_SPECS } from "./graph/spec";
+import { serializeGraph, parseGraph } from "./graph/serialize";
 
 // ---- wire types: mirror the serde structs in src-tauri/src/lib.rs exactly ----
 
@@ -81,7 +95,7 @@ export interface CollisionDto {
   numColliders: number;
   uncoveredFrames: number;
 }
-export type StudioMode = "jog" | "motion" | "simulate";
+export type StudioMode = "jog" | "motion" | "simulate" | "graph";
 export interface NamedPoseDto {
   name: string;
   q: number[];
@@ -145,6 +159,26 @@ interface StudioState {
   runPlan: (goal: number[]) => Promise<void>;
   checkCollision: (ground?: number | null) => Promise<void>;
   clearCollision: () => void;
+
+  // graph mode (Phase 8) — Simulink-style dataflow editor
+  graphNodes: CNode[];
+  graphEdges: CEdge[];
+  graphScopes: GraphScope[]; // last run's extracted Scope series
+  graphBanner: string | null; // red banner: cycles / type mismatch / run error
+  graphSaved: string[]; // saved graph names (list_graphs)
+  graphName: string;
+  _graphRunId: number; // monotonic latest-wins guard, like _reqId
+  onGraphNodesChange: (changes: NodeChange<CNode>[]) => void;
+  onGraphEdgesChange: (changes: EdgeChange<CEdge>[]) => void;
+  onGraphConnect: (c: Connection) => void;
+  addGraphNode: (kind: KindName) => void;
+  updateNodeParams: (id: string, patch: Record<string, unknown>) => void;
+  setGraphName: (s: string) => void;
+  runGraph: () => Promise<void>;
+  validateGraph: () => Promise<void>;
+  saveGraph: (name: string) => Promise<void>;
+  loadGraph: (name: string) => Promise<void>;
+  refreshGraphList: () => Promise<void>;
 }
 
 export const useStore = create<StudioState>((set, get) => ({
@@ -168,6 +202,13 @@ export const useStore = create<StudioState>((set, get) => ({
   simDamping: 0.2,
   simTorque: [],
   collision: null,
+  graphNodes: [],
+  graphEdges: [],
+  graphScopes: [],
+  graphBanner: null,
+  graphSaved: [],
+  graphName: "",
+  _graphRunId: 0,
 
   async loadRobot(path) {
     set({ loading: true, error: null });
@@ -187,9 +228,16 @@ export const useStore = create<StudioState>((set, get) => ({
         playing: false,
         playhead: 0,
         poses: [],
+        // a new robot invalidates the (ndof-bound) graph
+        graphNodes: [],
+        graphEdges: [],
+        graphScopes: [],
+        graphBanner: null,
+        graphName: "",
       });
       await get().refreshFrames();
       await get().refreshPoses();
+      void get().refreshGraphList();
     } catch (e) {
       set({ error: String(e), robot: null });
     } finally {
@@ -198,7 +246,7 @@ export const useStore = create<StudioState>((set, get) => ({
   },
 
   setJoint(i, v) {
-    if (get().playing || get().mode === "simulate") return; // sim/playback own the pose
+    if (get().playing || get().mode === "simulate" || get().mode === "graph") return; // sim/playback/graph own the pose
     const q = get().q.slice();
     q[i] = v;
     // a manual jog invalidates any prior IK status (it described a different pose)
@@ -237,7 +285,7 @@ export const useStore = create<StudioState>((set, get) => ({
 
   async solveIkGoverned(targetColMajor, snap) {
     const { q, robot } = get();
-    if (!robot || get().playing || get().mode === "simulate") return; // gizmo inert
+    if (!robot || get().playing || get().mode === "simulate" || get().mode === "graph") return; // gizmo inert
     const frameName = robot.frames[robot.tip].name;
     const reqId = get()._reqId + 1;
     set({ _reqId: reqId });
@@ -459,11 +507,261 @@ export const useStore = create<StudioState>((set, get) => ({
   clearCollision() {
     set({ collision: null });
   },
+
+  // ---- graph mode (Phase 8) ----
+  onGraphNodesChange(changes) {
+    set({ graphNodes: applyNodeChanges<CNode>(changes, get().graphNodes) });
+  },
+  onGraphEdgesChange(changes) {
+    set({ graphEdges: applyEdgeChanges<CEdge>(changes, get().graphEdges) });
+  },
+  onGraphConnect(c) {
+    const { source, target, sourceHandle, targetHandle } = c;
+    if (!source || !target) return;
+    const nodes = get().graphNodes;
+    const src = nodes.find((n) => n.id === source);
+    const tgt = nodes.find((n) => n.id === target);
+    if (!src || !tgt) return;
+    const outName = sourceHandle ?? NODE_SPECS[src.data.kind].outputs[0]?.name;
+    const inName = targetHandle ?? NODE_SPECS[tgt.data.kind].inputs[0]?.name;
+    if (!outName || !inName) return;
+    const st = outPortType(src.data.kind, outName);
+    const tts = inPortTypes(tgt.data.kind, inName);
+    if (!st || !tts || !tts.includes(st)) {
+      // reject type-incompatible wires (handle port-type guard)
+      set({ graphBanner: `Incompatible wire: ${st ?? "?"} → ${tts ? tts.join("|") : "?"}` });
+      return;
+    }
+    const color = PORT_COLORS[st];
+    // one feeder per input port: drop any existing edge into the same target handle
+    const kept = get().graphEdges.filter(
+      (e) => !(e.target === target && e.targetHandle === inName),
+    );
+    const edge: CEdge = {
+      id: `e_${source}.${outName}->${target}.${inName}`,
+      source,
+      target,
+      sourceHandle: outName,
+      targetHandle: inName,
+      data: { color },
+      style: { stroke: color },
+    };
+    set({ graphEdges: addEdge<CEdge>(edge, kept), graphBanner: null });
+  },
+  addGraphNode(kind) {
+    const ndof = get().robot?.ndof ?? 0;
+    const count = get().graphNodes.length;
+    const node: CNode = {
+      id: nextNodeId(kind),
+      type: kind,
+      position: { x: 90 + (count % 5) * 64, y: 70 + (count % 7) * 46 },
+      data: { kind, params: defaultParams(kind, ndof), status: "idle" },
+    };
+    set({ graphNodes: [...get().graphNodes, node] });
+  },
+  updateNodeParams(id, patch) {
+    set({
+      graphNodes: get().graphNodes.map((n) =>
+        n.id === id ? { ...n, data: { ...n.data, params: { ...n.data.params, ...patch } } } : n,
+      ),
+    });
+  },
+  setGraphName(s) {
+    set({ graphName: s });
+  },
+  async runGraph() {
+    const robot = get().robot;
+    if (!robot) return;
+    const id = get()._graphRunId + 1;
+    set({
+      _graphRunId: id,
+      graphBanner: null,
+      graphNodes: get().graphNodes.map((n) => ({
+        ...n,
+        data: { ...n.data, status: "running" as NodeStatus, error: undefined },
+      })),
+    });
+    const graphJson = serializeGraph(get().graphNodes, get().graphEdges, get().graphName, robot.name);
+    try {
+      const res = await invoke<GraphRunResult>("graph_run", { graphJson });
+      if (get()._graphRunId !== id) return; // a newer run superseded us
+      const ran = new Set(res.diagnostics?.topoOrder ?? []);
+      set({
+        graphScopes: res.scopes ?? [],
+        graphNodes: get().graphNodes.map((n) => ({
+          ...n,
+          data: {
+            ...n.data,
+            status: (ran.size === 0 || ran.has(n.id) ? "ok" : "idle") as NodeStatus,
+            error: undefined,
+          },
+        })),
+      });
+      const traj = res.trajectory ?? null;
+      if (traj) {
+        // the View sink drives the persistent GL preview via the playback clock
+        set({ traj, simTraj: null, playhead: 0, playing: false });
+        get()._applyTrajAt(0);
+        get().play();
+      }
+    } catch (e) {
+      if (get()._graphRunId !== id) return;
+      handleGraphError(e, get, set);
+    }
+  },
+  async validateGraph() {
+    const robot = get().robot;
+    if (!robot) return;
+    const graphJson = serializeGraph(get().graphNodes, get().graphEdges, get().graphName, robot.name);
+    try {
+      const diag = await invoke<Diagnostics>("graph_validate", { graphJson });
+      const dec = decorateWithDiagnostics(get().graphNodes, get().graphEdges, diag);
+      set({
+        graphNodes: dec.nodes,
+        graphEdges: dec.edges,
+        graphBanner: diagnosticsOk(diag) ? "graph is valid ✓" : dec.banner,
+      });
+    } catch (e) {
+      set({ graphBanner: String(e) });
+    }
+  },
+  async saveGraph(name) {
+    const robot = get().robot;
+    if (!robot) return;
+    const graphJson = serializeGraph(get().graphNodes, get().graphEdges, name, robot.name);
+    try {
+      await invoke("save_graph", { name, graphJson });
+      set({ graphName: name });
+      await get().refreshGraphList();
+    } catch (e) {
+      set({ graphBanner: String(e) });
+    }
+  },
+  async loadGraph(name) {
+    const ndof = get().robot?.ndof ?? 0;
+    try {
+      const graphJson = await invoke<string>("load_graph", { name });
+      const parsed = parseGraph(graphJson, ndof);
+      // re-color edges by their source out-port type (parseGraph leaves them bare)
+      const colored = parsed.edges.map((e) => {
+        const src = parsed.nodes.find((n) => n.id === e.source);
+        const t = src && e.sourceHandle ? outPortType(src.data.kind, e.sourceHandle) : undefined;
+        const color = t ? PORT_COLORS[t] : "#6c6c7a";
+        return { ...e, data: { color }, style: { stroke: color } };
+      });
+      bumpNodeSeq(parsed.nodes);
+      set({
+        graphNodes: parsed.nodes,
+        graphEdges: colored,
+        graphName: parsed.name || name,
+        graphScopes: [],
+        graphBanner: null,
+      });
+    } catch (e) {
+      set({ graphBanner: String(e) });
+    }
+  },
+  async refreshGraphList() {
+    try {
+      const list = await invoke<string[]>("list_graphs");
+      set({ graphSaved: list });
+    } catch {
+      // the backend command may be absent in some builds; leave the list as-is.
+    }
+  },
 }));
 
 /// The active playback clip: a baked sim rollout takes precedence over a motion traj.
 function activeClip(s: StudioState): TrajectoryDto | null {
   return s.simTraj ?? s.traj;
+}
+
+// ---- graph helpers (module scope) ----
+let nodeSeq = 0;
+function nextNodeId(kind: KindName): string {
+  return `${kind}_${(nodeSeq++).toString(36)}`;
+}
+/// After a load, advance the id counter past the loaded set to avoid collisions.
+function bumpNodeSeq(nodes: CNode[]): void {
+  nodeSeq += nodes.length + 1;
+}
+
+/// Build a short red-banner summary from validation diagnostics.
+function buildBanner(diag: Diagnostics): string {
+  const parts: string[] = [];
+  if (diag.cycle.length) parts.push(`cycle: ${diag.cycle.join(" → ")}`);
+  for (const e of diag.nodeErrors) parts.push(`${e.nodeId}: ${e.message}`);
+  for (const e of diag.edgeErrors) parts.push(`edge #${e.edgeIndex}: ${e.message}`);
+  const head = parts.slice(0, 4).join("  •  ");
+  return parts.length > 4 ? `${head}  (+${parts.length - 4} more)` : head;
+}
+
+/// Mark nodes/edges with their diagnostic status + colors; returns the banner too.
+function decorateWithDiagnostics(
+  nodes: CNode[],
+  edges: CEdge[],
+  diag: Diagnostics,
+): { nodes: CNode[]; edges: CEdge[]; banner: string | null } {
+  const nodeErr = new Map<string, string>();
+  for (const e of diag.nodeErrors) if (!nodeErr.has(e.nodeId)) nodeErr.set(e.nodeId, e.message);
+  const inCycle = new Set(diag.cycle);
+  const newNodes = nodes.map((n) => {
+    const msg = nodeErr.get(n.id);
+    const bad = msg !== undefined || inCycle.has(n.id);
+    return {
+      ...n,
+      data: {
+        ...n.data,
+        status: (bad ? "error" : "idle") as NodeStatus,
+        error: msg ?? (inCycle.has(n.id) ? "participates in a cycle" : undefined),
+      },
+    };
+  });
+  const badEdge = new Set(diag.edgeErrors.map((e) => e.edgeIndex));
+  const newEdges = edges.map((e, i) => {
+    const base = (e.data as { color?: string } | undefined)?.color ?? "#6c6c7a";
+    return { ...e, style: { ...(e.style ?? {}), stroke: badEdge.has(i) ? "#ff5a5a" : base } };
+  });
+  return { nodes: newNodes, edges: newEdges, banner: diagnosticsOk(diag) ? null : buildBanner(diag) };
+}
+
+/// Apply a `graph_run` rejection (serialized GraphError or a string) to the store.
+function handleGraphError(
+  e: unknown,
+  get: () => StudioState,
+  set: (p: Partial<StudioState>) => void,
+): void {
+  const err = e as
+    | { kind?: string; nodeId?: string; message?: string; diagnostics?: Diagnostics }
+    | undefined;
+  if (err && err.kind === "validation" && err.diagnostics) {
+    const dec = decorateWithDiagnostics(get().graphNodes, get().graphEdges, err.diagnostics);
+    set({ graphNodes: dec.nodes, graphEdges: dec.edges, graphBanner: dec.banner ?? "validation failed" });
+    return;
+  }
+  if (err && err.kind === "node" && err.nodeId) {
+    const nid = err.nodeId;
+    const msg = err.message ?? "node failed";
+    set({
+      graphNodes: get().graphNodes.map((n) => ({
+        ...n,
+        data: {
+          ...n.data,
+          status: (n.id === nid ? "error" : "idle") as NodeStatus,
+          error: n.id === nid ? msg : undefined,
+        },
+      })),
+      graphBanner: `node ${nid}: ${msg}`,
+    });
+    return;
+  }
+  set({
+    graphNodes: get().graphNodes.map((n) => ({
+      ...n,
+      data: { ...n.data, status: "idle" as NodeStatus },
+    })),
+    graphBanner: String((err && err.message) || e),
+  });
 }
 
 // playback analysis throttle: the last baked frame index (and clip) we analyzed,

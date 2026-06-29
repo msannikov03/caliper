@@ -38,6 +38,18 @@ pub fn crc16(data: &[u8]) -> u16 {
 /// Build a Protocol-2.0 instruction packet (header, id, length, instruction,
 /// params, CRC-16). Length = params + 3 (instruction + 2 CRC bytes).
 pub fn build_packet(id: u8, instruction: u8, params: &[u8]) -> Vec<u8> {
+    // The length field is a u16 = params + 3 (instruction + 2 CRC). An oversized
+    // payload would silently truncate the `as u16` cast and desync the length
+    // field from the bytes actually written. build_packet returns `Vec<u8>` (no
+    // Result to surface an error through), so guard by clamping params to the
+    // largest payload the length field can describe; real Dynamixel packets are
+    // far below this bound, so this never triggers in practice.
+    const MAX_PARAMS: usize = (u16::MAX as usize) - 3;
+    debug_assert!(
+        params.len() <= MAX_PARAMS,
+        "Dynamixel packet params exceed the u16 length field"
+    );
+    let params = &params[..params.len().min(MAX_PARAMS)];
     let len = (params.len() + 3) as u16;
     let mut pkt = vec![
         0xFF,
@@ -57,8 +69,15 @@ pub fn build_packet(id: u8, instruction: u8, params: &[u8]) -> Vec<u8> {
 }
 
 /// Radians → goal ticks, centered at half-range (`0 rad` → `2048`).
+///
+/// Clamps the float intermediate to the representable `i64` range before the cast
+/// and uses `saturating_add` for the half-range offset, so extreme-but-finite
+/// input saturates instead of overflowing (mirrors the CAN `rad_to_pulses`
+/// clamp). For ordinary inputs the result is unchanged.
 pub fn rad_to_ticks(rad: f64, tpr: i64) -> i64 {
-    (rad / (2.0 * PI) * tpr as f64).round() as i64 + tpr / 2
+    let raw = (rad / (2.0 * PI) * tpr as f64).round();
+    let ticks = raw.clamp(i64::MIN as f64, i64::MAX as f64) as i64;
+    ticks.saturating_add(tpr / 2)
 }
 /// Goal ticks → radians (inverse of [`rad_to_ticks`]).
 pub fn ticks_to_rad(ticks: i64, tpr: i64) -> f64 {
@@ -252,6 +271,19 @@ mod tests {
             assert!((back - rad).abs() < 2e-3, "deg={deg}");
         }
         assert_eq!(rad_to_ticks(0.0, DXL_TICKS_PER_REV), 2048); // centered
+    }
+
+    #[test]
+    fn rad_to_ticks_saturates_on_extreme_input() {
+        // Without the clamp + saturating_add, `huge as i64` then `+ tpr/2` would
+        // overflow (panic in debug) or wrap (release). It must saturate instead.
+        assert_eq!(rad_to_ticks(f64::MAX, DXL_TICKS_PER_REV), i64::MAX);
+        assert_eq!(
+            rad_to_ticks(f64::MIN, DXL_TICKS_PER_REV),
+            i64::MIN.saturating_add(DXL_TICKS_PER_REV / 2)
+        );
+        // ordinary inputs are unaffected by the guard
+        assert_eq!(rad_to_ticks(0.0, DXL_TICKS_PER_REV), 2048);
     }
 
     #[test]

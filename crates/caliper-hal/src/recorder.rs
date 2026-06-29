@@ -26,6 +26,17 @@ use parquet::file::properties::WriterProperties;
 pub const CODEBASE_VERSION: &str = "v2.1";
 pub const CHUNK_SIZE: usize = 1000;
 
+/// On-disk chunk directory (relative to the dataset root) that an episode belongs
+/// to, matching the advertised `data/chunk-{episode_chunk:03d}/...` layout.
+fn chunk_rel_path(episode_index: usize) -> PathBuf {
+    PathBuf::from(format!("data/chunk-{:03}", episode_index / CHUNK_SIZE))
+}
+
+/// Number of chunk directories needed for `total_episodes` episodes.
+fn total_chunks(total_episodes: usize) -> usize {
+    total_episodes.div_ceil(CHUNK_SIZE)
+}
+
 /// Dataset feature spec: dimensionality + joint names + frame rate.
 #[derive(Clone, Debug)]
 pub struct DatasetSpec {
@@ -118,7 +129,10 @@ impl Recorder {
     /// Create (or overwrite into) a dataset directory tree.
     pub fn create(root: impl AsRef<Path>, spec: DatasetSpec) -> Result<Self, Error> {
         let root = root.as_ref().to_path_buf();
-        for sub in ["meta", "data/chunk-000"] {
+        // Per-chunk directories are created lazily in `finalize_episode` (an episode
+        // lands in `data/chunk-{episode_index / CHUNK_SIZE:03}`), so only the base
+        // dirs are pre-created here.
+        for sub in ["meta", "data"] {
             fs::create_dir_all(root.join(sub)).map_err(|e| Error::Backend(e.to_string()))?;
         }
         Ok(Self {
@@ -229,10 +243,9 @@ impl Recorder {
         )
         .map_err(|e| Error::Backend(e.to_string()))?;
 
-        let path = self
-            .root
-            .join("data/chunk-000")
-            .join(format!("episode_{ep_index:06}.parquet"));
+        let chunk_dir = self.root.join(chunk_rel_path(self.next_episode));
+        fs::create_dir_all(&chunk_dir).map_err(|e| Error::Backend(e.to_string()))?;
+        let path = chunk_dir.join(format!("episode_{ep_index:06}.parquet"));
         let file = File::create(&path).map_err(|e| Error::Backend(e.to_string()))?;
         let props = WriterProperties::builder()
             .set_compression(Compression::SNAPPY)
@@ -253,12 +266,28 @@ impl Recorder {
         let ac = column_stats(&ep.actions, n);
         let ts: Vec<Vec<f64>> = ep.timestamps.iter().map(|&t| vec![t]).collect();
         let tst = column_stats(&ts, 1);
+        // Declared scalar features also carry per-episode stats in the v2.1 schema
+        // (lerobot expects an entry for every feature, not just the vector ones).
+        let fi: Vec<Vec<f64>> = (0..len).map(|i| vec![i as f64]).collect();
+        let ei: Vec<Vec<f64>> = (0..len).map(|_| vec![ep_index as f64]).collect();
+        let ix: Vec<Vec<f64>> = (0..len)
+            .map(|i| vec![(self.global_index + i as i64) as f64])
+            .collect();
+        let ti: Vec<Vec<f64>> = (0..len).map(|_| vec![ep.task_index as f64]).collect();
+        let fist = column_stats(&fi, 1);
+        let eist = column_stats(&ei, 1);
+        let ixst = column_stats(&ix, 1);
+        let tist = column_stats(&ti, 1);
         self.episodes_stats.push(serde_json::json!({
             "episode_index": ep_index,
             "stats": {
                 "observation.state": stats_json(&st),
                 "action": stats_json(&ac),
                 "timestamp": stats_json(&tst),
+                "frame_index": stats_json(&fist),
+                "episode_index": stats_json(&eist),
+                "index": stats_json(&ixst),
+                "task_index": stats_json(&tist),
             }
         }));
 
@@ -287,7 +316,7 @@ impl Recorder {
             "total_frames": self.total_frames,
             "total_tasks": self.tasks.len(),
             "total_videos": 0,
-            "total_chunks": 1,
+            "total_chunks": total_chunks(self.next_episode),
             "chunks_size": CHUNK_SIZE,
             "fps": self.spec.fps,
             "splits": {"train": format!("0:{}", self.next_episode)},
@@ -392,7 +421,7 @@ impl DatasetReader {
     pub fn read_episode(&self, ep: usize) -> Result<Episode, Error> {
         let path = self
             .root
-            .join("data/chunk-000")
+            .join(chunk_rel_path(ep))
             .join(format!("episode_{ep:06}.parquet"));
         let file = File::open(&path).map_err(|e| Error::Backend(e.to_string()))?;
         let reader = ParquetRecordBatchReaderBuilder::try_new(file)
@@ -541,6 +570,107 @@ mod tests {
         let root = rec.close().unwrap();
         let rd = DatasetReader::open(&root).unwrap();
         assert_eq!(rd.total_episodes, 2);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn chunk_layout_helpers() {
+        assert_eq!(chunk_rel_path(0), PathBuf::from("data/chunk-000"));
+        assert_eq!(
+            chunk_rel_path(CHUNK_SIZE - 1),
+            PathBuf::from("data/chunk-000")
+        );
+        assert_eq!(chunk_rel_path(CHUNK_SIZE), PathBuf::from("data/chunk-001"));
+        assert_eq!(
+            chunk_rel_path(2 * CHUNK_SIZE + 7),
+            PathBuf::from("data/chunk-002")
+        );
+        assert_eq!(total_chunks(0), 0);
+        assert_eq!(total_chunks(1), 1);
+        assert_eq!(total_chunks(CHUNK_SIZE), 1);
+        assert_eq!(total_chunks(CHUNK_SIZE + 1), 2);
+    }
+
+    #[test]
+    fn episodes_span_multiple_chunk_dirs() {
+        // Drive the recorder across the CHUNK_SIZE boundary without writing 1000+
+        // files: jump straight to the last episode of chunk-000 (private fields are
+        // reachable from this in-module test), then write episodes 999 and 1000.
+        let spec = DatasetSpec {
+            fps: 30,
+            ndof: 1,
+            joint_names: vec!["j".into()],
+            robot_type: "t".into(),
+        };
+        let dir = tmpdir("chunks");
+        let mut rec = Recorder::create(&dir, spec).unwrap();
+        rec.next_episode = CHUNK_SIZE - 1; // 999
+        for _ in 0..2 {
+            rec.start_episode("t").unwrap();
+            for k in 0..3 {
+                rec.append_frame(&[k as f64], &[0.0], k as f64).unwrap();
+            }
+            rec.finalize_episode().unwrap();
+        }
+        let root = rec.close().unwrap();
+
+        // Episode 999 lands in chunk-000, episode 1000 in chunk-001.
+        assert!(root.join("data/chunk-000/episode_000999.parquet").exists());
+        assert!(root.join("data/chunk-001/episode_001000.parquet").exists());
+
+        // info.json advertises the right number of chunks (ceil(1001 / 1000) = 2).
+        let info: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(root.join("meta/info.json")).unwrap())
+                .unwrap();
+        assert_eq!(info["total_chunks"].as_u64().unwrap(), 2);
+        assert_eq!(
+            info["total_episodes"].as_u64().unwrap(),
+            CHUNK_SIZE as u64 + 1
+        );
+
+        // The reader resolves the chunk dir from the episode index too.
+        let rd = DatasetReader::open(&root).unwrap();
+        let ep = rd.read_episode(CHUNK_SIZE).unwrap();
+        assert_eq!(ep.len(), 3);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn scalar_features_have_stats() {
+        let spec = DatasetSpec {
+            fps: 30,
+            ndof: 1,
+            joint_names: vec!["j".into()],
+            robot_type: "t".into(),
+        };
+        let dir = tmpdir("scalarstats");
+        let mut rec = Recorder::create(&dir, spec).unwrap();
+        rec.start_episode("t").unwrap();
+        for k in 0..4 {
+            rec.append_frame(&[k as f64], &[k as f64], k as f64)
+                .unwrap();
+        }
+        rec.finalize_episode().unwrap();
+        let root = rec.close().unwrap();
+
+        let line = fs::read_to_string(root.join("meta/episodes_stats.jsonl")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(line.lines().next().unwrap()).unwrap();
+        let stats = &v["stats"];
+        for feat in [
+            "observation.state",
+            "action",
+            "timestamp",
+            "frame_index",
+            "episode_index",
+            "index",
+            "task_index",
+        ] {
+            assert!(stats.get(feat).is_some(), "missing stats for {feat}");
+            assert_eq!(stats[feat]["count"][0].as_u64().unwrap(), 4);
+        }
+        // frame_index runs 0..4 -> min 0, max 3.
+        assert_eq!(stats["frame_index"]["min"][0].as_f64().unwrap(), 0.0);
+        assert_eq!(stats["frame_index"]["max"][0].as_f64().unwrap(), 3.0);
         let _ = fs::remove_dir_all(&root);
     }
 }

@@ -83,8 +83,18 @@ pub fn encode_read_encoder(id: u16) -> MksFrame {
 }
 
 /// Decode a `0x30` reply `[0x30, carry(i32 BE), value(u16 BE), crc]` → absolute pulses.
-pub fn decode_encoder_reply(data: &[u8]) -> Result<i64, Error> {
-    if data.len() < 8 || data[0] != 0x30 {
+///
+/// `id` is the CAN arbitration id the reply arrived on; it is required to verify
+/// the additive checksum (`(id + Σbody) & 0xFF`). The frame is rejected unless the
+/// command byte is `0x30`, the length is exactly 8, and the trailing checksum
+/// matches — guarding against corrupt or short frames.
+pub fn decode_encoder_reply(id: u16, data: &[u8]) -> Result<i64, Error> {
+    const EXPECTED_LEN: usize = 8; // [0x30, carry(4 BE), value(2 BE), crc]
+    let frame = MksFrame {
+        id,
+        data: data.to_vec(),
+    };
+    if data.len() != EXPECTED_LEN || frame.command() != Some(0x30) || !frame.checksum_ok() {
         return Err(Error::Backend("malformed 0x30 encoder reply".into()));
     }
     let carry = i32::from_be_bytes([data[1], data[2], data[3], data[4]]) as i64;
@@ -219,9 +229,47 @@ mod tests {
 
     #[test]
     fn encoder_reply_decodes() {
-        // carry=2 rev, value=8192 (half rev) → 2*16384 + 8192 = 40960 pulses
-        let data = [0x30, 0, 0, 0, 2, 0x20, 0x00, 0x00];
-        assert_eq!(decode_encoder_reply(&data).unwrap(), 2 * 16384 + 8192);
+        // carry=2 rev, value=8192 (half rev) → 2*16384 + 8192 = 40960 pulses.
+        // crc = (id + Σbody) & 0xFF = (1 + 0x30 + 2 + 0x20) & 0xFF = 0x53.
+        let data = [0x30, 0, 0, 0, 2, 0x20, 0x00, 0x53];
+        assert_eq!(decode_encoder_reply(1, &data).unwrap(), 2 * 16384 + 8192);
+    }
+
+    #[test]
+    fn encoder_reply_rejects_bad_frames() {
+        // valid frame for id=1
+        let good = [0x30, 0, 0, 0, 2, 0x20, 0x00, 0x53];
+        assert!(decode_encoder_reply(1, &good).is_ok());
+        // short frame (truncated)
+        assert!(matches!(
+            decode_encoder_reply(1, &good[..6]),
+            Err(Error::Backend(_))
+        ));
+        // overlong frame
+        let long = [0x30, 0, 0, 0, 2, 0x20, 0x00, 0x53, 0x00];
+        assert!(matches!(
+            decode_encoder_reply(1, &long),
+            Err(Error::Backend(_))
+        ));
+        // wrong command/identity byte
+        let mut wrong_cmd = good;
+        wrong_cmd[0] = 0x31;
+        assert!(matches!(
+            decode_encoder_reply(1, &wrong_cmd),
+            Err(Error::Backend(_))
+        ));
+        // corrupt payload → checksum mismatch
+        let mut corrupt = good;
+        corrupt[5] ^= 0xFF;
+        assert!(matches!(
+            decode_encoder_reply(1, &corrupt),
+            Err(Error::Backend(_))
+        ));
+        // valid bytes but wrong id → checksum mismatch
+        assert!(matches!(
+            decode_encoder_reply(2, &good),
+            Err(Error::Backend(_))
+        ));
     }
 
     #[test]

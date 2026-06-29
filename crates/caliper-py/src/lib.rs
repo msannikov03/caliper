@@ -58,6 +58,13 @@ impl Robot {
         self.inner.joint_names.clone()
     }
 
+    /// Per-joint position limits as `(lo, hi)` tuples; `None` for an unbounded
+    /// (continuous) joint. Length = ndof.
+    #[getter]
+    fn joint_limits(&self) -> Vec<Option<(f64, f64)>> {
+        self.inner.model.limits.clone()
+    }
+
     /// Name of the default tip frame (the last-registered link frame).
     fn tip_frame(&self) -> String {
         let model = &self.inner.model;
@@ -810,6 +817,7 @@ fn dmatrix_to_rows(m: &DMatrix<f64>) -> Vec<Vec<f64>> {
 struct ControlLoop {
     inner: EngineLoop<PhysicsSimBackend>,
     ndof: usize,
+    last_warn: bool,
 }
 
 #[pymethods]
@@ -854,6 +862,7 @@ impl ControlLoop {
         Ok(ControlLoop {
             inner,
             ndof: m.ndof,
+            last_warn: false,
         })
     }
 
@@ -881,6 +890,19 @@ impl ControlLoop {
         Ok((times, states, actions))
     }
 
+    /// Step the loop ONE tick toward `action` (a joint-space target) and return the
+    /// post-step measured q (the next observation). The policy-deployment primitive:
+    /// `obs -> policy.predict -> step_with_target -> obs`. Routes through the safety
+    /// gate like any command; if the action was clamped/rate-limited, `last_warn`
+    /// latches true for this step (so a deploy loop can observe saturation).
+    fn step_with_target(&mut self, action: Vec<f64>) -> PyResult<Vec<f64>> {
+        self.check_goal(&action)?;
+        let mut sp = HoldSetpoint::new(action);
+        let frame = self.inner.step(&mut sp, None).map_err(hal_err)?;
+        self.last_warn = frame.warn;
+        Ok(self.inner.backend().joint_positions())
+    }
+
     /// Latch an e-stop (loop + backend).
     fn estop(&mut self) -> PyResult<()> {
         self.inner.estop().map_err(hal_err)
@@ -906,6 +928,13 @@ impl ControlLoop {
     #[getter]
     fn tick(&self) -> u64 {
         self.inner.tick()
+    }
+    /// True iff the most recent `step_with_target` saturated the command (the safety
+    /// gate clamped position or rate-limited velocity) — an out-of-distribution policy
+    /// output signal for the deploy loop.
+    #[getter]
+    fn last_warn(&self) -> bool {
+        self.last_warn
     }
     fn __repr__(&self) -> String {
         format!(

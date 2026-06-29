@@ -152,9 +152,12 @@ impl<B: RobotBackend> ControlLoop<B> {
         let measured = self.backend.read_state()?;
         let q_now = measured.q.clone();
         let qd_now = measured.qd_or_zero();
+        // A malformed backend state must not propagate into the dynamics / gate.
+        crate::check_len(q_now.len(), n)?;
+        crate::check_len(qd_now.len(), n)?;
 
         // Resolve the target through the safety gate, or hold via the watchdog.
-        let (target_q, target_qd, target_qdd, warn) = match sp.target(self.tick, t) {
+        let (target_q, target_qd, target_qdd, verdict) = match sp.target(self.tick, t) {
             Some(tg) => {
                 let (safe, v) = self.monitor.gate(&tg.q, self.dt);
                 let qd = if tg.qd.len() == n {
@@ -167,18 +170,36 @@ impl<B: RobotBackend> ControlLoop<B> {
                 } else {
                     vec![0.0; n]
                 };
-                (safe, qd, qdd, !v.ok())
+                (safe, qd, qdd, v)
             }
             None => {
                 let v = self.monitor.tick_idle(self.dt);
-                (
-                    self.monitor.last().to_vec(),
-                    vec![0.0; n],
-                    vec![0.0; n],
-                    !v.ok(),
-                )
+                (self.monitor.last().to_vec(), vec![0.0; n], vec![0.0; n], v)
             }
         };
+        let warn = !verdict.ok();
+
+        // The safety core latched an e-stop (explicit, effort fault, or a watchdog
+        // trip with `WatchdogAction::EStop`). De-energize the backend and short-
+        // circuit the command write — for this tick and every subsequent one, since
+        // the monitor stays latched until `clear_estop`. Otherwise the loop would
+        // keep driving a backend it believes is stopped.
+        if self.monitor.is_estopped() {
+            self.backend.estop()?;
+            let frame = Frame {
+                tick: self.tick,
+                t,
+                measured: q_now,
+                measured_qd: qd_now,
+                command: target_q,
+                warn: true,
+            };
+            if let Some(s) = sink {
+                s.push(&frame);
+            }
+            self.tick += 1;
+            return Ok(frame);
+        }
 
         let mode = self.backend.mode();
         let cmd =
@@ -242,15 +263,30 @@ impl<B: RobotBackend> ControlLoop<B> {
         // tracking error (far setpoint, perturbed state) otherwise yields an
         // unbounded torque/velocity on the real-robot path.
         let cfg = self.monitor.config();
-        let cap = |x: f64, lim: Option<f64>| match lim {
-            Some(c) => x.clamp(-c.abs(), c.abs()),
-            None => x,
+        // A missing per-joint cap on a real torque/velocity path is NOT "no limit" —
+        // it would let a large tracking error drive an unbounded command into real
+        // hardware. Refuse rather than pass through. (Position mode is a reference,
+        // not a force/rate, so it stays an unconditional passthrough.)
+        let cap = |x: f64, lim: Option<f64>, what: &'static str, i: usize| -> Result<f64, Error> {
+            match lim {
+                Some(c) => Ok(x.clamp(-c.abs(), c.abs())),
+                None => Err(Error::Backend(format!(
+                    "no {what} limit for joint {i}; refusing unbounded command"
+                ))),
+            }
         };
         match mode {
             ControlMode::Position => Ok(target_q.to_vec()),
-            ControlMode::Velocity => Ok((0..n)
-                .map(|i| cap(at(target_qd, i) + kp * (target_q[i] - q[i]), cfg.vmax[i]))
-                .collect()),
+            ControlMode::Velocity => (0..n)
+                .map(|i| {
+                    cap(
+                        at(target_qd, i) + kp * (target_q[i] - q[i]),
+                        cfg.vmax.get(i).copied().flatten(),
+                        "velocity",
+                        i,
+                    )
+                })
+                .collect(),
             ControlMode::Torque => {
                 // computed torque: τ = M·a_des + (C·q̇ + g),  a_des = q̈* + kp·e + kd·ė
                 let a_des = DVector::from_iterator(
@@ -265,7 +301,9 @@ impl<B: RobotBackend> ControlLoop<B> {
                 let bias = rnea(&self.model, q, qd, &vec![0.0; n], &self.gravity)?; // C·q̇ + g
                 let tau = &mmat * &a_des + &bias;
                 // saturate each joint torque to its effort limit (clamp; safety bound)
-                Ok((0..n).map(|i| cap(tau[i], cfg.effort[i])).collect())
+                (0..n)
+                    .map(|i| cap(tau[i], cfg.effort.get(i).copied().flatten(), "effort", i))
+                    .collect()
             }
         }
     }
@@ -274,11 +312,23 @@ impl<B: RobotBackend> ControlLoop<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::WatchdogAction;
     use crate::physics::PhysicsSimBackend;
-    use crate::setpoint::{HoldSetpoint, TrajectorySetpoint};
+    use crate::setpoint::{HoldSetpoint, Setpoint, Target, TrajectorySetpoint};
     use crate::sim::SimBackend;
     use caliper_motion::{MotionLimits, move_j};
     use std::path::Path;
+
+    /// A source that always issues nothing, so the watchdog drives every tick.
+    struct NoneSource(usize);
+    impl Setpoint for NoneSource {
+        fn target(&mut self, _tick: u64, _t: f64) -> Option<Target> {
+            None
+        }
+        fn dof(&self) -> usize {
+            self.0
+        }
+    }
 
     fn model(name: &str) -> Arc<Model> {
         Arc::new(
@@ -387,6 +437,45 @@ mod tests {
                 assert_eq!(fa.command[i].to_bits(), fb.command[i].to_bits());
             }
         }
+    }
+
+    #[test]
+    fn watchdog_estop_deenergizes_backend() {
+        // No commands arrive → the watchdog (EStop action) trips, the monitor
+        // latches, and the loop MUST call backend.estop() (not keep driving it).
+        let m = model("dyn_pendulum2.urdf");
+        let backend = SimBackend::new(2);
+        let cfg = SafetyConfig::from_model(&m).with_watchdog(0.005, WatchdogAction::EStop);
+        let monitor = SafetyMonitor::new(cfg, &[0.0, 0.0]);
+        let mut loopy = ControlLoop::new(backend, m, 1e-3)
+            .unwrap()
+            .with_monitor(monitor);
+        let mut sp = NoneSource(2);
+        loopy.run_to(&mut sp, 20).unwrap(); // >5 ms of idle at 1 ms/tick
+        assert!(loopy.monitor().is_estopped());
+        assert!(
+            loopy.backend().is_estopped(),
+            "backend must be de-energized once the watchdog e-stops"
+        );
+    }
+
+    #[test]
+    fn torque_without_effort_cap_is_refused() {
+        // A real torque command with no effort cap would be unbounded → refuse.
+        let m = model("dyn_pendulum2.urdf");
+        let mut backend = PhysicsSimBackend::new(m.clone()).unwrap();
+        backend.set_state(&[0.3, 0.2], &[0.0, 0.0]).unwrap();
+        let mut cfg = SafetyConfig::from_model(&m);
+        cfg.effort = vec![None, None];
+        let monitor = SafetyMonitor::new(cfg, &[0.3, 0.2]);
+        let mut loopy = ControlLoop::new(backend, m, 1e-3)
+            .unwrap()
+            .with_monitor(monitor);
+        let mut sp = HoldSetpoint::new(vec![0.3, 0.2]);
+        assert!(
+            matches!(loopy.step(&mut sp, None), Err(Error::Backend(_))),
+            "missing effort cap must refuse the torque command"
+        );
     }
 
     #[test]

@@ -138,8 +138,14 @@ pub trait RobotBackend: Send {
         true
     }
     /// Latching: zeros commands, drops out of enabled, blocks commands until cleared.
+    ///
+    /// No safe default — a silent no-op would let a loop keep driving a backend it
+    /// believes is de-energized. Every real backend MUST override this; the default
+    /// fails loudly so an un-implemented e-stop can never be mistaken for a working one.
     fn estop(&mut self) -> Result<(), Error> {
-        Ok(())
+        Err(Error::Backend(
+            "estop() not implemented by this backend".into(),
+        ))
     }
     fn clear_estop(&mut self) -> Result<(), Error> {
         Ok(())

@@ -6,7 +6,7 @@
 //! and also runs registered [`SafetyCheck`]s (the collision hook, kept rapier-free
 //! because the check is an object-safe trait implemented in `caliper-collision`).
 
-use crate::{ControlMode, Error, JointState, RobotBackend};
+use crate::{ControlMode, Error, JointState, RobotBackend, check_finite};
 use caliper_dynamics::rnea;
 use caliper_model::Model;
 use nalgebra::Vector3;
@@ -103,10 +103,25 @@ pub struct SafetyMonitor {
 }
 
 impl SafetyMonitor {
-    /// Anchor the rate limiter at `q0` (typically the initial measured pose).
+    /// Anchor the rate limiter at `q0` (typically the initial measured pose). The
+    /// anchor is built defensively at exactly `cfg.dof()` length: missing entries
+    /// default to 0, non-finite values are sanitized, and every component is clamped
+    /// into its position limit so a bad/short `q0` can never poison or panic `gate`.
     pub fn new(cfg: SafetyConfig, q0: &[f64]) -> Self {
+        let n = cfg.dof();
+        let mut q_prev = vec![0.0; n];
+        for (i, slot) in q_prev.iter_mut().enumerate() {
+            let mut qi = q0.get(i).copied().unwrap_or(0.0);
+            if !qi.is_finite() {
+                qi = 0.0;
+            }
+            if let Some(Some((lo, hi))) = cfg.pos.get(i).copied() {
+                qi = qi.clamp(lo, hi);
+            }
+            *slot = qi;
+        }
         Self {
-            q_prev: q0.to_vec(),
+            q_prev,
             cfg,
             estopped: false,
             idle: 0.0,
@@ -151,7 +166,7 @@ impl SafetyMonitor {
                 target = self.q_prev[i];
             }
             // 1) position clamp
-            if let Some((lo, hi)) = self.cfg.pos[i] {
+            if let Some(Some((lo, hi))) = self.cfg.pos.get(i).copied() {
                 let c = target.clamp(lo, hi);
                 if c != target {
                     v.clamped_position = true;
@@ -159,7 +174,7 @@ impl SafetyMonitor {
                 target = c;
             }
             // 2) velocity (per-tick step) clamp
-            if let Some(vmax) = self.cfg.vmax[i] {
+            if let Some(Some(vmax)) = self.cfg.vmax.get(i).copied() {
                 let max_step = vmax.abs() * dt.max(0.0);
                 let delta = target - self.q_prev[i];
                 if delta.abs() > max_step {
@@ -213,7 +228,7 @@ impl SafetyMonitor {
         let tau = rnea(model, q, &zeros, &zeros, gravity)
             .map_err(|e| SafetyError::Check(e.to_string()))?;
         for i in 0..model.ndof {
-            if let Some(cap) = self.cfg.effort[i]
+            if let Some(Some(cap)) = self.cfg.effort.get(i).copied()
                 && tau[i].abs() > cap
             {
                 self.estopped = true;
@@ -309,9 +324,29 @@ impl<B: RobotBackend> RobotBackend for SafetyBackend<B> {
         self.inner.command_joint_positions(&safe)
     }
     fn command_joint_velocities(&mut self, qd: &[f64]) -> Result<(), Error> {
-        self.inner.command_joint_velocities(qd)
+        // Mirror the position path: never let a non-position command bypass the
+        // monitor. Reject while e-stopped, reject non-finite, then clamp each
+        // joint to its velocity cap (where the model defines one) before delegating.
+        if self.monitor.is_estopped() {
+            return Err(Error::EStopActive);
+        }
+        check_finite("joint velocities", qd)?;
+        let cfg = self.monitor.config();
+        let safe: Vec<f64> = qd
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| match cfg.vmax.get(i).copied().flatten() {
+                Some(c) => v.clamp(-c.abs(), c.abs()),
+                None => v,
+            })
+            .collect();
+        self.inner.command_joint_velocities(&safe)
     }
     fn command_joint_torques(&mut self, tau: &[f64]) -> Result<(), Error> {
+        if self.monitor.is_estopped() {
+            return Err(Error::EStopActive);
+        }
+        check_finite("joint torques", tau)?;
         self.inner.command_joint_torques(tau)
     }
     fn read_state(&mut self) -> Result<JointState, Error> {
@@ -379,6 +414,102 @@ mod tests {
         let v = m.tick_idle(0.03); // total 0.06 > 0.05
         assert!(v.watchdog_tripped && v.estopped);
         assert!(m.is_estopped());
+    }
+
+    /// A minimal backend that accepts velocity/torque and records the last command,
+    /// so we can prove the [`SafetyBackend`] gate (estop + finiteness + vmax clamp)
+    /// runs BEFORE delegation on the non-position paths.
+    #[derive(Default)]
+    struct RecBackend {
+        dof: usize,
+        last_qd: Vec<f64>,
+        last_tau: Vec<f64>,
+        estopped: bool,
+    }
+    impl RobotBackend for RecBackend {
+        fn dof(&self) -> usize {
+            self.dof
+        }
+        fn estop(&mut self) -> Result<(), Error> {
+            self.estopped = true;
+            Ok(())
+        }
+        fn clear_estop(&mut self) -> Result<(), Error> {
+            self.estopped = false;
+            Ok(())
+        }
+        fn is_estopped(&self) -> bool {
+            self.estopped
+        }
+        fn command_joint_positions(&mut self, _q: &[f64]) -> Result<(), Error> {
+            Ok(())
+        }
+        fn command_joint_velocities(&mut self, qd: &[f64]) -> Result<(), Error> {
+            self.last_qd = qd.to_vec();
+            Ok(())
+        }
+        fn command_joint_torques(&mut self, tau: &[f64]) -> Result<(), Error> {
+            self.last_tau = tau.to_vec();
+            Ok(())
+        }
+        fn read_state(&mut self) -> Result<JointState, Error> {
+            Ok(JointState {
+                tick: 0,
+                t: 0.0,
+                q: vec![0.0; self.dof],
+                qd: None,
+                tau: None,
+            })
+        }
+        fn joint_positions(&self) -> Vec<f64> {
+            vec![0.0; self.dof]
+        }
+    }
+
+    #[test]
+    fn safety_backend_gates_velocity_and_torque() {
+        let mut b = SafetyBackend::new(
+            RecBackend {
+                dof: 2,
+                ..Default::default()
+            },
+            SafetyMonitor::new(cfg2(), &[0.0, 0.0]),
+            0.1,
+        );
+        // velocity clamped to vmax (cfg2 vmax = 2.0)
+        b.command_joint_velocities(&[5.0, -5.0]).unwrap();
+        assert_eq!(b.inner().last_qd, vec![2.0, -2.0]);
+        // non-finite rejected before delegation
+        assert!(matches!(
+            b.command_joint_velocities(&[f64::NAN, 0.0]),
+            Err(Error::NonFinite { .. })
+        ));
+        assert!(matches!(
+            b.command_joint_torques(&[0.0, f64::INFINITY]),
+            Err(Error::NonFinite { .. })
+        ));
+        // after e-stop, both non-position paths are refused
+        b.estop().unwrap();
+        assert!(matches!(
+            b.command_joint_velocities(&[0.1, 0.1]),
+            Err(Error::EStopActive)
+        ));
+        assert!(matches!(
+            b.command_joint_torques(&[0.1, 0.1]),
+            Err(Error::EStopActive)
+        ));
+    }
+
+    #[test]
+    fn monitor_new_is_defensive() {
+        // short, non-finite, out-of-limit q0 → anchored at dof length, sanitized & clamped
+        let m = SafetyMonitor::new(cfg2(), &[5.0, f64::NAN]);
+        assert_eq!(m.last(), &[1.0, 0.0]); // 5.0 clamped to +1.0; NaN→0.0 (within ±1)
+        // gate must not panic with mismatched-length cfg vectors
+        let mut cfg = cfg2();
+        cfg.vmax = vec![Some(2.0)]; // shorter than pos (len 2)
+        let mut m2 = SafetyMonitor::new(cfg, &[0.0, 0.0]);
+        let (_q, _v) = m2.gate(&[0.1, 0.1], 0.1);
     }
 
     #[test]

@@ -4,7 +4,12 @@
 
 use crate::RobotBackend;
 use crate::setpoint::{Setpoint, Target};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+
+/// Ticks a jog velocity may persist without a refresh before [`JogSource`] stops
+/// integrating it and yields `None` (so the loop watchdog holds a dead UI).
+const DEFAULT_JOG_TICK_BUDGET: u64 = 100;
 
 /// Affine leader→follower joint map:
 /// `follower_q[i] = scale[i] * leader_q[perm[i]] + offset[i]`.
@@ -97,20 +102,27 @@ impl Setpoint for ScriptedSource {
 #[derive(Clone)]
 pub struct JogHandle {
     v: Arc<Mutex<Vec<f64>>>,
+    /// Freshness version, bumped on every `set`.
+    seq: Arc<AtomicU64>,
 }
 impl JogHandle {
     pub fn new(n: usize) -> Self {
         Self {
             v: Arc::new(Mutex::new(vec![0.0; n])),
+            seq: Arc::new(AtomicU64::new(0)),
         }
     }
     pub fn set(&self, v: Vec<f64>) {
         if let Ok(mut g) = self.v.lock() {
             *g = v;
+            self.seq.fetch_add(1, Ordering::Release);
         }
     }
     fn get(&self) -> Vec<f64> {
         self.v.lock().map(|g| g.clone()).unwrap_or_default()
+    }
+    fn version(&self) -> u64 {
+        self.seq.load(Ordering::Acquire)
     }
 }
 
@@ -120,6 +132,10 @@ pub struct JogSource {
     q: Vec<f64>,
     handle: JogHandle,
     dt: f64,
+    /// Max ticks a jog velocity may persist without a refresh before going stale.
+    budget: u64,
+    last_seq: u64,
+    last_fresh_tick: u64,
 }
 impl JogSource {
     pub fn new(q0: Vec<f64>, dt: f64) -> (Self, JogHandle) {
@@ -129,16 +145,37 @@ impl JogSource {
                 q: q0,
                 handle: h.clone(),
                 dt,
+                budget: DEFAULT_JOG_TICK_BUDGET,
+                last_seq: 0,
+                last_fresh_tick: 0,
             },
             h,
         )
     }
+    /// Override the staleness budget (ticks a jog velocity may persist un-refreshed).
+    pub fn with_tick_budget(mut self, ticks: u64) -> Self {
+        self.budget = ticks;
+        self
+    }
 }
 impl Setpoint for JogSource {
-    fn target(&mut self, _tick: u64, _t: f64) -> Option<Target> {
+    fn target(&mut self, tick: u64, _t: f64) -> Option<Target> {
+        let cur = self.handle.version();
+        if cur != self.last_seq {
+            self.last_seq = cur;
+            self.last_fresh_tick = tick;
+        }
+        // Stale jog command (dead/frozen UI) → stop integrating, let the watchdog hold.
+        if tick.saturating_sub(self.last_fresh_tick) > self.budget {
+            return None;
+        }
         let v = self.handle.get();
         for i in 0..self.q.len() {
-            self.q[i] += v.get(i).copied().unwrap_or(0.0) * self.dt;
+            // Skip non-finite components: a NaN/inf would permanently poison `q`.
+            let vi = v.get(i).copied().unwrap_or(0.0);
+            if vi.is_finite() {
+                self.q[i] += vi * self.dt;
+            }
         }
         Some(Target::hold(self.q.clone()))
     }
@@ -188,5 +225,27 @@ mod tests {
         assert!((t1.q[0] - 0.1).abs() < 1e-12 && (t1.q[1] + 0.2).abs() < 1e-12);
         let t2 = src.target(1, 0.1).unwrap();
         assert!((t2.q[0] - 0.2).abs() < 1e-12 && (t2.q[1] + 0.4).abs() < 1e-12);
+    }
+
+    #[test]
+    fn jog_skips_nonfinite_velocity() {
+        let (mut src, handle) = JogSource::new(vec![0.0, 0.0], 0.1);
+        handle.set(vec![f64::NAN, 2.0]);
+        let t = src.target(0, 0.0).unwrap();
+        assert_eq!(t.q[0], 0.0); // NaN component skipped, not integrated
+        assert!((t.q[1] - 0.2).abs() < 1e-12);
+        // q stays finite on subsequent ticks (never poisoned)
+        let t2 = src.target(1, 0.1).unwrap();
+        assert!(t2.q[0].is_finite() && t2.q[1].is_finite());
+    }
+
+    #[test]
+    fn jog_goes_stale_without_refresh() {
+        let (src, handle) = JogSource::new(vec![0.0], 0.1);
+        let mut src = src.with_tick_budget(2);
+        handle.set(vec![1.0]);
+        assert!(src.target(0, 0.0).is_some());
+        assert!(src.target(2, 0.0).is_some()); // diff == budget: still fresh
+        assert!(src.target(3, 0.0).is_none()); // diff > budget: stale → watchdog
     }
 }

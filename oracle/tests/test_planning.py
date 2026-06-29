@@ -2,7 +2,9 @@
 
 Core guarantees proven here with NO hardware: determinism (same seed ⇒ identical
 path), the collision-free guarantee (the path's own `verify` re-checks every edge
-at finer resolution), connectivity (endpoints), retiming endpoints, and the three
+at finer resolution, AND an independent standalone-CollisionModel re-check so a
+bug shared by plan()/verify() can't pass), connectivity (endpoints), retiming
+endpoints, and the three
 reachability verdicts — with the "reachable"/"blocked" target pose derived from
 PINOCCHIO forward kinematics (an independent cross-check of the target itself)."""
 
@@ -37,6 +39,24 @@ def _scene_box():
     return [((0.6, 0.0, 0.3), (0.15, 0.15, 0.15))]
 
 
+def _recheck_collision_free(path, ground, boxes, substeps=16):
+    """INDEPENDENT collision re-check of a planned path.
+
+    `Planner.verify` re-checks the path with the planner's OWN checker, so a
+    bug shared between plan() and verify() would pass both (self-consistent, not
+    external). Here we densely interpolate every edge and query a *separately
+    constructed* `CollisionModel` over the same scene — a check that does not go
+    through the planner at all. Returns True iff every sampled config is free."""
+    cm = caliper.CollisionModel(_arm(), ground=ground, boxes=boxes)
+    for a, b in zip(path[:-1], path[1:]):
+        for k in range(substeps + 1):
+            t = k / substeps
+            q = [ai + (bi - ai) * t for ai, bi in zip(a, b)]
+            if cm.query(q)["collision"]:
+                return False
+    return True
+
+
 # ---------- planning ----------
 
 def test_plan_deterministic_and_collision_free():
@@ -47,6 +67,11 @@ def test_plan_deterministic_and_collision_free():
     path2 = p2.plan(start, goal)
     assert path1 == path2, "same seed ⇒ identical path"
     assert p1.verify(path1), "every edge must be collision-free (re-verified)"
+    # Independent witness: re-check via a standalone CollisionModel, NOT the
+    # planner's own verify (see _recheck_collision_free).
+    assert _recheck_collision_free(path1, ground=-0.1, boxes=_scene_box()), (
+        "path must be collision-free under an independent CollisionModel re-check"
+    )
     assert path1[0] == start and path1[-1] == goal
 
 

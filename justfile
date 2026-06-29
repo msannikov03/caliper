@@ -29,8 +29,17 @@ py:
     maturin develop -m crates/caliper-py/Cargo.toml
 
 # Run the Python cross-validation / face-parity oracle
+# (needs the repo .venv: maturin + pytest + numpy + pin + pyarrow installed)
 oracle:
     python -m pytest oracle -v
+
+# Run the Phase-7 learning sidecar tests (pure-torch BC oracle, CPU, seconds).
+# Needs torch + caliper (PyO3) + caliper_learn installed into the repo .venv:
+#   env -u CONDA_PREFIX uv pip install --python .venv/bin/python torch
+#   env -u CONDA_PREFIX .venv/bin/maturin develop -m crates/caliper-py/Cargo.toml
+#   env -u CONDA_PREFIX uv pip install --python .venv/bin/python -e learn
+learn:
+    python -m pytest learn -v
 
 # Run the Caliper Studio desktop app (Tauri dev)
 app:

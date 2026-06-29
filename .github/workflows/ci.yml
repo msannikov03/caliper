@@ -40,6 +40,22 @@ jobs:
       - uses: astral-sh/setup-uv@v5
       # numpy + pin (Pinocchio) make oracle/tests/test_pinocchio.py actually RUN
       # (it importorskips otherwise) — the independent FK/Jacobian cross-validation.
-      - run: uv venv && uv pip install maturin pytest numpy pin
+      # pyarrow makes oracle/tests/test_lerobot_dataset.py actually RUN (it
+      # importorskips otherwise) — the LeRobotDataset v2.1 writer cross-validation.
+      - run: uv venv && uv pip install maturin pytest numpy pin pyarrow
       - run: uv run maturin develop -m crates/caliper-py/Cargo.toml
       - run: uv run python -m pytest oracle -v
+
+  learn:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: astral-sh/setup-uv@v5
+      # Phase-7 learning sidecar (learn/caliper_learn): CPU-only torch oracle —
+      # a 2-sample overfit smoke, checkpoint round-trip, and a closed-loop sim
+      # rollout. Needs caliper (PyO3) built into the same env as torch.
+      - run: uv venv && uv pip install maturin pytest numpy pyarrow torch
+      - run: uv run maturin develop -m crates/caliper-py/Cargo.toml
+      - run: uv pip install -e learn
+      - run: uv run python -m pytest learn -v

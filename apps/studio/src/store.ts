@@ -533,6 +533,11 @@ export const useStore = create<StudioState>((set, get) => ({
       return;
     }
     const color = PORT_COLORS[st];
+    // reject back-edges: would adding source→target create a cycle?
+    if (canReach(target, source, get().graphEdges)) {
+      set({ graphBanner: `Rejected: ${source} → ${target} would create a cycle` });
+      return;
+    }
     // one feeder per input port: drop any existing edge into the same target handle
     const kept = get().graphEdges.filter(
       (e) => !(e.target === target && e.targetHandle === inName),
@@ -603,6 +608,10 @@ export const useStore = create<StudioState>((set, get) => ({
         set({ traj, simTraj: null, playhead: 0, playing: false });
         get()._applyTrajAt(0);
         get().play();
+      } else {
+        // no View sink in this graph — stop any stale clip from a previous run
+        stopClock();
+        set({ traj: null, simTraj: null, playing: false, playhead: 0 });
       }
     } catch (e) {
       if (get()._graphRunId !== id) return;
@@ -677,13 +686,44 @@ function activeClip(s: StudioState): TrajectoryDto | null {
 }
 
 // ---- graph helpers (module scope) ----
+
+/// BFS reachability: returns true if `startId` can reach `goalId` via `edges`.
+/// Used to detect cycles before accepting a new connection.
+function canReach(startId: string, goalId: string, edges: CEdge[]): boolean {
+  const visited = new Set<string>();
+  const queue = [startId];
+  while (queue.length > 0) {
+    const cur = queue.shift()!;
+    if (cur === goalId) return true;
+    if (visited.has(cur)) continue;
+    visited.add(cur);
+    for (const e of edges) {
+      if (e.source === cur && !visited.has(e.target)) {
+        queue.push(e.target);
+      }
+    }
+  }
+  return false;
+}
+
 let nodeSeq = 0;
 function nextNodeId(kind: KindName): string {
   return `${kind}_${(nodeSeq++).toString(36)}`;
 }
 /// After a load, advance the id counter past the loaded set to avoid collisions.
+/// Ids are `${kind}_${seq.toString(36)}`; decode the base-36 suffix so we set
+/// nodeSeq above every existing id rather than just adding a length offset
+/// (the offset approach re-uses ids when loaded nodes outnumber prior mints).
 function bumpNodeSeq(nodes: CNode[]): void {
-  nodeSeq += nodes.length + 1;
+  let maxSeq = -1;
+  for (const n of nodes) {
+    const idx = n.id.lastIndexOf("_");
+    if (idx >= 0) {
+      const v = parseInt(n.id.slice(idx + 1), 36);
+      if (Number.isFinite(v) && v > maxSeq) maxSeq = v;
+    }
+  }
+  if (maxSeq >= nodeSeq) nodeSeq = maxSeq + 1;
 }
 
 /// Build a short red-banner summary from validation diagnostics.
@@ -731,9 +771,18 @@ function handleGraphError(
   get: () => StudioState,
   set: (p: Partial<StudioState>) => void,
 ): void {
-  const err = e as
-    | { kind?: string; nodeId?: string; message?: string; diagnostics?: Diagnostics }
-    | undefined;
+  // Tauri delivers graph_run Err as a plain JSON string; parse it first so the
+  // validation / node branches below can actually fire.
+  let err: { kind?: string; nodeId?: string; message?: string; diagnostics?: Diagnostics } | undefined;
+  if (typeof e === "string") {
+    try {
+      err = JSON.parse(e) as typeof err;
+    } catch {
+      err = { message: e };
+    }
+  } else {
+    err = e as typeof err;
+  }
   if (err && err.kind === "validation" && err.diagnostics) {
     const dec = decorateWithDiagnostics(get().graphNodes, get().graphEdges, err.diagnostics);
     set({ graphNodes: dec.nodes, graphEdges: dec.edges, graphBanner: dec.banner ?? "validation failed" });

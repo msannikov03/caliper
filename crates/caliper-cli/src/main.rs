@@ -999,7 +999,7 @@ fn main() -> anyhow::Result<()> {
                     println!("  status: ok");
                     println!("  topo order: [{}]", diag.topo_order.join(", "));
                 } else {
-                    print_diagnostics(&diag);
+                    print_diagnostics(&diag, false);
                     std::process::exit(1);
                 }
             }
@@ -1018,23 +1018,26 @@ fn load_graph(path: &std::path::Path) -> anyhow::Result<caliper::graph::GraphDoc
 }
 
 /// Print structured validation diagnostics (node/edge errors, cycle, topo order).
-fn print_diagnostics(diag: &caliper::graph::Diagnostics) {
-    println!("  status: INVALID");
+fn print_diagnostics(diag: &caliper::graph::Diagnostics, to_stderr: bool) {
+    macro_rules! out {
+        ($($a:tt)*) => { if to_stderr { eprintln!($($a)*) } else { println!($($a)*) } };
+    }
+    out!("  status: INVALID");
     for e in &diag.node_errors {
-        println!("  node `{}`: {}", e.node_id, e.message);
+        out!("  node `{}`: {}", e.node_id, e.message);
     }
     for e in &diag.edge_errors {
-        println!("  edge [{}]: {}", e.edge_index, e.message);
+        out!("  edge [{}]: {}", e.edge_index, e.message);
     }
     if !diag.cycle.is_empty() {
-        println!("  cycle: [{}]", diag.cycle.join(", "));
+        out!("  cycle: [{}]", diag.cycle.join(", "));
     }
     if !diag.topo_order.is_empty() {
-        println!("  topo order: [{}]", diag.topo_order.join(", "));
+        out!("  topo order: [{}]", diag.topo_order.join(", "));
     }
 }
 
-/// Print a `GraphError` (node failure or validation diagnostics) to stderr/stdout.
+/// Print a `GraphError` (node failure or validation diagnostics) entirely to stderr.
 fn print_graph_error(e: &caliper::graph::GraphError) {
     match e {
         caliper::graph::GraphError::Node { node_id, message } => {
@@ -1042,7 +1045,7 @@ fn print_graph_error(e: &caliper::graph::GraphError) {
         }
         caliper::graph::GraphError::Validation { diagnostics } => {
             eprintln!("graph error: validation failed");
-            print_diagnostics(diagnostics);
+            print_diagnostics(diagnostics, true);
         }
     }
 }

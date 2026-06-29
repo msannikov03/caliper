@@ -91,11 +91,13 @@ function NumField({
   value,
   onChange,
   step = 0.01,
+  min,
 }: {
   label: string;
   value: number;
   onChange: (v: number) => void;
   step?: number;
+  min?: number;
 }) {
   return (
     <label className="gfield">
@@ -104,6 +106,7 @@ function NumField({
         className="nodrag"
         type="number"
         step={step}
+        min={min}
         value={Number.isFinite(value) ? value : 0}
         onChange={(e) => {
           const v = parseFloat(e.target.value);
@@ -339,8 +342,9 @@ function PlanRrtNode(p: NodeProps) {
       <NumField
         label="seed"
         step={1}
+        min={0}
         value={(d.params.seed as number) ?? 1}
-        onChange={(v) => update(p.id, { seed: Math.trunc(v) })}
+        onChange={(v) => update(p.id, { seed: Math.max(0, Math.trunc(v)) })}
       />
       <CheckRow
         label="ground plane"
@@ -463,10 +467,10 @@ function ScopeNode(p: NodeProps) {
           ))}
         </select>
       </label>
-      {series && series.t.length > 0 ? (
+      {series && series.t.length > 0 && series.signal === signal ? (
         <ScopeChart t={series.t} y={series.y} label={signal} />
       ) : (
-        <div className="gscope-empty">run to plot</div>
+        <div className="gscope-empty">run to plot {signal}</div>
       )}
     </NodeShell>
   );

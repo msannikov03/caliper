@@ -86,7 +86,7 @@ export function kindParams(kind: KindName, p: Record<string, unknown>): Record<s
       return { frame: strOrNull(p.frame) };
     case "planRrt":
       return {
-        seed: Math.trunc(num(p.seed, 1)),
+        seed: Math.max(0, Math.trunc(num(p.seed, 1))),
         ground: p.groundOn ? num(p.ground) : null,
         boxes: asBoxes(p.boxes),
       };

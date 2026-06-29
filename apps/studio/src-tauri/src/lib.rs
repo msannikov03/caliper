@@ -1658,7 +1658,11 @@ fn graph_validate(
 
 /// Sanitize a user-supplied graph name to a safe single-segment filename stem.
 fn sanitize_name(name: &str) -> Result<String, String> {
-    let s: String = name
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err("graph name must not be empty".into());
+    }
+    let s: String = trimmed
         .chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == ' ' {
@@ -1672,7 +1676,19 @@ fn sanitize_name(name: &str) -> Result<String, String> {
     if s.is_empty() {
         return Err("graph name must not be empty".into());
     }
-    Ok(s)
+    // If sanitizing replaced any character, append a short hash of the ORIGINAL so
+    // distinct names (e.g. "a/b" vs "a.b") never collapse to the same file.
+    if s == trimmed {
+        Ok(s)
+    } else {
+        // FNV-1a 64-bit (no dep), truncated — deterministic per original name.
+        let mut h: u64 = 0xcbf29ce484222325;
+        for b in trimmed.as_bytes() {
+            h ^= *b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        Ok(format!("{s}-{:08x}", (h & 0xffff_ffff)))
+    }
 }
 
 /// `<app_data_dir>/graphs`, created if absent.
@@ -2095,9 +2111,15 @@ mod tests {
 
     #[test]
     fn sanitize_name_strips_unsafe() {
-        assert_eq!(sanitize_name("my/graph..v2").unwrap(), "my_graph__v2");
+        // already-safe names pass through unchanged
         assert_eq!(sanitize_name("ok-name_1").unwrap(), "ok-name_1");
         assert!(sanitize_name("   ").is_err());
         assert!(sanitize_name("").is_err());
+        // unsafe chars are replaced AND a hash of the original is appended so
+        // distinct originals never collide onto one file
+        let a = sanitize_name("a/b").unwrap();
+        let b = sanitize_name("a.b").unwrap();
+        assert!(a.starts_with("a_b-") && b.starts_with("a_b-"));
+        assert_ne!(a, b, "distinct unsafe names must map to distinct files");
     }
 }

@@ -6,6 +6,10 @@ use caliper_model::Model;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 
+/// Upper bound on a GravityDrop node's implied `duration/dt` step count, so a tiny
+/// graph payload cannot drive the executor into an unbounded simulation loop.
+pub const MAX_SIM_STEPS: u64 = 5_000_000;
+
 /// A per-node validation error.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -152,8 +156,8 @@ pub fn validate(doc: &GraphDoc, model: &Model) -> Diagnostics {
                 }
             }
             NodeKind::Control { kp, kd } => {
-                if !kp.is_finite() || !kd.is_finite() {
-                    err("kp/kd must be finite".into());
+                if !kp.is_finite() || !kd.is_finite() || *kp < 0.0 || *kd < 0.0 {
+                    err("kp/kd must be finite and non-negative".into());
                 }
                 if !model.has_inertia {
                     err("Control requires a model with <inertial> data (has_inertia)".into());
@@ -169,6 +173,16 @@ pub fn validate(doc: &GraphDoc, model: &Model) -> Diagnostics {
                 }
                 if !(dt.is_finite() && *dt > 0.0) {
                     err("dt must be finite and > 0".into());
+                }
+                // Bound the implied simulation step count so a tiny payload (e.g.
+                // duration=1e9, dt=1e-9) cannot spin the executor unbounded.
+                if duration.is_finite() && dt.is_finite() && *dt > 0.0 {
+                    let steps = (*duration / *dt).ceil();
+                    if steps > MAX_SIM_STEPS as f64 {
+                        err(format!(
+                            "duration/dt implies {steps:.0} sim steps (> {MAX_SIM_STEPS} cap); coarsen dt or shorten duration"
+                        ));
+                    }
                 }
                 if let Some(g) = gravity
                     && !all_finite(g)

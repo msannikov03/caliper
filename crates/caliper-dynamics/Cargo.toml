@@ -12,3 +12,6 @@ thiserror.workspace = true
 caliper-model.workspace = true
 caliper-spatial.workspace = true
 caliper-kinematics.workspace = true
+
+[dev-dependencies]
+proptest = "1"

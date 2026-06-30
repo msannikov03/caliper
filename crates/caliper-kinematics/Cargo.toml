@@ -10,3 +10,6 @@ repository.workspace = true
 caliper-spatial.workspace = true
 caliper-model.workspace = true
 nalgebra.workspace = true
+
+[dev-dependencies]
+proptest = "1"

@@ -358,3 +358,54 @@ mod tests {
         assert!((ke_parent - ke_child).abs() < 1e-9);
     }
 }
+
+/// Property-based (fuzz) tests over bounded, finite random twists/poses.
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn se3_diff(a: &Se3, b: &Se3) -> f64 {
+        (a.0.to_homogeneous() - b.0.to_homogeneous()).norm()
+    }
+
+    /// Build a finite twist with `‖ω‖ = theta` along a (guarded) unit axis. `theta`
+    /// is kept strictly below π by the caller, away from the multivalued log branch.
+    fn twist_from(v: [f64; 3], ax: [f64; 3], theta: f64) -> Twist {
+        let raw = Vector3::new(ax[0], ax[1], ax[2]);
+        let n = raw.norm();
+        let axis = if n < 1e-6 { Vector3::z() } else { raw / n };
+        Twist::from_vw(Vector3::new(v[0], v[1], v[2]), axis * theta)
+    }
+
+    proptest! {
+        /// exp(log(T)) == T and log(exp(ξ)) == ξ over random screws. The angle is
+        /// bounded to [1e-6, 3.0] (< π) so the SO(3) log is single-valued — the
+        /// θ=π branch is deliberately skipped (it is multivalued there).
+        #[test]
+        fn exp_log_roundtrip(
+            vx in -2.0f64..2.0, vy in -2.0f64..2.0, vz in -2.0f64..2.0,
+            ax in -1.0f64..1.0, ay in -1.0f64..1.0, az in -1.0f64..1.0,
+            theta in 1e-6f64..3.0,
+        ) {
+            let xi = twist_from([vx, vy, vz], [ax, ay, az], theta);
+            let t = Se3::exp(&xi);
+            // exp(log(T)) == T
+            prop_assert!(se3_diff(&Se3::exp(&t.log()), &t) < 1e-9);
+            // log(exp(ξ)) == ξ (unique below θ=π)
+            prop_assert!((t.log().0 - xi.0).norm() < 1e-7);
+        }
+
+        /// adjoint(T) · adjoint(T⁻¹) == I₆ (the adjoint is a group homomorphism).
+        #[test]
+        fn adjoint_inverse_is_identity(
+            vx in -2.0f64..2.0, vy in -2.0f64..2.0, vz in -2.0f64..2.0,
+            ax in -1.0f64..1.0, ay in -1.0f64..1.0, az in -1.0f64..1.0,
+            theta in 1e-6f64..3.0,
+        ) {
+            let t = Se3::exp(&twist_from([vx, vy, vz], [ax, ay, az], theta));
+            let prod = t.adjoint() * t.inverse().adjoint();
+            prop_assert!((prod - Matrix6::<f64>::identity()).norm() < 1e-9);
+        }
+    }
+}

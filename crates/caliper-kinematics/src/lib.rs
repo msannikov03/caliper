@@ -748,3 +748,85 @@ mod tests {
         assert_eq!(jac.singular_values().len(), 0);
     }
 }
+
+/// Property-based (fuzz) tests over bounded, finite random configurations.
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use nalgebra::{Rotation3, UnitQuaternion};
+    use proptest::prelude::*;
+    use std::path::Path;
+
+    fn load(name: &str) -> Model {
+        let p = format!(
+            "{}/../../oracle/fixtures/robots/{}",
+            env!("CARGO_MANIFEST_DIR"),
+            name
+        );
+        Model::from_urdf(Path::new(&p)).unwrap()
+    }
+
+    fn rot_log(m: &Matrix3<f64>) -> Vector3<f64> {
+        UnitQuaternion::from_rotation_matrix(&Rotation3::from_matrix_unchecked(*m)).scaled_axis()
+    }
+
+    /// Central finite-difference of FK, the independent reference for the analytic
+    /// Jacobian (same idiom as the deterministic unit test).
+    fn fd_jacobian(m: &Model, q: &[f64], frame: usize, h: f64) -> DMatrix<f64> {
+        let mut jfd = DMatrix::<f64>::zeros(6, m.ndof);
+        for i in 0..m.ndof {
+            let mut qp = q.to_vec();
+            let mut qm = q.to_vec();
+            qp[i] += h;
+            qm[i] -= h;
+            let tp = fk_frame(m, &qp, frame);
+            let tm = fk_frame(m, &qm, frame);
+            let v = (tp.translation_vec() - tm.translation_vec()) / (2.0 * h);
+            let w = rot_log(&(tp.rotation() * tm.rotation().transpose())) / (2.0 * h);
+            jfd[(0, i)] = v.x;
+            jfd[(1, i)] = v.y;
+            jfd[(2, i)] = v.z;
+            jfd[(3, i)] = w.x;
+            jfd[(4, i)] = w.y;
+            jfd[(5, i)] = w.z;
+        }
+        jfd
+    }
+
+    /// Assert FK yields a valid SE(3) and the analytic Jacobian matches central FD,
+    /// per-element to ~1e-6, for an arbitrary bounded configuration `q`.
+    fn check_config(m: &Model, q: &[f64]) -> Result<(), TestCaseError> {
+        let frame = m.tip_frame();
+        // FK is SE(3)-valid: rotation orthonormal with det +1.
+        let r = fk_tip(m, q).rotation();
+        prop_assert!((r.transpose() * r - Matrix3::identity()).norm() < 1e-9);
+        prop_assert!((r.determinant() - 1.0).abs() < 1e-9);
+        // analytic Jacobian == central finite-difference (per-element ~1e-6).
+        let (_, jac) = jacobian(m, q, frame, JacFrame::World);
+        let jfd = fd_jacobian(m, q, frame, 1e-6);
+        prop_assert!((&jac - &jfd).amax() < 1e-5);
+        Ok(())
+    }
+
+    proptest! {
+        /// 2-DOF arm: FK valid + analytic Jacobian matches FD over random q.
+        #[test]
+        fn fk_se3_valid_and_jacobian_matches_fd_2dof(
+            q in prop::collection::vec(-2.5f64..2.5, 2),
+        ) {
+            let m = load("toy.urdf");
+            prop_assume!(q.len() == m.ndof);
+            check_config(&m, &q)?;
+        }
+
+        /// 6-DOF arm: FK valid + analytic Jacobian matches FD over random q.
+        #[test]
+        fn fk_se3_valid_and_jacobian_matches_fd_6dof(
+            q in prop::collection::vec(-2.5f64..2.5, 6),
+        ) {
+            let m = load("showcase6.urdf");
+            prop_assume!(q.len() == m.ndof);
+            check_config(&m, &q)?;
+        }
+    }
+}

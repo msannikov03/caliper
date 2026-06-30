@@ -630,3 +630,64 @@ mod tests {
         );
     }
 }
+
+/// Property-based (fuzz) tests over bounded, finite random states.
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+    use std::path::Path;
+
+    fn load(name: &str) -> Model {
+        Model::from_urdf(Path::new(&format!(
+            "{}/../../oracle/fixtures/robots/{}",
+            env!("CARGO_MANIFEST_DIR"),
+            name
+        )))
+        .unwrap()
+    }
+
+    /// RNEA→forward-dynamics round-trip: τ = rnea(q,qd,qdd) must invert back to qdd
+    /// via forward_dynamics(q,qd,τ). (rnea is affine in qdd: τ = M(q)qdd + bias.)
+    fn check_roundtrip(m: &Model, q: &[f64], qd: &[f64], qdd: &[f64]) -> Result<(), TestCaseError> {
+        let g = GRAVITY_EARTH;
+        let tau = rnea(m, q, qd, qdd, &g).unwrap();
+        let qdd2 = forward_dynamics(m, q, qd, tau.as_slice(), &g).unwrap();
+        prop_assert!((qdd2 - DVector::from_row_slice(qdd)).norm() < 1e-7);
+        Ok(())
+    }
+
+    /// CRBA mass matrix is symmetric and positive-definite at any configuration.
+    fn check_crba(m: &Model, q: &[f64]) -> Result<(), TestCaseError> {
+        let mm = crba(m, q).unwrap();
+        prop_assert!((&mm - &mm.transpose()).norm() < 1e-12);
+        prop_assert!(mm.cholesky().is_some(), "M not SPD");
+        Ok(())
+    }
+
+    proptest! {
+        /// 2-DOF pendulum: forward-dynamics inverts RNEA, M is symmetric + PD.
+        #[test]
+        fn fd_inverts_rnea_2dof(
+            q in prop::collection::vec(-1.5f64..1.5, 2),
+            qd in prop::collection::vec(-1.5f64..1.5, 2),
+            qdd in prop::collection::vec(-1.5f64..1.5, 2),
+        ) {
+            let m = load("dyn_pendulum2.urdf");
+            check_roundtrip(&m, &q, &qd, &qdd)?;
+            check_crba(&m, &q)?;
+        }
+
+        /// 6-DOF arm: forward-dynamics inverts RNEA, M is symmetric + PD.
+        #[test]
+        fn fd_inverts_rnea_6dof(
+            q in prop::collection::vec(-1.5f64..1.5, 6),
+            qd in prop::collection::vec(-1.5f64..1.5, 6),
+            qdd in prop::collection::vec(-1.5f64..1.5, 6),
+        ) {
+            let m = load("showcase6.urdf");
+            check_roundtrip(&m, &q, &qd, &qdd)?;
+            check_crba(&m, &q)?;
+        }
+    }
+}

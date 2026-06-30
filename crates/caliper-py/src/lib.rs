@@ -14,7 +14,7 @@ use caliper::motion::{
 };
 use caliper::planning::reach::{ReachChecker as EngineReach, ReachConfig, ReachStatus};
 use caliper::planning::{PlanError, Planner as EnginePlanner, PlannerConfig};
-use caliper::spatial::Se3;
+use caliper::spatial::{Se3, Twist};
 use caliper_collision::{CollisionError, CollisionModel as EngineCollision, WorldScene};
 use nalgebra::{DMatrix, Matrix3, UnitQuaternion, Vector3};
 use pyo3::prelude::*;
@@ -1474,12 +1474,70 @@ fn validate_graph(py: Python<'_>, robot: &Robot, graph_json: &str) -> PyResult<P
     diagnostics_dict(py, &diag)
 }
 
+// ===== SE(3) log/exp (module functions, for external cross-validation) =====
+
+/// SE(3) log map. `m` is a 4×4 ROW-MAJOR homogeneous transform (same layout as
+/// `Robot.fk()` returns): outer Vec = 4 rows, each length 4; `m[row][col]`. The
+/// 3×3 rotation block is projected onto SO(3) (like the `ik()` path), so a
+/// slightly non-orthonormal basis is tolerated. Returns the 6-vector twist
+/// `[v; ω]` (linear first, angular last) matching the engine / Pinocchio
+/// `log6` convention, so the result is an element-wise comparison against
+/// `pinocchio.log6(SE3(...)).vector`.
+#[pyfunction]
+fn log6(m: Vec<Vec<f64>>) -> PyResult<Vec<f64>> {
+    if m.len() != 4 || m.iter().any(|r| r.len() != 4) {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "m must be a 4x4 row-major homogeneous matrix (4 rows of length 4)",
+        ));
+    }
+    for row in &m {
+        finite_or_err("m", row)?;
+    }
+    // row-major: m[row][col]
+    let rot = Matrix3::new(
+        m[0][0], m[0][1], m[0][2], m[1][0], m[1][1], m[1][2], m[2][0], m[2][1], m[2][2],
+    );
+    let trans = Vector3::new(m[0][3], m[1][3], m[2][3]);
+    // from_matrix projects onto SO(3) (the caller-supplied basis may be slightly
+    // non-orthonormal), matching the ik()/Studio path.
+    let quat = UnitQuaternion::from_matrix(&rot);
+    let se3 = Se3::from_parts(trans, quat);
+    Ok(se3.log().0.as_slice().to_vec())
+}
+
+/// SE(3) exp map (inverse of [`log6`]). `twist` is the length-6 screw `[v; ω]`
+/// (linear first, angular last). Returns the 4×4 ROW-MAJOR homogeneous transform
+/// (same layout as `Robot.fk()`). Round-trips with `log6` away from θ=π.
+#[pyfunction]
+fn exp6(twist: Vec<f64>) -> PyResult<Vec<Vec<f64>>> {
+    if twist.len() != 6 {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "twist must have length 6 ([v; omega], linear then angular)",
+        ));
+    }
+    finite_or_err("twist", &twist)?;
+    let t = Twist(nalgebra::Vector6::new(
+        twist[0], twist[1], twist[2], twist[3], twist[4], twist[5],
+    ));
+    let se3 = Se3::exp(&t);
+    let r = se3.rotation();
+    let p = se3.translation();
+    Ok(vec![
+        vec![r[(0, 0)], r[(0, 1)], r[(0, 2)], p[0]],
+        vec![r[(1, 0)], r[(1, 1)], r[(1, 2)], p[1]],
+        vec![r[(2, 0)], r[(2, 1)], r[(2, 2)], p[2]],
+        vec![0.0, 0.0, 0.0, 1.0],
+    ])
+}
+
 #[pymodule]
 fn _caliper(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", caliper::VERSION)?;
     m.add_function(wrap_pyfunction!(version, m)?)?;
     m.add_function(wrap_pyfunction!(run_graph, m)?)?;
     m.add_function(wrap_pyfunction!(validate_graph, m)?)?;
+    m.add_function(wrap_pyfunction!(log6, m)?)?;
+    m.add_function(wrap_pyfunction!(exp6, m)?)?;
     m.add_class::<Robot>()?;
     m.add_class::<Trajectory>()?;
     m.add_class::<MotionLimits>()?;

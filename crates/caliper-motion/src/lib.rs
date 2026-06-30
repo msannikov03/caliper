@@ -38,6 +38,8 @@ pub enum MotionError {
     CollinearArc,
     #[error("zero-length Cartesian segment with no rotation")]
     ZeroLengthSegment,
+    #[error("invalid Cartesian move parameter: {0}")]
+    BadParam(&'static str),
 }
 
 #[cfg(test)]

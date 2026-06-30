@@ -321,8 +321,8 @@ impl Jacobian {
     /// Yoshikawa manipulability = product of singular values (0 for a 0-DOF or
     /// non-finite Jacobian).
     pub fn manipulability(&self) -> f64 {
-        if self.0.ncols() == 0 || !self.all_finite() {
-            return 0.0;
+        if self.0.ncols() == 0 || self.0.nrows() == 0 || !self.all_finite() {
+            return 0.0; // empty SVD has no singular values -> product()==1.0 footgun
         }
         self.singular_values().iter().product()
     }

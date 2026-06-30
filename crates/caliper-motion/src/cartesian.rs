@@ -41,6 +41,27 @@ pub struct CartesianMoveOpts {
 }
 
 impl CartesianMoveOpts {
+    /// Reject non-finite / non-positive caps + dt before they reach the time-grid
+    /// (`n = (total/dt).ceil() as usize` would overflow/hang on dt<=0), mirroring the
+    /// joint-space path's `MotionLimits` / `retime_waypoints` guards.
+    pub fn validate(&self) -> Result<(), MotionError> {
+        let pos = [
+            ("v_lin", self.v_lin),
+            ("a_lin", self.a_lin),
+            ("j_lin", self.j_lin),
+            ("v_ang", self.v_ang),
+            ("a_ang", self.a_ang),
+            ("j_ang", self.j_ang),
+            ("dt", self.dt),
+        ];
+        for (name, v) in pos {
+            if !(v.is_finite() && v > 0.0) {
+                return Err(MotionError::BadParam(name));
+            }
+        }
+        Ok(())
+    }
+
     pub fn defaults(limits: MotionLimits) -> Self {
         Self {
             limits,
@@ -99,6 +120,12 @@ fn slerp_short(a: &UnitQuaternion<f64>, b: &UnitQuaternion<f64>, s: f64) -> Unit
     })
 }
 
+/// True iff a pose's translation and rotation quaternion are all finite.
+fn goal_is_finite(t: &Se3) -> bool {
+    t.translation_vec().iter().all(|x| x.is_finite())
+        && t.0.rotation.coords.iter().all(|x| x.is_finite())
+}
+
 pub fn move_l(
     model: &Model,
     frame: usize,
@@ -108,6 +135,10 @@ pub fn move_l(
 ) -> Result<Trajectory, MotionError> {
     if q_start.len() != model.ndof {
         return Err(MotionError::DimMismatch);
+    }
+    opts.validate()?;
+    if !goal_is_finite(goal) {
+        return Err(MotionError::BadParam("goal pose is non-finite"));
     }
     let t0 = fk_frame(model, q_start, frame); // actual start pose (no re-IK)
     let l = (goal.translation_vec() - t0.translation_vec()).norm();
@@ -138,6 +169,10 @@ pub fn move_c(
 ) -> Result<Trajectory, MotionError> {
     if q_start.len() != model.ndof {
         return Err(MotionError::DimMismatch);
+    }
+    opts.validate()?;
+    if !goal_is_finite(end) || !via.iter().all(|x| x.is_finite()) {
+        return Err(MotionError::BadParam("via/end pose is non-finite"));
     }
     let t0 = fk_frame(model, q_start, frame);
     let p0 = t0.translation_vec();

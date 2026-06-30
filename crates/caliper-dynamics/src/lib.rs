@@ -372,8 +372,15 @@ impl Simulator {
     /// `max_substeps` substeps the step is rejected rather than silently
     /// coarsening `h` past `h_max` (C4).
     pub fn step(&mut self, dt: f64) -> Result<(), DynError> {
-        if !dt.is_finite() || !self.h_max.is_finite() || self.h_max <= 0.0 || self.max_substeps < 1
-        {
+        // dt must be finite AND strictly positive: a negative dt slips past the
+        // `n_ideal > max_substeps` budget check (ceil is <= 0) and integrates
+        // backward in time with a negative h.
+        let valid = dt.is_finite()
+            && dt > 0.0
+            && self.h_max.is_finite()
+            && self.h_max > 0.0
+            && self.max_substeps >= 1;
+        if !valid {
             return Err(DynError::Diverged);
         }
         let n_ideal = (dt / self.h_max).ceil();
@@ -562,6 +569,10 @@ mod tests {
         let mut s = Simulator::new(m.clone()).unwrap();
         assert!(s.step(f64::NAN).is_err());
         assert!(s.step(f64::INFINITY).is_err());
+        // non-positive dt (negative would otherwise integrate backward in time)
+        let mut s = Simulator::new(m.clone()).unwrap();
+        assert!(s.step(-1e-3).is_err());
+        assert!(s.step(0.0).is_err());
         // non-positive / non-finite h_max
         let mut s = Simulator::new(m.clone()).unwrap();
         s.h_max = 0.0;

@@ -201,6 +201,37 @@ fn move_l_traces_straight_line() {
     }
 }
 
+#[test]
+fn move_l_rejects_bad_params_and_nonfinite_goal() {
+    let m = load("showcase6.urdf");
+    let l = lim(&m);
+    let qa = [0.3, -0.4, 0.6, 0.2, -0.5, 0.1];
+    let ta = fk_tip(&m, &qa);
+    let goal = Se3::from_parts(
+        ta.translation_vec() + Vector3::new(0.0, 0.05, 0.0),
+        ta.0.rotation,
+    );
+    let f = m.tip_frame();
+    // dt <= 0 / non-finite would overflow the (total/dt).ceil() time grid
+    for bad_dt in [0.0, -0.01, f64::INFINITY, f64::NAN] {
+        let opts = CartesianMoveOpts {
+            dt: bad_dt,
+            ..CartesianMoveOpts::defaults(l.clone())
+        };
+        assert!(matches!(
+            move_l(&m, f, &qa, &goal, &opts),
+            Err(MotionError::BadParam(_))
+        ));
+    }
+    // a non-finite goal pose is rejected up front
+    let opts = CartesianMoveOpts::defaults(l);
+    let bad_goal = Se3::from_parts(Vector3::new(f64::NAN, 0.0, 0.0), ta.0.rotation);
+    assert!(matches!(
+        move_l(&m, f, &qa, &bad_goal, &opts),
+        Err(MotionError::BadParam(_))
+    ));
+}
+
 // On an unreachable target, Abort hard-errors; the default (Truncate) returns a
 // best-effort prefix flagged completed=false with the reached path fraction.
 #[test]

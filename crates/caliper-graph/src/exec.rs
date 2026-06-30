@@ -437,6 +437,12 @@ fn extract_series(model: &Model, clip: &ClipData, sig: Signal) -> Result<Vec<f64
     }
 }
 
+/// Mechanical energy of a clip sample under STANDARD Earth gravity. NOTE: a Scope
+/// reads a face-neutral `ClipData` (times/qs/qds only) that does not carry the
+/// gravity field used to produce it, so the `energy` signal is always referenced to
+/// `GRAVITY_EARTH`. A GravityDrop run with a custom `gravity` vector will therefore
+/// have its PE plotted against Earth-g, not its own field (consistent across all
+/// clip sources; documented rather than threaded through the render-neutral clip).
 fn energy_at(model: &Model, q: &[f64], qd: &[f64]) -> Result<f64, String> {
     let mm = crba(model, q).map_err(|e| e.to_string())?;
     let qdv = DVector::from_row_slice(qd);

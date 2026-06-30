@@ -1,0 +1,39 @@
+CERN Open Hardware Licence Version 2 - Weakly Reciprocal (CERN-OHL-W-2.0)
+SPDX-License-Identifier: CERN-OHL-W-2.0
+
+================================================================================
+SCOPE OF THIS LICENSE
+================================================================================
+
+This license applies ONLY to the HARDWARE design files distributed with Caliper
+— for example mechanical CAD, PCB layouts, schematics, bills of materials, and
+any other physical-design artifacts (typically under `docs/hardware/` or a
+`hardware/` directory).
+
+It does NOT apply to:
+  - the software / source code, which is licensed under Apache-2.0
+    (see LICENSE-APACHE); or
+  - the documentation prose, which is licensed under CC-BY-4.0
+    (see LICENSE-CC-BY).
+
+================================================================================
+FULL LICENSE TEXT
+================================================================================
+
+The full, authoritative text of the CERN Open Hardware Licence Version 2 -
+Weakly Reciprocal is published by CERN and is incorporated here by reference. It
+is available at:
+
+    https://ohwr.org/cern_ohl_w_v2.txt
+    https://cern-ohl.web.cern.ch/
+
+The canonical SPDX identifier for this license is `CERN-OHL-W-2.0`; its full
+text is also catalogued at https://spdx.org/licenses/CERN-OHL-W-2.0.html .
+
+Copyright 2026 Mikhail Sannikov and the Caliper contributors.
+
+You may redistribute and modify the covered hardware design files under the
+terms of the CERN-OHL-W-2.0. The covered design files are distributed WITHOUT
+ANY EXPRESS OR IMPLIED WARRANTY, INCLUDING OF MERCHANTABILITY, SATISFACTORY
+QUALITY AND FITNESS FOR A PARTICULAR PURPOSE. Please see the full license for
+the applicable conditions.

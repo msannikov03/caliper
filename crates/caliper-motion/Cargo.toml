@@ -5,6 +5,11 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+description = "S-curve motion profiles (MOVE_J/L/C) and trajectory retiming"
+keywords = ["robotics", "motion", "trajectory", "s-curve", "planning"]
+categories = ["science::robotics"]
 
 [dependencies]
 caliper-spatial.workspace = true

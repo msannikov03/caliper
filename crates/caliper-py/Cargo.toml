@@ -5,6 +5,11 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+description = "Python bindings for the Caliper robotics engine (import caliper)"
+keywords = ["robotics", "python", "bindings", "kinematics", "engine"]
+categories = ["science::robotics", "api-bindings"]
 
 [lib]
 name = "_caliper"

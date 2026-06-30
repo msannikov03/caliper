@@ -5,6 +5,11 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+description = "Command-line interface for the Caliper robotics engine"
+keywords = ["robotics", "cli", "kinematics", "engine", "command-line"]
+categories = ["science::robotics", "command-line-utilities"]
 
 [[bin]]
 name = "caliper"

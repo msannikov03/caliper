@@ -5,6 +5,11 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+description = "Collision-aware motion planning (RRT-Connect) and reachability"
+keywords = ["robotics", "planning", "rrt", "motion-planning", "reachability"]
+categories = ["science::robotics", "algorithms"]
 
 # Collision-aware motion planning (RRT-Connect + shortcut smoothing) and
 # collision-aware reachability. Pure nalgebra/std — ZERO heavy deps, so the lean
@@ -19,3 +24,10 @@ caliper-ik.workspace = true
 caliper-spatial.workspace = true
 caliper-collision.workspace = true
 caliper-motion.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "planning"
+harness = false

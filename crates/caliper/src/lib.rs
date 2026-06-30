@@ -4,6 +4,7 @@
 //! (Studio app, CLI, Python bindings) use this crate as their primary entry
 //! point, though they also depend on individual sub-crates directly where they
 //! need types this facade does not re-export.
+pub use caliper_collision as collision;
 pub use caliper_dynamics as dynamics;
 pub use caliper_graph as graph;
 pub use caliper_hal as hal;

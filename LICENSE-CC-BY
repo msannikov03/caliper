@@ -1,0 +1,39 @@
+Creative Commons Attribution 4.0 International (CC-BY-4.0)
+SPDX-License-Identifier: CC-BY-4.0
+
+================================================================================
+SCOPE OF THIS LICENSE
+================================================================================
+
+This license applies ONLY to the DOCUMENTATION distributed with Caliper — for
+example the prose under `docs/`, design notes, guides, diagrams, and other
+written/illustrative material.
+
+It does NOT apply to:
+  - the software / source code, which is licensed under Apache-2.0
+    (see LICENSE-APACHE); or
+  - the hardware design files, which are licensed under CERN-OHL-W-2.0
+    (see LICENSE-CERN-OHL-W).
+
+================================================================================
+FULL LICENSE TEXT
+================================================================================
+
+The full, authoritative text of the Creative Commons Attribution 4.0
+International Public License is incorporated here by reference and is available
+at:
+
+    https://creativecommons.org/licenses/by/4.0/legalcode
+    https://creativecommons.org/licenses/by/4.0/
+
+The canonical SPDX identifier for this license is `CC-BY-4.0`; its full text is
+also catalogued at https://spdx.org/licenses/CC-BY-4.0.html .
+
+Copyright 2026 Mikhail Sannikov and the Caliper contributors.
+
+You are free to share (copy and redistribute in any medium or format) and adapt
+(remix, transform, and build upon) this documentation for any purpose, even
+commercially, under the following term: ATTRIBUTION — you must give appropriate
+credit, provide a link to the license, and indicate if changes were made. The
+documentation is provided "as-is", without warranties. Please see the full
+license for the applicable conditions.

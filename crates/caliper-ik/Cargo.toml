@@ -5,10 +5,22 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+description = "Inverse kinematics: damped least-squares solver plus analytic 6R IK"
+keywords = ["robotics", "ik", "inverse-kinematics", "solver", "jacobian"]
+categories = ["science::robotics"]
 
 [dependencies]
 caliper-spatial.workspace = true
 caliper-model.workspace = true
 caliper-kinematics.workspace = true
 nalgebra.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "ik"
+harness = false
 

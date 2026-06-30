@@ -52,7 +52,7 @@ pub struct LinkFrame {
 
 /// A collision shape, in the shape's own local frame. Box/sphere/cylinder are
 /// exact primitives; a `<mesh>` collision is loaded (STL), scaled, and reduced to
-/// a [`CollisionShape::ConvexHull`] of its vertices (see [`parse_collisions`]).
+/// a [`CollisionShape::ConvexHull`] of its vertices (see `parse_collisions`).
 /// Capsules are still skipped (no loader). Not `Copy` because `ConvexHull` owns a
 /// `Vec`; clone explicitly.
 #[derive(Clone, Debug, PartialEq)]

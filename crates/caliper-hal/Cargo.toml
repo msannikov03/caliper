@@ -5,6 +5,11 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+description = "Hardware abstraction layer: robot backends, sim, teleop, datasets"
+keywords = ["robotics", "hal", "control", "teleoperation", "dataset"]
+categories = ["science::robotics"]
 
 [features]
 default = []

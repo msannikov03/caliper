@@ -18,6 +18,12 @@ jobs:
       - run: cargo clippy --workspace --exclude studio --all-targets -- -D warnings
       - run: cargo test --workspace --exclude studio
       - run: bash scripts/assert-lean.sh
+      # Docs must build (catches doc-code + structural errors). Not -D warnings:
+      # mathematical notation like `[v;ω]` trips rustdoc's intra-doc-link lint as a
+      # false positive and merely renders as literal text, which is intended.
+      - run: cargo doc --workspace --exclude studio --no-deps
+      # Compile the criterion benchmarks (don't run them) so they can't rot.
+      - run: cargo bench --workspace --exclude studio --no-run
 
   studio:
     runs-on: macos-14

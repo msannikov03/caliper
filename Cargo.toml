@@ -21,11 +21,19 @@ members = [
 edition = "2024"
 rust-version = "1.89"
 version = "0.1.0"
-license = "MIT OR Apache-2.0"
+# Apache-2.0 covers the software. The hardware design files are CERN-OHL-W and the
+# documentation is CC-BY — see the root LICENSE-* files (those are repo-level, not
+# crate license fields).
+license = "Apache-2.0"
 repository = "https://github.com/msannikov03/caliper"
+homepage = "https://github.com/msannikov03/caliper"
+readme = "README.md"
 
 [workspace.dependencies]
 nalgebra = { version = "0.35", features = ["serde-serialize"] }
+# Benchmarks: keep `cargo_bench_support` (the harness) but drop plotters/rayon so
+# the dev-dependency tree stays light. `cargo bench --no-run` gates compilation.
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
 urdf-rs = "0.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -5,6 +5,11 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+description = "SE(3)/SO(3) rigid-body spatial math (Lie-group exp/log) for robotics"
+keywords = ["robotics", "se3", "kinematics", "lie-group", "math"]
+categories = ["science::robotics", "mathematics"]
 
 [dependencies]
 nalgebra.workspace = true

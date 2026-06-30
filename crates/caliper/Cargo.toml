@@ -5,6 +5,11 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+description = "Caliper robotics engine — unified facade over the sub-crates"
+keywords = ["robotics", "kinematics", "dynamics", "ik", "engine"]
+categories = ["science::robotics"]
 
 [features]
 default = []
@@ -21,4 +26,5 @@ caliper-ik.workspace = true
 caliper-motion.workspace = true
 caliper-hal.workspace = true
 caliper-planning.workspace = true
+caliper-collision.workspace = true
 caliper-graph.workspace = true

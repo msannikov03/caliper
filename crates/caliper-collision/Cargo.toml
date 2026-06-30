@@ -5,6 +5,11 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+description = "Pure-nalgebra collision model (OBB SAT plus closed-form queries)"
+keywords = ["robotics", "collision", "geometry", "sat", "obb"]
+categories = ["science::robotics", "algorithms"]
 
 # Pure-nalgebra collision (OBB SAT + sphere/half-space closed forms). No external
 # physics/geometry dependency: the resolved parry 0.28 moved its public query API
@@ -17,3 +22,10 @@ nalgebra.workspace = true
 caliper-model.workspace = true
 caliper-kinematics.workspace = true
 caliper-hal.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "collision"
+harness = false

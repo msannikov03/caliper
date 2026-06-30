@@ -5,6 +5,11 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+description = "Deterministic dataflow graph IR composing Caliper engine ops"
+keywords = ["robotics", "dataflow", "graph", "pipeline", "engine"]
+categories = ["science::robotics"]
 
 # Phase-8 dataflow executor: a deterministic, serde-serializable graph IR that
 # composes the existing engine ops (FK/IK/motion/planning/dynamics/control/

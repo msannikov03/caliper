@@ -5,6 +5,11 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+description = "Forward kinematics, Jacobians, and singularity analysis for robot arms"
+keywords = ["robotics", "kinematics", "jacobian", "singularity", "forward"]
+categories = ["science::robotics", "mathematics"]
 
 [dependencies]
 caliper-spatial.workspace = true
@@ -13,3 +18,8 @@ nalgebra.workspace = true
 
 [dev-dependencies]
 proptest = "1"
+criterion.workspace = true
+
+[[bench]]
+name = "kinematics"
+harness = false

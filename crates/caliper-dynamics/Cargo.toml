@@ -5,6 +5,11 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+description = "Rigid-body dynamics (RNEA / CRBA / forward dynamics) and simulation"
+keywords = ["robotics", "dynamics", "rnea", "simulation", "physics"]
+categories = ["science::robotics", "simulation"]
 
 [dependencies]
 nalgebra.workspace = true
@@ -15,3 +20,8 @@ caliper-kinematics.workspace = true
 
 [dev-dependencies]
 proptest = "1"
+criterion.workspace = true
+
+[[bench]]
+name = "dynamics"
+harness = false

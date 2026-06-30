@@ -1,0 +1,16 @@
+<?xml version="1.0"?>
+<!-- Same unit-cube mesh as collide_mesh.urdf but with a per-axis scale=2 2 2, so
+     the convex-hull corners must land at +/-1.0 (verifies mesh scale is applied
+     before the hull). -->
+<robot name="collide_mesh_scaled">
+  <link name="base"/>
+  <link name="l1">
+    <collision><origin xyz="0 0 0"/>
+      <geometry><mesh filename="unit_cube.stl" scale="2 2 2"/></geometry></collision>
+  </link>
+  <joint name="j1" type="revolute">
+    <parent link="base"/><child link="l1"/>
+    <origin xyz="0 0 0"/><axis xyz="0 0 1"/>
+    <limit lower="-3.0" upper="3.0" effort="10" velocity="2"/>
+  </joint>
+</robot>

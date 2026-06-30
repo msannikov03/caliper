@@ -8,6 +8,9 @@ use caliper_model::Model;
 use caliper_spatial::Se3;
 use nalgebra::{Cholesky, DVector};
 
+mod analytic;
+pub use analytic::analytic_ik_6r;
+
 const UNBOUNDED: f64 = 1.0e6;
 
 #[derive(Clone, Debug)]

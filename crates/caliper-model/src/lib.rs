@@ -5,9 +5,12 @@
 //! every link exposed as a queryable/renderable frame. Algorithms (FK, Jacobian,
 //! IK) are free functions over `(&Model, &[f64])`.
 use caliper_spatial::{Se3, SpatialInertia};
-use nalgebra::{Isometry3, Matrix3, Translation3, UnitQuaternion, Vector3};
+use nalgebra::{Isometry3, Matrix3, Point3, Translation3, UnitQuaternion, Vector3};
 use std::collections::HashMap;
 use std::path::Path;
+
+pub mod hull;
+pub mod stl;
 
 /// Movable joint type (Phase 1). `Fixed` joints are folded out at compile time;
 /// `Continuous` is treated as `Revolute` without limits.
@@ -47,9 +50,12 @@ pub struct LinkFrame {
     pub offset: Se3,
 }
 
-/// A primitive collision shape (the exact subset; meshes are skipped — see
-/// [`parse_collisions`]). Dimensions are in the shape's own local frame.
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// A collision shape, in the shape's own local frame. Box/sphere/cylinder are
+/// exact primitives; a `<mesh>` collision is loaded (STL), scaled, and reduced to
+/// a [`CollisionShape::ConvexHull`] of its vertices (see [`parse_collisions`]).
+/// Capsules are still skipped (no loader). Not `Copy` because `ConvexHull` owns a
+/// `Vec`; clone explicitly.
+#[derive(Clone, Debug, PartialEq)]
 pub enum CollisionShape {
     /// Axis-aligned box; `half` are the half-extents (URDF `size`/2).
     Box {
@@ -62,6 +68,12 @@ pub enum CollisionShape {
     Cylinder {
         radius: f64,
         length: f64,
+    },
+    /// Convex hull of a `<mesh>`'s (scaled) vertices, in the link-local frame.
+    /// `points` are the hull vertices; a collider checks against their convex
+    /// hull (GJK), which is exact for the support-function test.
+    ConvexHull {
+        points: Vec<Point3<f64>>,
     },
 }
 
@@ -103,18 +115,19 @@ pub struct Model {
     /// True iff every movable link AND every fixed link folded onto a movable
     /// parent carried a real `<inertial>` (mass>0). Dynamics entry points gate on this.
     pub has_inertia: bool,
-    /// Parsed `<collision>` primitives (box/sphere/cylinder), each attached to a
-    /// link frame. ⚠ Mesh and capsule collisions are SKIPPED (no geometry loader):
-    /// those links carry NO collider and are therefore NOT collision-checked — a
-    /// query can report "clear" while a mesh-collidered link interpenetrates. Real
-    /// arms are usually mesh-collidered, so callers MUST surface the uncovered count
+    /// Parsed `<collision>` geometry — box/sphere/cylinder primitives plus mesh
+    /// colliders loaded as a [`CollisionShape::ConvexHull`] — each attached to a
+    /// link frame. ⚠ A `<capsule>`, or a `<mesh>` that could not be loaded
+    /// (missing/`package://`/non-STL file, unparsable, degenerate), is still
+    /// SKIPPED: that link carries NO collider for the dropped part and is NOT
+    /// collision-checked there. Callers should surface the uncovered count
     /// (`caliper_collision::CollisionModel::uncovered_frames`). Empty when absent.
     pub collision: Vec<CollisionGeom>,
     /// Frame indices of link frames that had a `<collision>` whose geometry was
-    /// DROPPED (mesh/capsule). Such a frame may carry primitive colliders too, so it
-    /// is only PARTIALLY covered — a query can still report "clear" for its dropped
-    /// part. Callers must treat these as not-fully-covered (see
-    /// `caliper_collision::CollisionModel::uncovered_frames`).
+    /// DROPPED (capsule, or an unloadable mesh). Such a frame may carry other
+    /// colliders too, so it is only PARTIALLY covered — a query can still report
+    /// "clear" for its dropped part. Callers must treat these as not-fully-covered
+    /// (see `caliper_collision::CollisionModel::uncovered_frames`).
     pub dropped_collider_frames: Vec<usize>,
 }
 
@@ -203,6 +216,8 @@ struct RobotTree {
 impl RobotTree {
     fn from_urdf(path: &Path) -> Result<Self, CompileError> {
         let u = urdf_rs::read_file(path).map_err(|e| CompileError::Parse(e.to_string()))?;
+        // Mesh `<collision filename=...>` is resolved relative to the URDF's directory.
+        let base_dir = path.parent();
         let mut t = RobotTree {
             name: u.name.clone(),
             ..Default::default()
@@ -211,7 +226,7 @@ impl RobotTree {
             t.link_index.insert(l.name.clone(), t.links.len());
             t.links.push(l.name.clone());
             t.link_inertia.push(parse_inertial(&l.inertial));
-            let (geoms, dropped) = parse_collisions(l);
+            let (geoms, dropped) = parse_collisions(l, base_dir);
             t.link_collision.push(geoms);
             t.link_dropped.push(dropped);
         }
@@ -292,10 +307,15 @@ fn parse_inertial(inr: &urdf_rs::Inertial) -> Option<SpatialInertia> {
 }
 
 /// Parse a link's `<collision>` primitives into `(link-local origin, shape)`.
-/// Box/sphere/cylinder are exact; meshes and capsules are SKIPPED (no geometry
-/// loader) — such links contribute NO collider and are consequently NOT checked
-/// for collision (unsafe-by-omission; see the `Model::collision` note).
-fn parse_collisions(link: &urdf_rs::Link) -> (Vec<(Se3, CollisionShape)>, bool) {
+/// Box/sphere/cylinder are exact; a `<mesh>` is loaded (STL), scaled, and reduced
+/// to a [`CollisionShape::ConvexHull`]. A mesh that cannot be loaded (missing
+/// file, unsupported/`package://` path, unparsable STL, degenerate hull) and a
+/// `<capsule>` are SKIPPED (no collider; `dropped=true`) — the pre-existing,
+/// safe-by-omission behavior (see the `Model::collision` note).
+fn parse_collisions(
+    link: &urdf_rs::Link,
+    base_dir: Option<&Path>,
+) -> (Vec<(Se3, CollisionShape)>, bool) {
     let mut out = Vec::new();
     let mut dropped = false;
     for c in &link.collision {
@@ -312,14 +332,66 @@ fn parse_collisions(link: &urdf_rs::Link) -> (Vec<(Se3, CollisionShape)>, bool) 
                 radius: *radius,
                 length: *length,
             },
+            urdf_rs::Geometry::Mesh { filename, scale } => {
+                match load_mesh_hull(filename, scale.as_ref(), base_dir) {
+                    Some(points) => CollisionShape::ConvexHull { points },
+                    None => {
+                        dropped = true; // unloadable mesh → keep DROPPED (safe)
+                        continue;
+                    }
+                }
+            }
             _ => {
-                dropped = true; // Mesh / Capsule: no inline geometry → dropped (NOT checked)
+                dropped = true; // Capsule: no loader → dropped (NOT checked)
                 continue;
             }
         };
         out.push((origin, shape));
     }
     (out, dropped)
+}
+
+/// Resolve a `<mesh>` filename, load its STL, apply the URDF per-axis `scale`,
+/// and reduce to a convex hull of vertices. `None` on any failure (the caller
+/// then keeps the mesh dropped). Only plain/relative/`file://` paths are
+/// resolved; `package://` is unsupported here (no package map) → `None`.
+fn load_mesh_hull(
+    filename: &str,
+    scale: Option<&urdf_rs::Vec3>,
+    base_dir: Option<&Path>,
+) -> Option<Vec<Point3<f64>>> {
+    let name = filename.strip_prefix("file://").unwrap_or(filename);
+    if name.starts_with("package://") {
+        return None; // not resolvable without a package map
+    }
+    let path = {
+        let p = Path::new(name);
+        if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            base_dir?.join(p)
+        }
+    };
+    // Only STL is supported by the pure-Rust loader.
+    let is_stl = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("stl"))
+        .unwrap_or(false);
+    if !is_stl {
+        return None;
+    }
+    let bytes = std::fs::read(&path).ok()?;
+    let mut verts = stl::parse_stl(&bytes)?;
+    if let Some(s) = scale {
+        let [sx, sy, sz] = s.0;
+        for v in &mut verts {
+            v.coords.component_mul_assign(&Vector3::new(sx, sy, sz));
+        }
+    }
+    let hull = hull::convex_hull(&verts);
+    // need at least a triangle to be a meaningful collider
+    (hull.len() >= 3).then_some(hull)
 }
 
 /// A URDF limit is meaningful only when `lower < upper`; otherwise treat the
@@ -457,11 +529,11 @@ fn compile(t: &RobotTree) -> Result<Model, CompileError> {
     // frame's offset already encodes any folded fixed chain — no separate fold).
     for (li, geoms) in t.link_collision.iter().enumerate() {
         if let Some(&frame) = m.frame_index.get(&t.links[li]) {
-            for &(origin, shape) in geoms {
+            for (origin, shape) in geoms {
                 m.collision.push(CollisionGeom {
                     frame,
-                    origin,
-                    shape,
+                    origin: *origin,
+                    shape: shape.clone(),
                 });
             }
             if t.link_dropped.get(li).copied().unwrap_or(false) {
@@ -605,7 +677,7 @@ mod tests {
         let m = load("collide_arm.urdf");
         assert_eq!(m.collision.len(), 3, "three box colliders");
         for g in &m.collision {
-            match g.shape {
+            match &g.shape {
                 CollisionShape::Box { half } => {
                     assert!((half.x - 0.06).abs() < 1e-12); // size 0.12 → half 0.06
                     assert!((half.z - 0.15).abs() < 1e-12); // size 0.3  → half 0.15
@@ -625,7 +697,7 @@ mod tests {
         let mut saw_sphere = false;
         let mut saw_cyl = false;
         for g in &m.collision {
-            match g.shape {
+            match &g.shape {
                 CollisionShape::Sphere { radius } => {
                     saw_sphere = true;
                     assert!((radius - 0.1).abs() < 1e-12);
@@ -640,7 +712,7 @@ mod tests {
                         "folded offset"
                     );
                 }
-                CollisionShape::Box { .. } => panic!("no boxes in this fixture"),
+                other => panic!("only sphere + cylinder here, got {other:?}"),
             }
         }
         assert!(saw_sphere && saw_cyl);
@@ -649,6 +721,68 @@ mod tests {
     #[test]
     fn no_collision_geometry_is_empty() {
         assert!(load("toy.urdf").collision.is_empty());
+    }
+
+    #[test]
+    fn loads_mesh_as_convex_hull() {
+        // unit_cube.stl → ConvexHull of its 8 corners; the link is now COVERED
+        // (NOT dropped), closing the silent-drop gap for mesh colliders.
+        let m = load("collide_mesh.urdf");
+        assert_eq!(m.collision.len(), 1, "the mesh became one collider");
+        assert!(
+            m.dropped_collider_frames.is_empty(),
+            "a loaded mesh must NOT be reported as dropped"
+        );
+        match &m.collision[0].shape {
+            CollisionShape::ConvexHull { points } => {
+                assert_eq!(points.len(), 8, "unit cube hull = 8 corners");
+                for p in points {
+                    // every corner sits at +/-0.5 on all three axes
+                    assert!(p.coords.iter().all(|c| (c.abs() - 0.5).abs() < 1e-9));
+                }
+            }
+            other => panic!("expected ConvexHull, got {other:?}"),
+        }
+        // the mesh collider rides the l1 frame
+        assert_eq!(m.collision[0].frame, m.frame_id("l1").unwrap());
+    }
+
+    #[test]
+    fn mesh_scale_is_applied_before_hull() {
+        let m = load("collide_mesh_scaled.urdf");
+        match &m.collision[0].shape {
+            CollisionShape::ConvexHull { points } => {
+                assert_eq!(points.len(), 8);
+                // scale 2 → corners at +/-1.0 on all three axes
+                for p in points {
+                    assert!(p.coords.iter().all(|c| (c.abs() - 1.0).abs() < 1e-9));
+                }
+            }
+            other => panic!("expected ConvexHull, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn missing_mesh_file_stays_dropped() {
+        // collide_shapes.urdf references a NON-existent hand.stl → must remain
+        // DROPPED (safe-by-omission), preserving the pre-mesh-loader behavior.
+        let m = load("collide_shapes.urdf");
+        assert_eq!(
+            m.collision.len(),
+            2,
+            "sphere + cylinder only; mesh unloadable"
+        );
+        assert!(
+            m.collision
+                .iter()
+                .all(|g| !matches!(g.shape, CollisionShape::ConvexHull { .. })),
+            "no convex hull from a missing file"
+        );
+        assert_eq!(
+            m.dropped_collider_frames.len(),
+            1,
+            "the unloadable mesh frame is still tracked as dropped"
+        );
     }
 
     #[test]

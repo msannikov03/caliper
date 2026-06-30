@@ -13,6 +13,7 @@
 
 mod rng;
 mod rrt;
+mod rrtstar;
 mod smooth;
 
 pub mod reach;
@@ -26,6 +27,7 @@ use caliper_motion::{MotionLimits, Trajectory, retime_waypoints};
 use caliper_spatial::Se3;
 use rng::Rng;
 use rrt::{Tree, dist, lerp, steer};
+use rrtstar::{StarParams, rrt_star};
 use std::sync::Arc;
 
 /// Tunable planner parameters. Defaults are sensible for a ~6-DOF arm.
@@ -198,6 +200,57 @@ impl Planner {
             }
         }
         Err(PlanError::Unreachable(self.cfg.max_iters))
+    }
+
+    /// Plan an **asymptotically-optimal** (RRT*) collision-free, smoothed
+    /// joint-space waypoint path from `start` to `goal` within `iters` samples.
+    ///
+    /// Unlike [`plan`](Self::plan) (RRT-Connect — fast, *feasible*), this grows a
+    /// single start-rooted tree that keeps rewiring toward lower path length, so
+    /// with enough iterations it converges to (near-)shortest joint-space paths.
+    /// Same validity model and resolution as `plan`; same determinism (a given
+    /// `seed`/`iters` yields the same path). Endpoints equal `start`/`goal` and
+    /// every edge is collision-free at the planner resolution (independently
+    /// re-checkable with [`verify_path`](Self::verify_path)). The raw RRT* path is
+    /// shortcut-smoothed (monotone non-increasing in length) before returning.
+    pub fn plan_optimal(
+        &self,
+        start: &[f64],
+        goal: &[f64],
+        iters: usize,
+    ) -> Result<Vec<Vec<f64>>, PlanError> {
+        self.validate_cfg()?;
+        if iters == 0 {
+            return Err(PlanError::InvalidConfig("iters must be > 0"));
+        }
+        let n = self.model.ndof;
+        for (name, q) in [("start", start), ("goal", goal)] {
+            if q.len() != n {
+                return Err(PlanError::Dim {
+                    expected: n,
+                    got: q.len(),
+                });
+            }
+            if !q.iter().all(|x| x.is_finite()) {
+                return Err(PlanError::NonFinite(name));
+            }
+        }
+        self.check_bounds(start, "start")?;
+        self.check_bounds(goal, "goal")?;
+        self.check_endpoint(start, true)?;
+        self.check_endpoint(goal, false)?;
+
+        let params = StarParams {
+            seed: self.cfg.seed,
+            iters,
+            step: self.cfg.step,
+            goal_bias: self.cfg.goal_bias,
+        };
+        let raw = rrt_star(start, goal, &self.bounds, &params, |a, b| {
+            self.motion_valid(a, b)
+        })
+        .ok_or(PlanError::Unreachable(iters))?;
+        Ok(self.smooth(raw))
     }
 
     /// Plan + retime into a playable/recordable [`Trajectory`] (collision-free
@@ -550,6 +603,119 @@ mod tests {
             ),
             "out-of-bounds goal must error"
         );
+    }
+
+    // ---- RRT* (plan_optimal) cross-validation ----
+
+    #[test]
+    fn optimal_connects_collision_free_endpoints() {
+        let p = arm_planner(WorldScene::new());
+        let start = vec![0.0, 0.0, 0.0];
+        let goal = vec![0.4, -0.4, 0.4];
+        let path = p.plan_optimal(&start, &goal, 1500).unwrap();
+        assert!(path.len() >= 2);
+        assert_eq!(&path[0], &start, "endpoint must equal start exactly");
+        assert_eq!(
+            path.last().unwrap(),
+            &goal,
+            "endpoint must equal goal exactly"
+        );
+        assert!(
+            p.verify_path(&path),
+            "RRT* path must be collision-free at fine resolution"
+        );
+        // Any valid path is at least the straight-line joint distance.
+        assert!(path_length(&path) >= dist(&start, &goal) - 1e-9);
+    }
+
+    #[test]
+    fn optimal_deterministic_same_seed() {
+        let a = arm_planner(WorldScene::new())
+            .plan_optimal(&[0.0, 0.0, 0.0], &[0.4, -0.4, 0.4], 1200)
+            .unwrap();
+        let b = arm_planner(WorldScene::new())
+            .plan_optimal(&[0.0, 0.0, 0.0], &[0.4, -0.4, 0.4], 1200)
+            .unwrap();
+        assert_eq!(a, b, "same seed ⇒ identical RRT* path");
+    }
+
+    #[test]
+    fn optimal_not_worse_than_rrt_connect_free_space() {
+        // Both planners share the validity model + smoother; with enough iterations
+        // RRT* must not return a longer path than RRT-Connect. (A wrong RRT* that
+        // ignores cost / rewiring would routinely lose this.)
+        let p = arm_planner(WorldScene::new());
+        let start = vec![0.0, 0.0, 0.0];
+        let goal = vec![0.4, -0.4, 0.4];
+        let connect = p.plan(&start, &goal).unwrap();
+        let star = p.plan_optimal(&start, &goal, 3000).unwrap();
+        assert!(p.verify_path(&star));
+        assert!(
+            path_length(&star) <= path_length(&connect) + 1e-6,
+            "RRT* {:.6} should be <= RRT-Connect {:.6}",
+            path_length(&star),
+            path_length(&connect),
+        );
+    }
+
+    #[test]
+    fn optimal_with_world_scene_not_worse_than_rrt_connect() {
+        let scene = WorldScene::new()
+            .with_ground(-0.1)
+            .add_box([0.6, 0.0, 0.3], [0.15, 0.15, 0.15]);
+        let start = vec![0.0, 0.0, 0.0];
+        let goal = vec![0.4, -0.4, 0.4];
+        let cm = CollisionModel::new(model("collide_arm.urdf"), scene.clone(), 0.0);
+        assert!(
+            !cm.query(&start).unwrap().has_collision(),
+            "start must be clear"
+        );
+        assert!(
+            !cm.query(&goal).unwrap().has_collision(),
+            "goal must be clear"
+        );
+        let p = arm_planner(scene);
+        let connect = p.plan(&start, &goal).unwrap();
+        let star = p.plan_optimal(&start, &goal, 5000).unwrap();
+        assert!(
+            p.verify_path(&star),
+            "RRT* path must be collision-free under the world"
+        );
+        assert_eq!(&star[0], &start);
+        assert_eq!(star.last().unwrap(), &goal);
+        assert!(
+            path_length(&star) <= path_length(&connect) + 1e-6,
+            "RRT* {:.6} should be <= RRT-Connect {:.6}",
+            path_length(&star),
+            path_length(&connect),
+        );
+    }
+
+    #[test]
+    fn optimal_invalid_iters_errors() {
+        let p = arm_planner(WorldScene::new());
+        assert!(matches!(
+            p.plan_optimal(&[0.0, 0.0, 0.0], &[0.4, -0.4, 0.4], 0),
+            Err(PlanError::InvalidConfig(_))
+        ));
+    }
+
+    #[test]
+    fn optimal_guards_dim_bounds_collision() {
+        let p = arm_planner(WorldScene::new());
+        assert!(matches!(
+            p.plan_optimal(&[0.0, 0.0], &[0.0, 0.0, 0.0], 100),
+            Err(PlanError::Dim { .. })
+        ));
+        assert!(matches!(
+            p.plan_optimal(&[100.0, 0.0, 0.0], &[0.0, 0.0, 0.0], 100),
+            Err(PlanError::OutOfBounds { which: "start", .. })
+        ));
+        let folded = vec![0.0, std::f64::consts::PI, std::f64::consts::PI];
+        assert!(matches!(
+            p.plan_optimal(&[0.0, 0.0, 0.0], &folded, 100),
+            Err(PlanError::GoalInCollision(_))
+        ));
     }
 
     #[test]

@@ -1,0 +1,17 @@
+<?xml version="1.0"?>
+<!-- Mesh-collider coverage fixture: l1 carries a <mesh> collision (unit_cube.stl,
+     corners at +/-0.5). The pure-Rust STL loader + convex hull turn it into a
+     ConvexHull collider, so l1 is now COVERED (NOT in dropped_collider_frames)
+     and uncovered_frames() counts only the collider-less `base`. -->
+<robot name="collide_mesh">
+  <link name="base"/>
+  <link name="l1">
+    <collision><origin xyz="0 0 0"/>
+      <geometry><mesh filename="unit_cube.stl"/></geometry></collision>
+  </link>
+  <joint name="j1" type="revolute">
+    <parent link="base"/><child link="l1"/>
+    <origin xyz="0 0 0"/><axis xyz="0 0 1"/>
+    <limit lower="-3.0" upper="3.0" effort="10" velocity="2"/>
+  </joint>
+</robot>

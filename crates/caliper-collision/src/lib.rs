@@ -10,14 +10,16 @@
 //! Geometry: oriented-box ↔ oriented-box uses the separating-axis theorem (15
 //! axes, Ericson); sphere/box and half-space cases are closed-form. Cylinders are
 //! conservatively approximated by their tight oriented bounding box (errs toward
-//! detecting a collision — safe). Everything is deterministic and dependency-free.
+//! detecting a collision — safe). MESH colliders arrive as a convex hull of
+//! vertices ([`CollisionShape::ConvexHull`]) and are checked with GJK (boolean
+//! origin-in-Minkowski-difference) against convex/box/sphere colliders and against
+//! the world half-space. Everything is deterministic and dependency-free.
 //!
-//! ⚠ SCOPE: only box/sphere/cylinder `<collision>` primitives are checked. Links
-//! whose collision geometry is a MESH or capsule carry no collider (no mesh
-//! loader), so they are NOT checked — a report can read "clear" while such a link
-//! interpenetrates. [`CollisionModel::uncovered_frames`] returns that count;
-//! callers should surface it rather than trust a "clear" verdict blindly. A
-//! conservative fallback collider for mesh links is future work.
+//! ⚠ SCOPE: box/sphere/cylinder/convex-hull(mesh) `<collision>` geometry is
+//! checked. A `<capsule>`, or a `<mesh>` the loader could not read, carries no
+//! collider, so that part is NOT checked — a report can read "clear" while such a
+//! link interpenetrates. [`CollisionModel::uncovered_frames`] returns that count;
+//! callers should surface it rather than trust a "clear" verdict blindly.
 
 use caliper_hal::SafetyCheck;
 use caliper_kinematics::fk_frame;
@@ -88,7 +90,7 @@ impl CollisionReport {
 }
 
 /// An oriented collision primitive in world coordinates.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 enum Prim {
     /// Oriented box: center, orientation (columns = local axes), half-extents.
     Obb {
@@ -99,6 +101,13 @@ enum Prim {
     Sphere {
         c: Vector3<f64>,
         radius: f64,
+    },
+    /// Convex hull (mesh collider) in WORLD coordinates. `margin` inflates the
+    /// hull by a sphere of that radius at GJK support time (conservative, exact
+    /// Minkowski sum). Never empty (a ConvexHull collider always has >= 3 points).
+    Convex {
+        points: Vec<Vector3<f64>>,
+        margin: f64,
     },
 }
 
@@ -165,7 +174,7 @@ impl CollisionModel {
                 let world = fk_frame(&self.model, q, g.frame).0 * g.origin.0;
                 let r = world.rotation.to_rotation_matrix().into_inner();
                 let c = world.translation.vector;
-                (prim_for(g.shape, c, r, self.margin), g.frame)
+                (prim_for(&g.shape, c, r, self.margin), g.frame)
             })
             .collect();
 
@@ -239,8 +248,10 @@ impl SafetyCheck for CollisionModel {
 }
 
 /// Convert a parsed shape at world `(c, r)` (+margin) into an oriented primitive.
-/// Cylinders become their tight OBB (Z-aligned local; conservative).
-fn prim_for(shape: CollisionShape, c: Vector3<f64>, r: Matrix3<f64>, margin: f64) -> Prim {
+/// Cylinders become their tight OBB (Z-aligned local; conservative). A ConvexHull
+/// is transformed vertex-by-vertex into world coords (`c + r·p`); its margin is
+/// applied at GJK support time.
+fn prim_for(shape: &CollisionShape, c: Vector3<f64>, r: Matrix3<f64>, margin: f64) -> Prim {
     match shape {
         CollisionShape::Box { half } => Prim::Obb {
             c,
@@ -255,6 +266,10 @@ fn prim_for(shape: CollisionShape, c: Vector3<f64>, r: Matrix3<f64>, margin: f64
             c,
             r,
             h: Vector3::new(radius + margin, radius + margin, length / 2.0 + margin),
+        },
+        CollisionShape::ConvexHull { points } => Prim::Convex {
+            points: points.iter().map(|p| c + r * p.coords).collect(),
+            margin,
         },
     }
 }
@@ -327,6 +342,10 @@ fn intersects(a: &Prim, b: &Prim) -> bool {
         (Prim::Sphere { c: a, radius: ra }, Prim::Sphere { c: b, radius: rb }) => {
             (a - b).norm() <= ra + rb
         }
+        // Any pair involving a convex hull (mesh) → GJK boolean test. The closed
+        // forms above stay the gold path for primitive ↔ primitive; GJK is
+        // cross-validated against `obb_obb` over random poses (see tests).
+        (Prim::Convex { .. }, _) | (_, Prim::Convex { .. }) => gjk_intersect(a, b),
     }
 }
 
@@ -340,6 +359,9 @@ fn prim_below_plane(p: &Prim, n: Vector3<f64>, d: f64) -> bool {
                 + h.z * r.column(2).dot(&n).abs();
             c.dot(&n) - reach <= d
         }
+        // The convex hull dips into the half-space iff its lowest vertex does
+        // (the support point along -n); margin lowers it by `margin·|n|`, |n|==1.
+        Prim::Convex { points, margin } => points.iter().any(|p| p.dot(&n) - *margin <= d),
     }
 }
 
@@ -458,6 +480,202 @@ fn obb_obb(
         }
     }
     true // no separating axis → intersecting
+}
+
+// ===== GJK boolean intersection (pure nalgebra) =====
+//
+// Tests whether two convex primitives overlap by deciding if the origin lies in
+// their Minkowski difference A ⊖ B. Matches the rest of the module's BOOLEAN
+// contract (no distance/penetration). Touching (origin on the boundary) is
+// treated as a collision, consistent with the `<=` SAT. The simplex evolution is
+// the well-known Muratori/Moran form; it is cross-validated against the validated
+// `obb_obb` SAT over many random poses in the tests below.
+
+const GJK_MAX_ITERS: usize = 64;
+
+/// Support point of a primitive in direction `d` (need not be unit). For a sphere
+/// / convex hull the margin is folded in here (Minkowski sum with a sphere).
+fn prim_support(p: &Prim, d: &Vector3<f64>) -> Vector3<f64> {
+    match p {
+        Prim::Obb { c, r, h } => {
+            // farthest corner: c + R · (sign(Rᵀd) ⊙ h)
+            let dl = r.transpose() * d;
+            let s = Vector3::new(
+                if dl.x >= 0.0 { h.x } else { -h.x },
+                if dl.y >= 0.0 { h.y } else { -h.y },
+                if dl.z >= 0.0 { h.z } else { -h.z },
+            );
+            c + r * s
+        }
+        Prim::Sphere { c, radius } => {
+            let n = d.norm();
+            if n > 0.0 { c + d * (*radius / n) } else { *c }
+        }
+        Prim::Convex { points, margin } => {
+            // farthest vertex along d, then push out by margin·d̂ (rounded hull)
+            let mut best = points[0];
+            let mut bestdot = best.dot(d);
+            for &v in &points[1..] {
+                let vd = v.dot(d);
+                if vd > bestdot {
+                    bestdot = vd;
+                    best = v;
+                }
+            }
+            let n = d.norm();
+            if *margin > 0.0 && n > 0.0 {
+                best + d * (*margin / n)
+            } else {
+                best
+            }
+        }
+    }
+}
+
+/// A representative interior/center point, used only to seed the search direction.
+fn prim_center(p: &Prim) -> Vector3<f64> {
+    match p {
+        Prim::Obb { c, .. } | Prim::Sphere { c, .. } => *c,
+        Prim::Convex { points, .. } => points.iter().sum::<Vector3<f64>>() / points.len() as f64,
+    }
+}
+
+/// Support of the Minkowski difference A ⊖ B in direction `d`.
+#[inline]
+fn mink_support(a: &Prim, b: &Prim, d: &Vector3<f64>) -> Vector3<f64> {
+    prim_support(a, d) - prim_support(b, &(-d))
+}
+
+/// GJK boolean overlap test. A faithful port of the canonical
+/// Muratori/Moran simplex evolution (`a` is always the most-recently-added
+/// vertex; `simplex3`/`simplex4` keep a consistent winding so the tetra face
+/// normals come out outward). Returns `true` on overlap or touching.
+fn gjk_intersect(pa: &Prim, pb: &Prim) -> bool {
+    // The Minkowski-difference support is symmetric in (pa,pb) for origin
+    // containment; `s(dir)` below is A⊖B.
+    let s = |dir: &Vector3<f64>| mink_support(pa, pb, dir);
+
+    let mut search = prim_center(pa) - prim_center(pb);
+    if search.norm_squared() < 1e-24 {
+        search = Vector3::new(1.0, 0.0, 0.0);
+    }
+
+    // first two simplex points
+    let mut c = s(&search);
+    search = -c;
+    let mut b = s(&search);
+    if b.dot(&search) < 0.0 {
+        return false; // no overlap
+    }
+    // perpendicular to edge cb, toward the origin
+    let cb = c - b;
+    search = cb.cross(&(-b)).cross(&cb);
+    if search.norm_squared() < 1e-24 {
+        // origin lies on the line cb → pick any axis not parallel to it
+        search = cb.cross(&Vector3::new(1.0, 0.0, 0.0));
+        if search.norm_squared() < 1e-24 {
+            search = cb.cross(&Vector3::new(0.0, 0.0, -1.0));
+        }
+    }
+
+    let mut a; // newest vertex
+    let mut d = Vector3::zeros();
+    let mut simp_dim = 2usize;
+
+    for _ in 0..GJK_MAX_ITERS {
+        a = s(&search);
+        if a.dot(&search) < 0.0 {
+            return false; // farthest point short of the origin → separated
+        }
+        simp_dim += 1;
+        if simp_dim == 3 {
+            simplex3(&mut a, &mut b, &mut c, &mut d, &mut simp_dim, &mut search);
+        } else if simplex4(&mut a, &mut b, &mut c, &mut d, &mut simp_dim, &mut search) {
+            return true;
+        }
+        if search.norm_squared() < 1e-24 {
+            // origin on the simplex (touching) → treat as collision
+            return true;
+        }
+    }
+    true // no decision within the cap → assume overlap (conservative)
+}
+
+/// Triangle simplex update (Moran). `a` is newest. Reduces to an edge or prepares
+/// a winding-consistent triangle base for the tetra step.
+fn simplex3(
+    a: &mut Vector3<f64>,
+    b: &mut Vector3<f64>,
+    c: &mut Vector3<f64>,
+    d: &mut Vector3<f64>,
+    simp_dim: &mut usize,
+    search: &mut Vector3<f64>,
+) {
+    let n = (*b - *a).cross(&(*c - *a)); // triangle normal
+    let ao = -*a;
+    *simp_dim = 2;
+    if (*b - *a).cross(&n).dot(&ao) > 0.0 {
+        // closest to edge AB
+        *c = *a;
+        *search = (*b - *a).cross(&ao).cross(&(*b - *a));
+        return;
+    }
+    if n.cross(&(*c - *a)).dot(&ao) > 0.0 {
+        // closest to edge AC
+        *b = *a;
+        *search = (*c - *a).cross(&ao).cross(&(*c - *a));
+        return;
+    }
+    *simp_dim = 3;
+    if n.dot(&ao) > 0.0 {
+        // above the triangle
+        *d = *c;
+        *c = *b;
+        *b = *a;
+        *search = n;
+    } else {
+        // below the triangle
+        *d = *b;
+        *b = *a;
+        *search = -n;
+    }
+}
+
+/// Tetrahedron simplex update (Moran). `a` is the tip (newest); BCD is the base.
+/// Returns `true` iff the origin is enclosed.
+fn simplex4(
+    a: &mut Vector3<f64>,
+    b: &mut Vector3<f64>,
+    c: &mut Vector3<f64>,
+    d: &mut Vector3<f64>,
+    simp_dim: &mut usize,
+    search: &mut Vector3<f64>,
+) -> bool {
+    let abc = (*b - *a).cross(&(*c - *a));
+    let acd = (*c - *a).cross(&(*d - *a));
+    let adb = (*d - *a).cross(&(*b - *a));
+    let ao = -*a;
+    *simp_dim = 3;
+    if abc.dot(&ao) > 0.0 {
+        *d = *c;
+        *c = *b;
+        *b = *a;
+        *search = abc;
+        return false;
+    }
+    if acd.dot(&ao) > 0.0 {
+        *b = *a;
+        *search = acd;
+        return false;
+    }
+    if adb.dot(&ao) > 0.0 {
+        *c = *d;
+        *d = *b;
+        *b = *a;
+        *search = adb;
+        return false;
+    }
+    true // enclosed
 }
 
 #[cfg(test)]
@@ -709,6 +927,271 @@ mod tests {
             "adjacent movable links stay allowlisted"
         );
         assert!(!cm.allowlisted(l1, l3), "non-adjacent links stay checked");
+    }
+
+    // ---- mesh / convex-hull (GJK) coverage + cross-validation ----
+
+    /// A deterministic splitmix64 stream → f64 in [0,1) (no `rand` crate).
+    struct Rng(u64);
+    impl Rng {
+        fn f(&mut self) -> f64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            ((z ^ (z >> 31)) >> 11) as f64 / (1u64 << 53) as f64
+        }
+        fn range(&mut self, lo: f64, hi: f64) -> f64 {
+            lo + (hi - lo) * self.f()
+        }
+    }
+
+    fn rand_rot(rng: &mut Rng) -> Matrix3<f64> {
+        let axis = Vector3::new(
+            rng.range(-1.0, 1.0),
+            rng.range(-1.0, 1.0),
+            rng.range(-1.0, 1.0),
+        );
+        let axis = if axis.norm() < 1e-6 {
+            Vector3::new(0.0, 0.0, 1.0)
+        } else {
+            axis.normalize()
+        };
+        let ang = rng.range(-std::f64::consts::PI, std::f64::consts::PI);
+        nalgebra::Rotation3::from_axis_angle(&nalgebra::Unit::new_normalize(axis), ang).into_inner()
+    }
+
+    /// The 8 corners of an oriented box, in world coordinates.
+    fn cube_points(c: Vector3<f64>, r: Matrix3<f64>, h: Vector3<f64>) -> Vec<Vector3<f64>> {
+        let mut p = Vec::with_capacity(8);
+        for sx in [-1.0, 1.0] {
+            for sy in [-1.0, 1.0] {
+                for sz in [-1.0, 1.0] {
+                    p.push(c + r * Vector3::new(sx * h.x, sy * h.y, sz * h.z));
+                }
+            }
+        }
+        p
+    }
+
+    /// A convex-hull primitive shaped as the 8 corners of an oriented box.
+    fn cube_prim(c: Vector3<f64>, r: Matrix3<f64>, h: Vector3<f64>) -> Prim {
+        Prim::Convex {
+            points: cube_points(c, r, h),
+            margin: 0.0,
+        }
+    }
+
+    #[test]
+    fn convex_cube_matches_obb_overlap_and_separation() {
+        let i = Matrix3::identity();
+        let h = Vector3::new(0.5, 0.5, 0.5);
+        let obb = Prim::Obb {
+            c: Vector3::zeros(),
+            r: i,
+            h,
+        };
+        // overlapping (0.5 apart): convex-cube must collide with the OBB, and the
+        // result must match obb_obb on the equivalent boxes.
+        let near = cube_prim(Vector3::new(0.5, 0.0, 0.0), i, h);
+        assert!(
+            intersects(&near, &obb),
+            "overlapping convex vs obb must collide"
+        );
+        assert!(intersects(&obb, &near), "symmetry");
+        // separated (1.2 apart): must be clear, matching the SAT.
+        let far = cube_prim(Vector3::new(1.2, 0.0, 0.0), i, h);
+        assert!(
+            !intersects(&far, &obb),
+            "separated convex vs obb must be clear"
+        );
+    }
+
+    #[test]
+    fn gjk_matches_obb_sat_randomized() {
+        // Cross-validate GJK against the validated OBB SAT over many random poses,
+        // using ONLY boundary-free placements so the boolean verdicts are
+        // unambiguous: (1) B's center placed INSIDE A → guaranteed overlap, and
+        // (2) B pushed beyond A along world-x with a positive gap → guaranteed
+        // separation (x is a separating axis). Any transcription error in the GJK
+        // simplex routines would surface as a mismatch here.
+        let mut rng = Rng(0xCAFE_F00D_1234_5678);
+        let ident = Matrix3::identity();
+        for _ in 0..400 {
+            let ha = Vector3::new(
+                rng.range(0.1, 0.5),
+                rng.range(0.1, 0.5),
+                rng.range(0.1, 0.5),
+            );
+            let hb = Vector3::new(
+                rng.range(0.1, 0.5),
+                rng.range(0.1, 0.5),
+                rng.range(0.1, 0.5),
+            );
+            let rb = rand_rot(&mut rng);
+            let obb_a = Prim::Obb {
+                c: Vector3::zeros(),
+                r: ident,
+                h: ha,
+            };
+
+            // --- guaranteed OVERLAP: center of B sits inside A ---
+            let c_in = Vector3::new(
+                rng.range(-ha.x, ha.x),
+                rng.range(-ha.y, ha.y),
+                rng.range(-ha.z, ha.z),
+            );
+            let conv_b = cube_prim(c_in, rb, hb);
+            let conv_a = cube_prim(Vector3::zeros(), ident, ha);
+            let obb_b = Prim::Obb {
+                c: c_in,
+                r: rb,
+                h: hb,
+            };
+            // SAT ground truth
+            assert!(
+                obb_obb(&Vector3::zeros(), &ident, &ha, &c_in, &rb, &hb),
+                "sanity: B's center inside A must overlap per SAT"
+            );
+            assert!(intersects(&conv_b, &obb_a), "convex(B) vs obb(A) overlap");
+            assert!(
+                intersects(&conv_a, &conv_b),
+                "convex(A) vs convex(B) overlap"
+            );
+            assert!(intersects(&conv_a, &obb_b), "convex(A) vs obb(B) overlap");
+
+            // --- guaranteed SEPARATION: push B beyond A along world x ---
+            let proj_bx =
+                hb.x * rb[(0, 0)].abs() + hb.y * rb[(0, 1)].abs() + hb.z * rb[(0, 2)].abs();
+            let cx = ha.x + proj_bx + 0.05; // 5 cm gap → x is a separating axis
+            let c_out = Vector3::new(cx, rng.range(-0.2, 0.2), rng.range(-0.2, 0.2));
+            let conv_out = cube_prim(c_out, rb, hb);
+            let obb_out = Prim::Obb {
+                c: c_out,
+                r: rb,
+                h: hb,
+            };
+            assert!(
+                !obb_obb(&Vector3::zeros(), &ident, &ha, &c_out, &rb, &hb),
+                "sanity: gapped B must be separated per SAT"
+            );
+            assert!(!intersects(&conv_out, &obb_a), "convex(B) vs obb(A) clear");
+            assert!(
+                !intersects(&conv_a, &conv_out),
+                "convex(A) vs convex(B) clear"
+            );
+            assert!(!intersects(&conv_a, &obb_out), "convex(A) vs obb(B) clear");
+        }
+    }
+
+    #[test]
+    fn convex_vs_sphere_matches_sphere_obb() {
+        // A convex cube is geometrically the same body as the equivalent OBB, so
+        // GJK(convex, sphere) must agree with the closed-form sphere_obb.
+        let i = Matrix3::identity();
+        let h = Vector3::new(0.5, 0.5, 0.5);
+        let cube = cube_prim(Vector3::zeros(), i, h);
+        for &(sc, sr) in &[
+            ([0.8, 0.0, 0.0], 0.4), // 0.3 gap < r → hit
+            ([1.2, 0.0, 0.0], 0.4), // 0.7 gap > r → clear
+            ([0.0, 0.0, 0.0], 0.1), // inside
+            ([0.9, 0.9, 0.0], 0.3), // near a corner, clear
+        ] {
+            let sphere = Prim::Sphere {
+                c: Vector3::new(sc[0], sc[1], sc[2]),
+                radius: sr,
+            };
+            let want = sphere_obb(
+                &Vector3::new(sc[0], sc[1], sc[2]),
+                sr,
+                &Vector3::zeros(),
+                &i,
+                &h,
+            );
+            assert_eq!(
+                intersects(&cube, &sphere),
+                want,
+                "convex/sphere must match sphere_obb for {sc:?} r={sr}"
+            );
+        }
+    }
+
+    #[test]
+    fn convex_margin_inflates() {
+        // With a 5 cm gap the cubes are clear; a margin >= half the gap on the
+        // convex side must close it (Minkowski-sum inflation in the support fn).
+        let i = Matrix3::identity();
+        let h = Vector3::new(0.5, 0.5, 0.5);
+        let obb = Prim::Obb {
+            c: Vector3::new(1.05, 0.0, 0.0),
+            r: i,
+            h,
+        };
+        let bare = Prim::Convex {
+            points: cube_points(Vector3::zeros(), i, h),
+            margin: 0.0,
+        };
+        assert!(!intersects(&bare, &obb), "0.05 gap, no margin → clear");
+        let inflated = Prim::Convex {
+            points: cube_points(Vector3::zeros(), i, h),
+            margin: 0.06,
+        };
+        assert!(intersects(&inflated, &obb), "margin must close the gap");
+    }
+
+    #[test]
+    fn convex_below_plane() {
+        // cube spanning z ∈ [-0.5, 0.5]: dips into a half-space at z ≤ 0.1, clear
+        // below z ≤ -1.0. Validates the convex arm of prim_below_plane.
+        let cube = cube_prim(
+            Vector3::zeros(),
+            Matrix3::identity(),
+            Vector3::new(0.5, 0.5, 0.5),
+        );
+        let zup = Vector3::new(0.0, 0.0, 1.0);
+        assert!(prim_below_plane(&cube, zup, 0.1));
+        assert!(!prim_below_plane(&cube, zup, -1.0));
+    }
+
+    #[test]
+    fn mesh_link_is_now_covered_and_collides() {
+        // collide_mesh.urdf: l1 carries unit_cube.stl → a ConvexHull collider. The
+        // mesh frame is now COVERED (only the collider-less base is uncovered), and
+        // the convex collider participates in real world-collision queries via GJK.
+        let m = model("collide_mesh.urdf");
+        assert!(
+            m.dropped_collider_frames.is_empty(),
+            "loaded mesh must not be dropped"
+        );
+        let cm = CollisionModel::new(m.clone(), WorldScene::new(), 0.0);
+        assert_eq!(cm.num_colliders(), 1, "the convex-hull collider");
+        assert_eq!(
+            cm.uncovered_frames(),
+            1,
+            "only `base` is uncovered now; l1's mesh is covered"
+        );
+        // a world box overlapping the cube (centered at origin at q=0) → collision
+        let hit = CollisionModel::new(
+            m.clone(),
+            WorldScene::new().add_box([0.0, 0.0, 0.0], [0.2, 0.2, 0.2]),
+            0.0,
+        );
+        assert!(
+            hit.query(&[0.0]).unwrap().has_collision(),
+            "convex hull (mesh) must collide with an overlapping world box"
+        );
+        // a distant box → clear (FK consistency through the convex path)
+        let clear = CollisionModel::new(
+            m.clone(),
+            WorldScene::new().add_box([5.0, 0.0, 0.0], [0.2, 0.2, 0.2]),
+            0.0,
+        );
+        assert!(!clear.query(&[0.0]).unwrap().has_collision());
+        // ground intersecting the cube (z ≤ 0.1) → world hit; far below → clear
+        let ground = CollisionModel::new(m.clone(), WorldScene::new().with_ground(0.1), 0.0);
+        assert!(!ground.query(&[0.0]).unwrap().world_hits.is_empty());
+        let deep = CollisionModel::new(m, WorldScene::new().with_ground(-2.0), 0.0);
+        assert!(deep.query(&[0.0]).unwrap().world_hits.is_empty());
     }
 
     // ---- B13: degenerate world-box extents are sanitized ----

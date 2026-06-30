@@ -20,6 +20,10 @@ dataset = ["dep:arrow", "dep:parquet", "dep:serde", "dep:serde_json"]
 # bus binding requires a robot to validate and is deferred with ROS-bridge/MuJoCo.
 can = []
 dynamixel = []
+# Remote-control backend — real length-prefixed CRC-16 frame codec + NotConnected
+# stub. Marker feature (no transport dep yet): the actual TCP/UDP/websocket socket
+# binding is deferred like the other hardware skeletons.
+remote = []
 
 [dependencies]
 thiserror.workspace = true

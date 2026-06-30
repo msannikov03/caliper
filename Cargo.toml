@@ -11,6 +11,7 @@ members = [
   "crates/caliper-collision",
   "crates/caliper-planning",
   "crates/caliper-graph",
+  "crates/caliper-calib",
   "crates/caliper",
   "crates/caliper-cli",
   "crates/caliper-py",
@@ -52,6 +53,7 @@ caliper-hal        = { path = "crates/caliper-hal", version = "0.1.0" }
 caliper-collision  = { path = "crates/caliper-collision", version = "0.1.0" }
 caliper-planning   = { path = "crates/caliper-planning", version = "0.1.0" }
 caliper-graph      = { path = "crates/caliper-graph", version = "0.1.0" }
+caliper-calib      = { path = "crates/caliper-calib", version = "0.1.0" }
 caliper            = { path = "crates/caliper", version = "0.1.0" }
 
 [profile.release]

@@ -44,6 +44,7 @@ export function GraphEditor() {
   const onEdgesChange = useStore((s) => s.onGraphEdgesChange);
   const onConnect = useStore((s) => s.onGraphConnect);
   const runGraph = useStore((s) => s.runGraph);
+  const runGraphLive = useStore((s) => s.runGraphLive);
   const validateGraph = useStore((s) => s.validateGraph);
   const banner = useStore((s) => s.graphBanner);
   const graphName = useStore((s) => s.graphName);
@@ -64,6 +65,14 @@ export function GraphEditor() {
       <div className="g-toolbar">
         <button className="g-run" disabled={!robot} onClick={() => void runGraph()}>
           ▶ Run
+        </button>
+        <button
+          className="g-run-live"
+          disabled={!robot}
+          title="Run, then stream the Scope traces in for a live feel (build-checked only)"
+          onClick={() => void runGraphLive()}
+        >
+          ⦿ Run Live
         </button>
         <button className="g-validate" disabled={!robot} onClick={() => void validateGraph()}>
           ✓ Validate

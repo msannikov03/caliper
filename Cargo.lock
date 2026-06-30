@@ -639,6 +639,7 @@ dependencies = [
 name = "caliper"
 version = "0.1.0"
 dependencies = [
+ "caliper-calib",
  "caliper-collision",
  "caliper-dynamics",
  "caliper-graph",
@@ -649,6 +650,17 @@ dependencies = [
  "caliper-motion",
  "caliper-planning",
  "caliper-spatial",
+]
+
+[[package]]
+name = "caliper-calib"
+version = "0.1.0"
+dependencies = [
+ "caliper-kinematics",
+ "caliper-model",
+ "caliper-spatial",
+ "nalgebra",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

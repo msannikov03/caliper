@@ -1,0 +1,19 @@
+[package]
+name = "caliper-calib"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+description = "Kinematic calibration: joint-offset (zero) estimation via damped Gauss-Newton"
+keywords = ["robotics", "calibration", "kinematics", "gauss-newton", "joint-offset"]
+categories = ["science::robotics", "mathematics"]
+
+[dependencies]
+caliper-spatial.workspace = true
+caliper-model.workspace = true
+caliper-kinematics.workspace = true
+nalgebra.workspace = true
+thiserror.workspace = true

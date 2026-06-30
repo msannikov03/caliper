@@ -449,6 +449,7 @@ function ScopeNode(p: NodeProps) {
   const update = useStore((s) => s.updateNodeParams);
   const robot = useStore((s) => s.robot);
   const series = useStore((s) => s.graphScopes.find((x) => x.nodeId === p.id));
+  const live = useStore((s) => s.graphLive);
   const signal = (d.params.signal as string) ?? "q0";
   const opts = signalOptions(robot?.ndof ?? 0);
   return (
@@ -468,7 +469,7 @@ function ScopeNode(p: NodeProps) {
         </select>
       </label>
       {series && series.t.length > 0 && series.signal === signal ? (
-        <ScopeChart t={series.t} y={series.y} label={signal} />
+        <ScopeChart t={series.t} y={series.y} label={signal} live={live} />
       ) : (
         <div className="gscope-empty">run to plot {signal}</div>
       )}

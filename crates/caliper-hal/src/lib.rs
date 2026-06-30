@@ -18,6 +18,7 @@ mod physics;
 mod safety;
 mod setpoint;
 mod sim;
+mod streaming;
 mod teleop;
 
 #[cfg(feature = "dataset")]
@@ -39,6 +40,8 @@ pub use recorder::{DatasetReader, DatasetSpec, Episode, Recorder, replay_frame};
 pub use backends::can_mks::{CanMksBackend, MksFrame};
 #[cfg(feature = "dynamixel")]
 pub use backends::dynamixel::DynamixelBackend;
+#[cfg(feature = "remote")]
+pub use backends::remote::{RemoteBackend, RemoteCmd};
 
 use caliper_dynamics::DynError;
 

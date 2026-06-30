@@ -164,6 +164,7 @@ interface StudioState {
   graphNodes: CNode[];
   graphEdges: CEdge[];
   graphScopes: GraphScope[]; // last run's extracted Scope series
+  graphLive: boolean; // when true, Scope charts stream the last run in (live feel)
   graphBanner: string | null; // red banner: cycles / type mismatch / run error
   graphSaved: string[]; // saved graph names (list_graphs)
   graphName: string;
@@ -175,6 +176,8 @@ interface StudioState {
   updateNodeParams: (id: string, patch: Record<string, unknown>) => void;
   setGraphName: (s: string) => void;
   runGraph: () => Promise<void>;
+  runGraphLive: () => Promise<void>; // same run, but stream the Scope series in
+  _execGraph: (live: boolean) => Promise<void>; // shared run impl (latest-wins)
   validateGraph: () => Promise<void>;
   saveGraph: (name: string) => Promise<void>;
   loadGraph: (name: string) => Promise<void>;
@@ -205,6 +208,7 @@ export const useStore = create<StudioState>((set, get) => ({
   graphNodes: [],
   graphEdges: [],
   graphScopes: [],
+  graphLive: false,
   graphBanner: null,
   graphSaved: [],
   graphName: "",
@@ -232,6 +236,7 @@ export const useStore = create<StudioState>((set, get) => ({
         graphNodes: [],
         graphEdges: [],
         graphScopes: [],
+        graphLive: false,
         graphBanner: null,
         graphName: "",
       });
@@ -574,13 +579,21 @@ export const useStore = create<StudioState>((set, get) => ({
   setGraphName(s) {
     set({ graphName: s });
   },
-  async runGraph() {
+  runGraph() {
+    return get()._execGraph(false);
+  },
+  runGraphLive() {
+    return get()._execGraph(true);
+  },
+  async _execGraph(live) {
     const robot = get().robot;
     if (!robot) return;
     const id = get()._graphRunId + 1;
     set({
       _graphRunId: id,
       graphBanner: null,
+      // clear any prior live state up-front so a new batch run renders statically
+      graphLive: false,
       graphNodes: get().graphNodes.map((n) => ({
         ...n,
         data: { ...n.data, status: "running" as NodeStatus, error: undefined },
@@ -593,6 +606,9 @@ export const useStore = create<StudioState>((set, get) => ({
       const ran = new Set(res.diagnostics?.topoOrder ?? []);
       set({
         graphScopes: res.scopes ?? [],
+        // flip live on AFTER scopes land so the charts mount with fresh data and
+        // their reveal effect re-runs in streaming mode
+        graphLive: live && (res.scopes?.length ?? 0) > 0,
         graphNodes: get().graphNodes.map((n) => ({
           ...n,
           data: {
@@ -664,6 +680,7 @@ export const useStore = create<StudioState>((set, get) => ({
         graphEdges: colored,
         graphName: parsed.name || name,
         graphScopes: [],
+        graphLive: false,
         graphBanner: null,
       });
     } catch (e) {

@@ -204,6 +204,64 @@ impl Robot {
         Ok(d.into())
     }
 
+    /// Closed-form (analytic) inverse kinematics for a canonical spherical-wrist
+    /// 6R arm. `target` is a 4×4 COLUMN-MAJOR homogeneous matrix (same convention
+    /// as `ik()`: `target[col][row]`; the rotation block is projected onto SO(3)).
+    /// `seed` (optional, length ndof) places the branch nearest the seed first.
+    /// Returns `None` when the model is NOT a recognised spherical-wrist 6R (fall
+    /// back to the numeric `ik()`); otherwise the list of branch configs (each
+    /// length ndof, seed-nearest first), or `[]` when recognised-but-unreachable.
+    #[pyo3(signature = (target, seed=None, frame=None))]
+    fn analytic_ik(
+        &self,
+        target: Vec<Vec<f64>>,
+        seed: Option<Vec<f64>>,
+        frame: Option<&str>,
+    ) -> PyResult<Option<Vec<Vec<f64>>>> {
+        let model = &self.inner.model;
+        if target.len() != 4 || target.iter().any(|c| c.len() != 4) {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "target must be a 4x4 column-major matrix (4 columns of length 4)",
+            ));
+        }
+        for col in &target {
+            finite_or_err("target", col)?;
+        }
+        if let Some(s) = &seed {
+            if s.len() != model.ndof {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "seed has length {}, expected ndof={}",
+                    s.len(),
+                    model.ndof
+                )));
+            }
+            finite_or_err("seed", s)?;
+        }
+        let f = resolve_frame(model, frame)?;
+        // column-major: target[col][row]
+        let rot = Matrix3::new(
+            target[0][0],
+            target[1][0],
+            target[2][0],
+            target[0][1],
+            target[1][1],
+            target[2][1],
+            target[0][2],
+            target[1][2],
+            target[2][2],
+        );
+        let trans = Vector3::new(target[3][0], target[3][1], target[3][2]);
+        // from_matrix projects onto SO(3), matching the ik()/Studio path.
+        let quat = UnitQuaternion::from_matrix(&rot);
+        let target_se3 = Se3::from_parts(trans, quat);
+        Ok(caliper::ik::analytic_ik_6r(
+            model,
+            f,
+            &target_se3,
+            seed.as_deref(),
+        ))
+    }
+
     /// Singularity analysis at `q` (World / LOCAL_WORLD_ALIGNED). Dict with every
     /// SingularityReport field. `kind` is lowercase: "none"|"wrist"|"elbow"|"boundary".
     #[pyo3(signature = (q, frame=None))]
@@ -1254,6 +1312,22 @@ impl Planner {
         finite_or_err("goal", &goal)?;
         self.inner.plan(&start, &goal).map_err(plan_err)
     }
+    /// Plan an asymptotically-optimal (RRT*) collision-free, shortcut-smoothed
+    /// joint-space waypoint path from `start` to `goal` within `iters` samples.
+    /// Like `plan()` but converges toward shorter paths with more iterations;
+    /// deterministic for a given seed/iters.
+    fn plan_optimal(
+        &self,
+        start: Vec<f64>,
+        goal: Vec<f64>,
+        iters: usize,
+    ) -> PyResult<Vec<Vec<f64>>> {
+        finite_or_err("start", &start)?;
+        finite_or_err("goal", &goal)?;
+        self.inner
+            .plan_optimal(&start, &goal, iters)
+            .map_err(plan_err)
+    }
     /// Plan to a Cartesian goal pose (12 numbers); `frame` index defaults to tip.
     #[pyo3(signature = (start, target, frame=None))]
     fn plan_to_pose(
@@ -1530,6 +1604,66 @@ fn exp6(twist: Vec<f64>) -> PyResult<Vec<Vec<f64>>> {
     ])
 }
 
+// ===== Kinematic calibration (module function) =====
+
+/// Estimate per-joint zero offsets `δ` so that `FK(qₖ + δ) ≈ Tₖ` for every
+/// observation, by damped Gauss–Newton. `observations` is a list of
+/// `(q, pose)` pairs, where `q` is a length-ndof configuration and `pose` is a
+/// 4×4 COLUMN-MAJOR homogeneous matrix (same convention as `Robot.ik()`:
+/// `pose[col][row]`; rotation projected onto SO(3)). `frame` is the measured
+/// frame name (default = tip frame). Returns a dict
+/// `{offsets, rms_residual, iters, converged}`.
+#[pyfunction]
+#[pyo3(signature = (robot, observations, frame=None, max_iters=50, lambda=1e-9, tol_step=1e-12, tol_residual=1e-12))]
+#[allow(clippy::too_many_arguments)]
+fn calibrate_joint_offsets(
+    py: Python<'_>,
+    robot: &Robot,
+    observations: Vec<(Vec<f64>, Vec<Vec<f64>>)>,
+    frame: Option<&str>,
+    max_iters: usize,
+    lambda: f64,
+    tol_step: f64,
+    tol_residual: f64,
+) -> PyResult<Py<PyDict>> {
+    let model = &robot.inner.model;
+    let f = resolve_frame(model, frame)?;
+    let mut obs: Vec<(Vec<f64>, Se3)> = Vec::with_capacity(observations.len());
+    for (i, (q, pose)) in observations.into_iter().enumerate() {
+        finite_or_err("observation q", &q)?;
+        if pose.len() != 4 || pose.iter().any(|c| c.len() != 4) {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "observation {i}: pose must be a 4x4 column-major matrix (4 columns of length 4)"
+            )));
+        }
+        for col in &pose {
+            finite_or_err("observation pose", col)?;
+        }
+        // column-major: pose[col][row]
+        let rot = Matrix3::new(
+            pose[0][0], pose[1][0], pose[2][0], pose[0][1], pose[1][1], pose[2][1], pose[0][2],
+            pose[1][2], pose[2][2],
+        );
+        let trans = Vector3::new(pose[3][0], pose[3][1], pose[3][2]);
+        let se3 = Se3::from_parts(trans, UnitQuaternion::from_matrix(&rot));
+        obs.push((q, se3));
+    }
+    let opts = caliper::calib::CalibOptions {
+        max_iters,
+        lambda,
+        tol_step,
+        tol_residual,
+    };
+    let res = caliper::calib::calibrate_joint_offsets(model, f, &obs, opts)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+    let d = PyDict::new(py);
+    d.set_item("offsets", res.offsets)?;
+    d.set_item("rms_residual", res.rms_residual)?;
+    d.set_item("iters", res.iters)?;
+    d.set_item("converged", res.converged)?;
+    Ok(d.into())
+}
+
 #[pymodule]
 fn _caliper(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", caliper::VERSION)?;
@@ -1538,6 +1672,7 @@ fn _caliper(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(validate_graph, m)?)?;
     m.add_function(wrap_pyfunction!(log6, m)?)?;
     m.add_function(wrap_pyfunction!(exp6, m)?)?;
+    m.add_function(wrap_pyfunction!(calibrate_joint_offsets, m)?)?;
     m.add_class::<Robot>()?;
     m.add_class::<Trajectory>()?;
     m.add_class::<MotionLimits>()?;

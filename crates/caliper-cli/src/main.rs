@@ -1,11 +1,12 @@
 //! `caliper` — the command-line face of the engine.
+use caliper::calib::{CalibOptions, calibrate_joint_offsets};
 use caliper::dynamics::{self, GRAVITY_EARTH, Simulator};
 use caliper::hal::{
     ControlLoop, DatasetReader, DatasetSpec, Gains, HoldSetpoint, JointMap, LeaderFollowerSource,
     PhysicsSimBackend, Recorder, RobotBackend, SimBackend, replay_frame,
 };
-use caliper::ik::{IkOpts, ik};
-use caliper::kinematics::{JacFrame, Jacobian, SingularityParams, jacobian};
+use caliper::ik::{IkOpts, analytic_ik_6r, ik};
+use caliper::kinematics::{JacFrame, Jacobian, SingularityParams, fk_frame, jacobian};
 use caliper::motion::{CartesianMoveOpts, MotionLimits, MotionLimitsConfig, move_j, move_l};
 use caliper::planning::path_length;
 use caliper::planning::reach::{ReachChecker, ReachConfig, ReachStatus};
@@ -13,7 +14,7 @@ use caliper::planning::{Planner, PlannerConfig};
 use caliper::spatial::Se3;
 use caliper_collision::{CollisionModel, WorldScene};
 use clap::{Parser, Subcommand};
-use nalgebra::{Matrix3, UnitQuaternion, Vector3};
+use nalgebra::{Matrix3, Matrix4, UnitQuaternion, Vector3};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -59,6 +60,10 @@ enum Cmd {
         /// Optional frame name; defaults to the tip frame.
         #[arg(long)]
         frame: Option<String>,
+        /// Use the closed-form analytic solver (spherical-wrist 6R only); falls
+        /// back with a clear notice + non-zero exit if the model is not 6R.
+        #[arg(long)]
+        analytic: bool,
     },
     /// Singularity / manipulability analysis at a configuration.
     Analyze {
@@ -208,6 +213,45 @@ enum Cmd {
         /// Frame for a Cartesian --target; defaults to the tip frame.
         #[arg(long)]
         frame: Option<String>,
+        /// Use the asymptotically-optimal RRT* planner instead of RRT-Connect.
+        /// Joint-space --goal only (not Cartesian --target).
+        #[arg(long)]
+        optimal: bool,
+        /// RRT* sample budget (only with --optimal).
+        #[arg(long, default_value_t = 4000)]
+        iters: usize,
+    },
+    /// Calibrate joint-zero offsets from measured tip poses (kinematic calibration).
+    ///
+    /// Observations JSON schema (--observations <file.json>):
+    ///   {"observations": [
+    ///     {"q": [j0, j1, ...],            // commanded config, length = ndof
+    ///      "pose": [16 numbers]},         // measured tip pose, 4x4 COLUMN-MAJOR
+    ///     {"q": [...],
+    ///      "pose": [[r00,r01,r02,tx],     // OR a 4x4 nested (row-major) homogeneous
+    ///               [r10,r11,r12,ty],     //    matrix
+    ///               [r20,r21,r22,tz],
+    ///               [0,0,0,1]]}
+    ///   ]}
+    /// Each `pose` is FK(q + delta) for the unknown true offset `delta`; the solver
+    /// recovers `delta` so that FK(q + delta) matches every measured pose.
+    ///
+    /// --self-test synthesizes observations from a known --offset via FK, so the
+    /// command is runnable headlessly and demonstrates exact offset recovery.
+    Calibrate {
+        urdf: PathBuf,
+        /// Measured frame; defaults to the tip frame.
+        #[arg(long)]
+        frame: Option<String>,
+        /// Observations JSON file (schema above). Mutually exclusive with --self-test.
+        #[arg(long)]
+        observations: Option<PathBuf>,
+        /// Synthesize observations from FK with a known offset (headless demo).
+        #[arg(long)]
+        self_test: bool,
+        /// True offset for --self-test (length = ndof). Defaults to a small canned offset.
+        #[arg(long, value_delimiter = ',', allow_hyphen_values = true)]
+        offset: Option<Vec<f64>>,
     },
     /// Collision-aware reachability of a Cartesian pose (Phase 6).
     Reach {
@@ -309,6 +353,7 @@ fn main() -> anyhow::Result<()> {
             target,
             seed,
             frame,
+            analytic,
         } => {
             let robot = caliper::model::Robot::from_urdf(&urdf)?;
             let m = &robot.model;
@@ -336,14 +381,46 @@ fn main() -> anyhow::Result<()> {
             // from_matrix projects onto SO(3) (the supplied basis may be non-orthonormal).
             let quat = UnitQuaternion::from_matrix(&rot);
             let target_se3 = Se3::from_parts(trans, quat);
-            let res = ik(m, f, &target_se3, &seed, &IkOpts::default());
             let tip = m.frame_name(f);
-            println!("IK '{}' -> frame '{}'", robot.name, tip);
-            println!("  success : {}", res.success);
-            println!("  iters   : {} (restarts {})", res.iters, res.restarts_used);
-            println!("  residual: {:.6e}", res.residual);
-            let qs: Vec<String> = res.q.iter().map(|v| format!("{v:.6}")).collect();
-            println!("  q       : [{}]", qs.join(", "));
+            if analytic {
+                match analytic_ik_6r(m, f, &target_se3, Some(seed.as_slice())) {
+                    None => {
+                        eprintln!(
+                            "IK (analytic) '{}' -> frame '{tip}': model is NOT a spherical-wrist 6R",
+                            robot.name
+                        );
+                        eprintln!("  in the canonical alignment the closed form needs;");
+                        eprintln!("  rerun without --analytic to use the numeric IK solver.");
+                        std::process::exit(2);
+                    }
+                    Some(branches) if branches.is_empty() => {
+                        eprintln!("IK (analytic) '{}' -> frame '{tip}'", robot.name);
+                        eprintln!(
+                            "  recognised spherical-wrist 6R, but the pose is UNREACHABLE (0 branches)"
+                        );
+                        std::process::exit(1);
+                    }
+                    Some(branches) => {
+                        // `seed` was given, so branches[0] is the seed-nearest solution.
+                        let best = &branches[0];
+                        let ee = fk_frame(m, best, f);
+                        let residual = ee.inverse().compose(&target_se3).log().0.norm();
+                        println!("IK (analytic) '{}' -> frame '{tip}'", robot.name);
+                        println!("  branches: {}", branches.len());
+                        let qs: Vec<String> = best.iter().map(|v| format!("{v:.6}")).collect();
+                        println!("  q (seed-nearest): [{}]", qs.join(", "));
+                        println!("  FK residual     : {residual:.6e}");
+                    }
+                }
+            } else {
+                let res = ik(m, f, &target_se3, &seed, &IkOpts::default());
+                println!("IK '{}' -> frame '{}'", robot.name, tip);
+                println!("  success : {}", res.success);
+                println!("  iters   : {} (restarts {})", res.iters, res.restarts_used);
+                println!("  residual: {:.6e}", res.residual);
+                let qs: Vec<String> = res.q.iter().map(|v| format!("{v:.6}")).collect();
+                println!("  q       : [{}]", qs.join(", "));
+            }
         }
         Cmd::Analyze {
             urdf,
@@ -848,6 +925,8 @@ fn main() -> anyhow::Result<()> {
             obstacle,
             seed,
             frame,
+            optimal,
+            iters,
         } => {
             let robot = caliper::model::Robot::from_urdf(&urdf)?;
             let m = &robot.model;
@@ -874,8 +953,17 @@ fn main() -> anyhow::Result<()> {
                     goal.iter().all(|x| x.is_finite()),
                     "--goal contains a non-finite value"
                 );
-                planner.plan(&start, &goal)?
+                if optimal {
+                    anyhow::ensure!(iters > 0, "--iters must be > 0");
+                    planner.plan_optimal(&start, &goal, iters)?
+                } else {
+                    planner.plan(&start, &goal)?
+                }
             } else {
+                anyhow::ensure!(
+                    !optimal,
+                    "--optimal supports only joint-space --goal, not Cartesian --target"
+                );
                 let t = target.unwrap();
                 let goal_se3 = target_to_se3(&t)?;
                 let f = resolve_frame(m, &frame)?;
@@ -883,6 +971,14 @@ fn main() -> anyhow::Result<()> {
             };
             let free = planner.verify_path(&path);
             println!("PLAN '{}'  seed={seed}", robot.name);
+            println!(
+                "  planner     : {}",
+                if optimal {
+                    format!("RRT* (optimal, iters={iters})")
+                } else {
+                    "RRT-Connect".to_string()
+                }
+            );
             println!("  waypoints   : {}", path.len());
             println!("  path length : {:.4} rad", path_length(&path));
             if planner.uncovered_frames() > 0 {
@@ -895,6 +991,62 @@ fn main() -> anyhow::Result<()> {
                 "  collision-free (re-verified): {}",
                 if free { "PASS" } else { "FAIL" }
             );
+        }
+        Cmd::Calibrate {
+            urdf,
+            frame,
+            observations,
+            self_test,
+            offset,
+        } => {
+            let robot = caliper::model::Robot::from_urdf(&urdf)?;
+            let m = &robot.model;
+            let f = resolve_frame(m, &frame)?;
+            anyhow::ensure!(
+                observations.is_some() ^ self_test,
+                "pass exactly one of --observations <file.json> / --self-test"
+            );
+            let (obs, truth) = if self_test {
+                let truth = match offset {
+                    Some(o) => {
+                        anyhow::ensure!(o.len() == m.ndof, "--offset needs {} values", m.ndof);
+                        anyhow::ensure!(
+                            o.iter().all(|x| x.is_finite()),
+                            "--offset contains a non-finite value"
+                        );
+                        o
+                    }
+                    None => default_offset(m.ndof),
+                };
+                (synth_observations(m, f, &truth), Some(truth))
+            } else {
+                anyhow::ensure!(
+                    offset.is_none(),
+                    "--offset only applies to --self-test (it is the synthesized true offset)"
+                );
+                let path = observations.unwrap();
+                (load_observations(&path, m.ndof)?, None)
+            };
+            let res = calibrate_joint_offsets(m, f, &obs, CalibOptions::default())?;
+            println!("CALIBRATE '{}' -> frame '{}'", robot.name, m.frame_name(f));
+            println!("  observations: {}", obs.len());
+            println!("  offsets     : [{}]", fmt6(&res.offsets));
+            println!("  rms_residual: {:.6e}", res.rms_residual);
+            println!("  iters       : {}", res.iters);
+            println!("  converged   : {}", res.converged);
+            if let Some(truth) = truth {
+                let err = res
+                    .offsets
+                    .iter()
+                    .zip(&truth)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0, f64::max);
+                println!("  true offset : [{}]", fmt6(&truth));
+                println!(
+                    "  max|recovered - true| = {err:.3e}  ->  {}",
+                    if err < 1e-6 { "PASS" } else { "FAIL" }
+                );
+            }
         }
         Cmd::Reach {
             urdf,
@@ -1083,4 +1235,138 @@ fn fmt_vec(v: &[f64]) -> String {
         .map(|x| format!("{x:.4}"))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// Format a vector at 6 decimals (calibration offsets are small).
+fn fmt6(v: &[f64]) -> String {
+    v.iter()
+        .map(|x| format!("{x:.6}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// A small deterministic canned offset of length `n`, used when `--self-test` is run
+/// without an explicit `--offset`. Magnitudes stay small so FK stays well-conditioned.
+fn default_offset(n: usize) -> Vec<f64> {
+    (0..n)
+        .map(|i| {
+            let sign = if i % 2 == 0 { 1.0 } else { -1.0 };
+            sign * 0.05 * (1.0 + 0.4 * i as f64)
+        })
+        .collect()
+}
+
+/// Synthesize calibration observations `Tₖ = FK(qₖ + truth)` for deterministic random
+/// configs, mirroring the crate's own self-test so `--self-test` demonstrates exact
+/// offset recovery headlessly. Deterministic splitmix64 PRNG (repo style, no `rand`).
+fn synth_observations(
+    model: &caliper::model::Model,
+    frame: usize,
+    truth: &[f64],
+) -> Vec<(Vec<f64>, Se3)> {
+    let mut state: u64 = 0xCA11_BACE_D1FF_0001;
+    let mut next_u64 = || {
+        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    };
+    (0..16)
+        .map(|_| {
+            let q: Vec<f64> = (0..model.ndof)
+                .map(|_| {
+                    let u = (next_u64() >> 11) as f64 / (1u64 << 53) as f64;
+                    -1.0 + 2.0 * u
+                })
+                .collect();
+            let phi: Vec<f64> = q.iter().zip(truth).map(|(a, b)| a + b).collect();
+            let t = fk_frame(model, &phi, frame);
+            (q, t)
+        })
+        .collect()
+}
+
+/// Load + validate calibration observations from a JSON file (schema documented on the
+/// `calibrate` subcommand). Each `pose` may be 16 column-major numbers or a 4x4 nested
+/// row-major homogeneous matrix.
+fn load_observations(path: &std::path::Path, ndof: usize) -> anyhow::Result<Vec<(Vec<f64>, Se3)>> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| anyhow::anyhow!("failed to read observations `{}`: {e}", path.display()))?;
+    let v: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| anyhow::anyhow!("failed to parse observations `{}`: {e}", path.display()))?;
+    let arr = v
+        .get("observations")
+        .and_then(|x| x.as_array())
+        .ok_or_else(|| anyhow::anyhow!("observations JSON must have an `observations` array"))?;
+    anyhow::ensure!(!arr.is_empty(), "observations array is empty");
+    let mut out = Vec::with_capacity(arr.len());
+    for (i, o) in arr.iter().enumerate() {
+        let q = o
+            .get("q")
+            .and_then(|x| x.as_array())
+            .ok_or_else(|| anyhow::anyhow!("observation {i}: missing `q` array"))?;
+        let q: Vec<f64> = q
+            .iter()
+            .map(|n| {
+                n.as_f64()
+                    .ok_or_else(|| anyhow::anyhow!("observation {i}: `q` has a non-number"))
+            })
+            .collect::<anyhow::Result<_>>()?;
+        anyhow::ensure!(
+            q.len() == ndof,
+            "observation {i}: q has {} value(s), expected ndof = {ndof}",
+            q.len()
+        );
+        anyhow::ensure!(
+            q.iter().all(|x| x.is_finite()),
+            "observation {i}: q contains a non-finite value"
+        );
+        let pose = o
+            .get("pose")
+            .ok_or_else(|| anyhow::anyhow!("observation {i}: missing `pose`"))?;
+        let se3 = parse_pose(pose).map_err(|e| anyhow::anyhow!("observation {i}: {e}"))?;
+        out.push((q, se3));
+    }
+    Ok(out)
+}
+
+/// Parse a 4x4 homogeneous transform from JSON: either 16 column-major numbers or a
+/// 4x4 nested (row-major) array. The rotation block is re-projected onto SO(3).
+fn parse_pose(v: &serde_json::Value) -> anyhow::Result<Se3> {
+    let arr = v.as_array().ok_or_else(|| {
+        anyhow::anyhow!("`pose` must be an array (16 column-major numbers or a 4x4 nested matrix)")
+    })?;
+    let h: Matrix4<f64> = if arr.len() == 16 {
+        let mut m = [0.0_f64; 16];
+        for (k, e) in arr.iter().enumerate() {
+            m[k] = e
+                .as_f64()
+                .ok_or_else(|| anyhow::anyhow!("`pose` has a non-number element"))?;
+        }
+        Matrix4::from_column_slice(&m)
+    } else if arr.len() == 4 {
+        let mut m = Matrix4::zeros();
+        for (r, row) in arr.iter().enumerate() {
+            let row = row
+                .as_array()
+                .ok_or_else(|| anyhow::anyhow!("`pose` 4x4: row {r} is not an array"))?;
+            anyhow::ensure!(row.len() == 4, "`pose` 4x4: row {r} needs 4 numbers");
+            for (c, e) in row.iter().enumerate() {
+                m[(r, c)] = e
+                    .as_f64()
+                    .ok_or_else(|| anyhow::anyhow!("`pose` 4x4: row {r} has a non-number"))?;
+            }
+        }
+        m
+    } else {
+        anyhow::bail!("`pose` must be 16 column-major numbers or a 4x4 nested array");
+    };
+    anyhow::ensure!(
+        h.iter().all(|x| x.is_finite()),
+        "`pose` contains a non-finite value"
+    );
+    let rot = h.fixed_view::<3, 3>(0, 0).into_owned();
+    let trans = Vector3::new(h[(0, 3)], h[(1, 3)], h[(2, 3)]);
+    Ok(Se3::from_parts(trans, UnitQuaternion::from_matrix(&rot)))
 }

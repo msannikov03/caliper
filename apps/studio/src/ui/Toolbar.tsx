@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useStore } from "../store";
+import "./panels.css";
 
 export function Toolbar({ version }: { version: string }) {
   const loadRobot = useStore((s) => s.loadRobot);

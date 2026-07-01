@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
-import { ReactFlow, Background, Controls, MiniMap } from "@xyflow/react";
+import { ReactFlow, Background, BackgroundVariant, Controls, MiniMap } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
+import "./graph.css";
 import { useStore } from "../store";
 import { nodeTypes } from "./nodes";
 import { KIND_ORDER, NODE_SPECS } from "./spec";
@@ -126,9 +127,21 @@ export function GraphEditor() {
           defaultEdgeOptions={{ animated: false }}
           proOptions={{ hideAttribution: false }}
         >
-          <Background gap={18} color="#1b1b22" />
+          <Background
+            variant={BackgroundVariant.Dots}
+            gap={22}
+            size={1}
+            color="rgba(255,255,255,0.06)"
+          />
           <Controls showInteractive={false} />
-          <MiniMap pannable zoomable nodeColor="#26262f" maskColor="rgba(10,10,12,0.6)" />
+          <MiniMap
+            pannable
+            zoomable
+            bgColor="#0b0d10"
+            nodeColor="#22262e"
+            nodeStrokeColor="rgba(255,255,255,0.12)"
+            maskColor="rgba(11,13,16,0.66)"
+          />
         </ReactFlow>
       </div>
     </div>

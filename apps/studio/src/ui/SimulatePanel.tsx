@@ -1,4 +1,5 @@
 import { useStore } from "../store";
+import "./panels.css";
 
 export function SimulatePanel() {
   const mode = useStore((s) => s.mode);

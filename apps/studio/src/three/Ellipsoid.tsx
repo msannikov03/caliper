@@ -1,9 +1,18 @@
 import { useLayoutEffect, useMemo, useRef } from "react";
 import * as THREE from "three";
 import { useStore } from "../store";
-import { severity, rampColor } from "../sevColor";
+import { severity } from "../sevColor";
 
 const GAIN = 0.12; // cosmetic: σ (m/rad·m) -> scene metres. Single-robot view only.
+
+// Direction A · Instrument semantic palette (good → warn → singular). three.js
+// needs literal hex, so the token values are inlined here (same thresholds as
+// sevColor.rampColor; colours tuned to the lookbook tokens).
+function rampHex(f: number): string {
+  if (f >= 0.66) return "#3DD68C"; // good — well-conditioned
+  if (f >= 0.33) return "#F5B759"; // warn — approaching
+  return "#FF5C6C"; // singular — rank-deficient
+}
 
 export function Ellipsoid() {
   const report = useStore((s) => s.report);
@@ -27,18 +36,18 @@ export function Ellipsoid() {
 
   if (!report) return null;
   const f = severity(report.sigmaMin, report.epsActivate);
-  const c = rampColor(f);
+  const c = rampHex(f);
   return (
     <mesh ref={ref} matrixAutoUpdate={false} renderOrder={2}>
       <sphereGeometry args={[1, 48, 32]} />
       <meshStandardMaterial
         color={c}
         transparent
-        opacity={0.28}
+        opacity={0.26}
         depthWrite={false}
         emissive={c}
-        emissiveIntensity={0.15}
-        roughness={0.5}
+        emissiveIntensity={0.18}
+        roughness={0.45}
         metalness={0}
       />
     </mesh>

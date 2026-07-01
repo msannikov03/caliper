@@ -46,23 +46,29 @@ export function ScopeChart({
       scales: { x: { time: false } },
       axes: [
         {
-          stroke: "#6c6c7a",
-          grid: { stroke: "#1b1b22", width: 1 },
-          ticks: { stroke: "#1b1b22", width: 1 },
-          font: "9px Inter, sans-serif",
+          stroke: "#8a9099",
+          grid: { stroke: "rgba(255,255,255,0.05)", width: 1 },
+          ticks: { stroke: "rgba(255,255,255,0.08)", width: 1 },
+          font: "9px 'JetBrains Mono', ui-monospace, monospace",
           size: 22,
         },
         {
-          stroke: "#6c6c7a",
-          grid: { stroke: "#1b1b22", width: 1 },
-          ticks: { stroke: "#1b1b22", width: 1 },
-          font: "9px Inter, sans-serif",
+          stroke: "#8a9099",
+          grid: { stroke: "rgba(255,255,255,0.05)", width: 1 },
+          ticks: { stroke: "rgba(255,255,255,0.08)", width: 1 },
+          font: "9px 'JetBrains Mono', ui-monospace, monospace",
           size: 34,
         },
       ],
       series: [
         {},
-        { label: labelRef.current, stroke: "#36c6d4", width: 1.5, points: { show: false } },
+        {
+          label: labelRef.current,
+          stroke: "#7c82ff",
+          fill: "rgba(124,130,255,0.10)",
+          width: 1.5,
+          points: { show: false },
+        },
       ],
     };
     plot.current = new uPlot(opts, [t, y] as uPlot.AlignedData, host.current);

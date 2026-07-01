@@ -1,0 +1,98 @@
+/* ============================================================
+   CALIPER STUDIO — DESIGN TOKENS · DIRECTION A · "INSTRUMENT"
+   A calm precision instrument for robots.
+   Copied verbatim from the lookbook :root + base.
+   ============================================================ */
+
+:root {
+  /* --- base + surfaces --- */
+  --base: #0b0d10; /* cool near-black */
+  --surface: #13161b; /* floating panel */
+  --raised: #1b1f26; /* raised card    */
+  --raised-2: #22262e; /* control track  */
+  --border: rgba(255, 255, 255, 0.07);
+  --border-2: rgba(255, 255, 255, 0.12);
+  --hairline: rgba(255, 255, 255, 0.045);
+
+  /* --- text --- */
+  --text: #e6e8ec;
+  --muted: #8a9099;
+  --faint: #565c66;
+
+  /* --- accent --- */
+  --accent: #7c82ff; /* indigo-violet, active/primary ONLY */
+  --accent-dim: #5157cc;
+  --accent-glow: rgba(124, 130, 255, 0.28);
+
+  /* --- semantic HUD (singularity proximity) --- */
+  --good: #3dd68c;
+  --warn: #f5b759;
+  --singular: #ff5c6c;
+
+  /* --- axis triad (robotics-true: x=red y=green z=blue) --- */
+  --ax-x: #ff6470;
+  --ax-y: #56d98c;
+  --ax-z: #6e9bff;
+
+  /* --- type --- */
+  --ui: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+
+  /* --- radius --- */
+  --r-sm: 4px;
+  --r: 6px;
+  --r-lg: 8px;
+
+  /* --- elevation --- */
+  --e1: 0 1px 2px rgba(0, 0, 0, 0.4);
+  --e2:
+    0 8px 24px -8px rgba(0, 0, 0, 0.6), 0 1px 0 rgba(255, 255, 255, 0.04) inset;
+  --e3:
+    0 20px 60px -16px rgba(0, 0, 0, 0.75),
+    0 1px 0 rgba(255, 255, 255, 0.05) inset;
+
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  margin: 0;
+  height: 100%;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  background: var(--base);
+  color: var(--text);
+  font-family: var(--ui);
+  font-size: 15px;
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+  letter-spacing: -0.006em;
+  overflow: hidden;
+}
+
+::selection {
+  background: var(--accent-glow);
+  color: #fff;
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+/* mono is the universal helper for ALL numerics + small uppercase labels */
+.mono {
+  font-family: var(--mono);
+  font-feature-settings: "tnum" 1, "zero" 1;
+  font-variant-numeric: tabular-nums;
+}

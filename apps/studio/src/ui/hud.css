@@ -1,0 +1,82 @@
+/* ============================================================
+   HUD component styling — Direction A · Instrument
+   Co-located styles for SingularityHud / Hud (the tip readout).
+   Reuses the global .hud-card / .metric / .gauge / .eyebrow / .mono
+   vocabulary from App.css; adds only the pieces unique to these two
+   floating readouts (the singularity card frame + ellipsoid mini-viz).
+   ============================================================ */
+
+/* --- singularity HUD: floating instrument card, top-left over viewport --- */
+.sing-hud {
+  position: absolute;
+  top: 16px;
+  left: 16px;
+  z-index: 4;
+  width: 262px;
+  pointer-events: none; /* informational — orbit the viewport through it */
+}
+
+.sing-hud .h-status .led {
+  transition: background 0.12s linear, box-shadow 0.12s linear;
+}
+
+/* manipulability ellipsoid mini-viz + metric column */
+.sing-hud .ellipse-wrap {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+.sing-hud .ellipse-box {
+  width: 104px;
+  height: 104px;
+  flex: none;
+  border: 1px solid var(--hairline);
+  border-radius: var(--r);
+  background: radial-gradient(circle at 50% 50%, #14181e, #0d0f13);
+  position: relative;
+  overflow: hidden;
+}
+.sing-hud .ellipse-box svg {
+  display: block;
+}
+.sing-hud .ellipse-box ellipse,
+.sing-hud .ellipse-box line {
+  transition: rx 0.1s linear, ry 0.1s linear, stroke 0.12s linear, fill 0.12s linear;
+}
+.sing-hud .ell-metrics {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.sing-hud .gauge .needle {
+  transition: left 0.1s linear;
+}
+
+/* --- tip / IK readout (bottom-left): tighten the retargeted .hud --- */
+.hud {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.hud .tip-name {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text);
+  letter-spacing: -0.005em;
+}
+.hud .eyebrow {
+  margin-bottom: 1px;
+}
+.hud .ik {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--muted);
+  margin-top: 1px;
+}
+.hud.err {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}

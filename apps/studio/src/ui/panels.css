@@ -1,0 +1,86 @@
+/* ============================================================
+   panels.css — component-local styling for the Instrument
+   control panels (JointPanel / Toolbar / PosePanel /
+   SimulatePanel / Transport).
+
+   The global vocabulary (.joint / .joint-panel / .transport /
+   .pose-panel / .sim-panel / .float / .btn / .eyebrow …) lives
+   in App.css and tokens.css. This file only adds what that
+   vocabulary does not cover: the interactive range control that
+   drives the hairline joint track, and a couple of active-state
+   refinements. Nothing here redefines a global rule.
+   ============================================================ */
+
+/* --- joint panel header sub-line (rad · robot) --- */
+.joint-panel .jp-sub {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--faint);
+  letter-spacing: 0.02em;
+  margin: -8px 0 12px;
+}
+
+/* the active joint's readout picks up the accent, matching the lookbook */
+.joint.active .j-read {
+  color: var(--accent);
+}
+
+/* --- interactive slider laid transparently over the visual track ---
+   The .j-fill / .j-knob render the value; this native range sits on
+   top (invisible) purely to capture click + drag and dispatch setJoint. */
+.joint .j-track {
+  touch-action: none;
+}
+.joint .j-track input[type="range"] {
+  position: absolute;
+  left: 0;
+  top: -7px;
+  width: 100%;
+  height: calc(100% + 14px);
+  margin: 0;
+  padding: 0;
+  background: transparent;
+  cursor: pointer;
+  -webkit-appearance: none;
+  appearance: none;
+  accent-color: var(--accent);
+}
+.joint .j-track input[type="range"]:disabled {
+  cursor: default;
+}
+.joint .j-track input[type="range"]:focus-visible {
+  outline: none;
+}
+/* transparent native thumb (the styled .j-knob is what the user sees),
+   but keep it wide so the whole knob area is grabbable */
+.joint .j-track input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: transparent;
+  border: none;
+}
+.joint .j-track input[type="range"]::-moz-range-thumb {
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: transparent;
+  border: none;
+}
+.joint .j-track input[type="range"]::-webkit-slider-runnable-track {
+  background: transparent;
+}
+.joint .j-track input[type="range"]::-moz-range-track {
+  background: transparent;
+}
+/* subtle focus ring on the whole track when the slider is keyboard-focused */
+.joint .j-track:has(input:focus-visible) {
+  box-shadow: 0 0 0 3px var(--accent-glow);
+}
+
+/* --- transport: give the play glyph crisp centering --- */
+.transport button svg {
+  display: block;
+}

@@ -1,4 +1,5 @@
 import { useStore } from "../store";
+import "./hud.css";
 
 export function Hud() {
   const robot = useStore((s) => s.robot);
@@ -7,8 +8,19 @@ export function Hud() {
   const res = useStore((s) => s.ikResidual);
   const error = useStore((s) => s.error);
 
-  if (error) return <div className="hud err">error: {error}</div>;
-  if (!robot) return <div className="hud">loading robot…</div>;
+  if (error)
+    return (
+      <div className="hud err">
+        <span className="eyebrow">Error</span>
+        <div className="mono">{error}</div>
+      </div>
+    );
+  if (!robot)
+    return (
+      <div className="hud">
+        <span className="eyebrow">Loading robot…</span>
+      </div>
+    );
 
   const tip = frames[robot.tip];
   const pos = tip ? [tip[12], tip[13], tip[14]] : [0, 0, 0];
@@ -16,12 +28,9 @@ export function Hud() {
 
   return (
     <div className="hud">
-      <div>
-        tip <b>{tipName}</b>
-      </div>
-      <div className="mono">
-        xyz {pos.map((p) => p.toFixed(3)).join("  ")}
-      </div>
+      <span className="eyebrow">Tool center point</span>
+      <div className="tip-name">{tipName}</div>
+      <div className="mono">xyz {pos.map((p) => p.toFixed(3)).join("  ")}</div>
       <div className={`ik ${ikOk ? "ok" : ikOk === false ? "fail" : ""}`}>
         {ikOk == null
           ? "drag the tip gizmo to solve IK"

@@ -35,6 +35,7 @@ jobs:
         with:
           node-version: 22
       - run: npm --prefix apps/studio ci
+      - run: npm --prefix apps/studio run test
       - run: npm --prefix apps/studio run build
       - run: cargo build -p studio
 

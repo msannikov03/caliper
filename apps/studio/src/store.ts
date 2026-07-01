@@ -101,7 +101,7 @@ export interface NamedPoseDto {
   q: number[];
 }
 
-interface StudioState {
+export interface StudioState {
   // robot + configuration
   robot: RobotInfo | null;
   q: number[]; // length ndof — the single source of truth for configuration
@@ -844,6 +844,15 @@ function scheduleRefresh(get: () => StudioState) {
     pending = false;
     void get().refreshFrames();
   });
+}
+
+// ---- test-only exports (no runtime behaviour change) ----
+// These expose pure internal helpers so unit tests can drive them directly
+// without going through the full Zustand store or the Tauri IPC boundary.
+export { handleGraphError, bumpNodeSeq, canReach };
+/** Reset the module-level node-id sequence counter to 0 (test helper only). */
+export function _resetNodeSeq(): void {
+  nodeSeq = 0;
 }
 
 // ---- trajectory playback clock (performance.now-driven; baked frames only) ----

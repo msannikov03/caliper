@@ -10,16 +10,25 @@
 //! Geometry: oriented-box ↔ oriented-box uses the separating-axis theorem (15
 //! axes, Ericson); sphere/box and half-space cases are closed-form. Cylinders are
 //! conservatively approximated by their tight oriented bounding box (errs toward
-//! detecting a collision — safe). MESH colliders arrive as a convex hull of
-//! vertices ([`CollisionShape::ConvexHull`]) and are checked with GJK (boolean
-//! origin-in-Minkowski-difference) against convex/box/sphere colliders and against
-//! the world half-space. Everything is deterministic and dependency-free.
+//! detecting a collision — safe). CAPSULES are swept spheres (a core segment ⊕ a
+//! sphere of `radius`): capsule ↔ sphere/half-space/capsule use closed-form
+//! point-segment / segment-segment distances, and capsule ↔ box/convex reuse GJK
+//! via the capsule's exact support function. MESH colliders arrive as a convex
+//! hull of vertices ([`CollisionShape::ConvexHull`]) and are checked with GJK
+//! (boolean origin-in-Minkowski-difference). Everything is deterministic and
+//! dependency-free.
 //!
-//! ⚠ SCOPE: box/sphere/cylinder/convex-hull(mesh) `<collision>` geometry is
-//! checked. A `<capsule>`, or a `<mesh>` the loader could not read, carries no
-//! collider, so that part is NOT checked — a report can read "clear" while such a
-//! link interpenetrates. [`CollisionModel::uncovered_frames`] returns that count;
-//! callers should surface it rather than trust a "clear" verdict blindly.
+//! PENETRATION DEPTH: on overlap, [`CollisionModel::contacts`] runs EPA (the
+//! expanding polytope algorithm) on each self-colliding pair to recover a
+//! [`Contact`] (separation `normal`, penetration `depth`, and a `witness` point).
+//! It is additive: the boolean [`CollisionModel::query`] / [`CollisionReport`] are
+//! unchanged.
+//!
+//! ⚠ SCOPE: box/sphere/cylinder/capsule/convex-hull(mesh) `<collision>` geometry is
+//! checked. A `<mesh>` the loader could not read carries no collider, so that part
+//! is NOT checked — a report can read "clear" while such a link interpenetrates.
+//! [`CollisionModel::uncovered_frames`] returns that count; callers should surface
+//! it rather than trust a "clear" verdict blindly.
 
 use caliper_hal::SafetyCheck;
 use caliper_kinematics::fk_frame;
@@ -109,6 +118,29 @@ enum Prim {
         points: Vec<Vector3<f64>>,
         margin: f64,
     },
+    /// Capsule = a swept sphere: the set of points within `radius` of the core
+    /// segment `[a, b]` (both endpoints in WORLD coordinates). A degenerate
+    /// `a == b` reduces to a sphere. Its support function is exact, so it plugs
+    /// straight into GJK/EPA.
+    Capsule {
+        a: Vector3<f64>,
+        b: Vector3<f64>,
+        radius: f64,
+    },
+}
+
+/// A penetration contact recovered by EPA for an overlapping primitive pair.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Contact {
+    /// Unit separation axis = the outward normal of the Minkowski difference
+    /// `A ⊖ B` at the boundary point closest to the origin. Translating `A` by
+    /// `-depth * normal` (or `B` by `+depth * normal`) just resolves the overlap.
+    pub normal: Vector3<f64>,
+    /// Penetration depth ≥ 0 (the minimum translation distance along `normal`).
+    pub depth: f64,
+    /// A witness point on the surface of `A`, in world coordinates (the deepest
+    /// point of `A` inside `B`, recovered from the EPA face's support points).
+    pub witness: Vector3<f64>,
 }
 
 /// A configuration-space collision checker over a robot model + a world scene.
@@ -137,7 +169,7 @@ impl CollisionModel {
     }
     /// Frames NOT fully collision-covered (unsafe-by-omission hint for the UI/docs):
     /// frames with NO collider, PLUS frames that carry a primitive collider but also
-    /// had a mesh/capsule collider DROPPED (only partially covered — a query can still
+    /// had a mesh collider DROPPED (only partially covered — a query can still
     /// report "clear" for the dropped part).
     pub fn uncovered_frames(&self) -> usize {
         let dropped: HashSet<usize> = self.model.dropped_collider_frames.iter().copied().collect();
@@ -233,6 +265,72 @@ impl CollisionModel {
         report.colliding_frames = fv;
         Ok(report)
     }
+
+    /// Penetration contacts for every self-colliding link pair at `q`, via EPA.
+    /// Additive to [`CollisionModel::query`] (which stays a pure boolean): for each
+    /// overlapping, non-allowlisted, distinct-frame pair this returns
+    /// `(frame_a, frame_b, contact)` with `frame_a < frame_b`. The contact's
+    /// `witness` lies on the lower-indexed frame's collider (treated as `A`); its
+    /// `normal`/`depth` are the minimum translation that separates them (move `A`
+    /// by `-depth * normal`). Pairs whose overlap is a bare touch (zero depth) or
+    /// whose EPA degenerates are omitted. Deterministically sorted by frame pair.
+    ///
+    /// World geometry (ground / boxes) is NOT included — it has no `frame_b`; use
+    /// [`CollisionModel::query`]'s `world_hits` for those.
+    pub fn contacts(&self, q: &[f64]) -> Result<Vec<(usize, usize, Contact)>, CollisionError> {
+        if q.len() != self.model.ndof {
+            return Err(CollisionError::Dim {
+                expected: self.model.ndof,
+                got: q.len(),
+            });
+        }
+        if !q.iter().all(|x| x.is_finite()) {
+            return Err(CollisionError::NonFinite);
+        }
+
+        let placed: Vec<(Prim, usize)> = self
+            .model
+            .collision
+            .iter()
+            .map(|g| {
+                let world = fk_frame(&self.model, q, g.frame).0 * g.origin.0;
+                let r = world.rotation.to_rotation_matrix().into_inner();
+                let c = world.translation.vector;
+                (prim_for(&g.shape, c, r, self.margin), g.frame)
+            })
+            .collect();
+
+        let mut out: Vec<(usize, usize, Contact)> = Vec::new();
+        for i in 0..placed.len() {
+            for j in (i + 1)..placed.len() {
+                let (fi, fj) = (placed[i].1, placed[j].1);
+                if fi == fj {
+                    continue;
+                }
+                let key = if fi < fj { (fi, fj) } else { (fj, fi) };
+                if self.allowed.contains(&key) {
+                    continue;
+                }
+                // Orient A = lower-indexed frame so the witness/normal convention is
+                // tied to the canonical `(frame_a, frame_b)` order.
+                let (pa, pb) = if fi < fj {
+                    (&placed[i].0, &placed[j].0)
+                } else {
+                    (&placed[j].0, &placed[i].0)
+                };
+                if !intersects(pa, pb) {
+                    continue;
+                }
+                if let Some(tetra) = gjk_tetra(pa, pb)
+                    && let Some(contact) = epa(pa, pb, tetra)
+                {
+                    out.push((key.0, key.1, contact));
+                }
+            }
+        }
+        out.sort_by_key(|a| (a.0, a.1));
+        Ok(out)
+    }
 }
 
 impl SafetyCheck for CollisionModel {
@@ -267,6 +365,18 @@ fn prim_for(shape: &CollisionShape, c: Vector3<f64>, r: Matrix3<f64>, margin: f6
             r,
             h: Vector3::new(radius + margin, radius + margin, length / 2.0 + margin),
         },
+        // Z-aligned capsule (URDF): core segment from `-length/2` to `+length/2`
+        // along the shape's local Z (= world `r·ẑ`), swept by `radius`. The margin
+        // inflates the swept radius (conservative), exactly as for a sphere.
+        CollisionShape::Capsule { radius, length } => {
+            let axis = Vector3::new(r[(0, 2)], r[(1, 2)], r[(2, 2)]); // world local-Z
+            let half = length / 2.0;
+            Prim::Capsule {
+                a: c - axis * half,
+                b: c + axis * half,
+                radius: radius + margin,
+            }
+        }
         CollisionShape::ConvexHull { points } => Prim::Convex {
             points: points.iter().map(|p| c + r * p.coords).collect(),
             margin,
@@ -342,10 +452,39 @@ fn intersects(a: &Prim, b: &Prim) -> bool {
         (Prim::Sphere { c: a, radius: ra }, Prim::Sphere { c: b, radius: rb }) => {
             (a - b).norm() <= ra + rb
         }
-        // Any pair involving a convex hull (mesh) → GJK boolean test. The closed
-        // forms above stay the gold path for primitive ↔ primitive; GJK is
-        // cross-validated against `obb_obb` over random poses (see tests).
-        (Prim::Convex { .. }, _) | (_, Prim::Convex { .. }) => gjk_intersect(a, b),
+        // ----- capsule (swept-sphere) closed forms -----
+        // capsule ↔ sphere: point-to-segment distance ≤ r_cap + r_sphere.
+        (Prim::Capsule { a: p, b: q, radius }, Prim::Sphere { c: sc, radius: sr })
+        | (Prim::Sphere { c: sc, radius: sr }, Prim::Capsule { a: p, b: q, radius }) => {
+            let rr = radius + sr;
+            point_segment_dist2(sc, p, q) <= rr * rr
+        }
+        // capsule ↔ capsule: segment-to-segment distance ≤ r1 + r2.
+        (
+            Prim::Capsule {
+                a: a1,
+                b: b1,
+                radius: r1,
+            },
+            Prim::Capsule {
+                a: a2,
+                b: b2,
+                radius: r2,
+            },
+        ) => {
+            let rr = r1 + r2;
+            segment_segment_dist2(a1, b1, a2, b2) <= rr * rr
+        }
+        // Any remaining pair involving a convex hull (mesh) OR a capsule → GJK
+        // boolean test. The capsule's exact swept-sphere support function makes
+        // GJK exact for capsule ↔ box / capsule ↔ convex (and it is conservative —
+        // never under-reports — on the iteration cap). The closed forms above stay
+        // the gold path for primitive ↔ primitive; GJK is cross-validated against
+        // `obb_obb` and the closed forms over many poses (see tests).
+        (Prim::Convex { .. }, _)
+        | (_, Prim::Convex { .. })
+        | (Prim::Capsule { .. }, _)
+        | (_, Prim::Capsule { .. }) => gjk_intersect(a, b),
     }
 }
 
@@ -362,6 +501,9 @@ fn prim_below_plane(p: &Prim, n: Vector3<f64>, d: f64) -> bool {
         // The convex hull dips into the half-space iff its lowest vertex does
         // (the support point along -n); margin lowers it by `margin·|n|`, |n|==1.
         Prim::Convex { points, margin } => points.iter().any(|p| p.dot(&n) - *margin <= d),
+        // The capsule dips in iff its lowest core endpoint, lowered by `radius`
+        // (|n|==1), reaches the half-space.
+        Prim::Capsule { a, b, radius } => a.dot(&n).min(b.dot(&n)) - *radius <= d,
     }
 }
 
@@ -482,6 +624,80 @@ fn obb_obb(
     true // no separating axis → intersecting
 }
 
+// ===== capsule (swept-sphere) closed-form distances (pure nalgebra) =====
+
+/// Squared distance from point `p` to the segment `[a, b]`. A degenerate segment
+/// (`a == b`) reduces to point-to-point. Exact closed form.
+fn point_segment_dist2(p: &Vector3<f64>, a: &Vector3<f64>, b: &Vector3<f64>) -> f64 {
+    let ab = b - a;
+    let ab2 = ab.norm_squared();
+    if ab2 <= 1e-30 {
+        return (p - a).norm_squared(); // degenerate segment = point
+    }
+    let t = ((p - a).dot(&ab) / ab2).clamp(0.0, 1.0);
+    (p - (a + ab * t)).norm_squared()
+}
+
+/// Squared distance between segments `[p1, q1]` and `[p2, q2]` (Ericson, RTCD
+/// §5.1.9, "ClosestPtSegmentSegment"). Handles either or both segments degenerate.
+/// Exact closed form — the basis for the capsule ↔ capsule boolean.
+fn segment_segment_dist2(
+    p1: &Vector3<f64>,
+    q1: &Vector3<f64>,
+    p2: &Vector3<f64>,
+    q2: &Vector3<f64>,
+) -> f64 {
+    const EPS: f64 = 1e-12;
+    let d1 = q1 - p1; // direction of segment 1
+    let d2 = q2 - p2; // direction of segment 2
+    let r = p1 - p2;
+    let a = d1.dot(&d1); // squared length of segment 1
+    let e = d2.dot(&d2); // squared length of segment 2
+    let f = d2.dot(&r);
+
+    let (s, t);
+    if a <= EPS && e <= EPS {
+        // both segments are points
+        return r.norm_squared();
+    }
+    if a <= EPS {
+        // first segment is a point
+        s = 0.0;
+        t = (f / e).clamp(0.0, 1.0);
+    } else {
+        let c = d1.dot(&r);
+        if e <= EPS {
+            // second segment is a point
+            t = 0.0;
+            s = (-c / a).clamp(0.0, 1.0);
+        } else {
+            // general non-degenerate case
+            let b = d1.dot(&d2);
+            let denom = a * e - b * b; // always ≥ 0
+            let s0 = if denom > EPS {
+                ((b * f - c * e) / denom).clamp(0.0, 1.0)
+            } else {
+                0.0 // parallel segments → pick an arbitrary point on segment 1
+            };
+            let t0 = (b * s0 + f) / e;
+            // clamp t to [0,1] and recompute s for the clamped t
+            if t0 < 0.0 {
+                t = 0.0;
+                s = (-c / a).clamp(0.0, 1.0);
+            } else if t0 > 1.0 {
+                t = 1.0;
+                s = ((b - c) / a).clamp(0.0, 1.0);
+            } else {
+                t = t0;
+                s = s0;
+            }
+        }
+    }
+    let c1 = p1 + d1 * s;
+    let c2 = p2 + d2 * t;
+    (c1 - c2).norm_squared()
+}
+
 // ===== GJK boolean intersection (pure nalgebra) =====
 //
 // Tests whether two convex primitives overlap by deciding if the origin lies in
@@ -529,6 +745,16 @@ fn prim_support(p: &Prim, d: &Vector3<f64>) -> Vector3<f64> {
                 best
             }
         }
+        // Swept sphere: farther segment endpoint along d, pushed out by radius·d̂.
+        Prim::Capsule { a, b, radius } => {
+            let base = if a.dot(d) >= b.dot(d) { *a } else { *b };
+            let n = d.norm();
+            if n > 0.0 {
+                base + d * (*radius / n)
+            } else {
+                base
+            }
+        }
     }
 }
 
@@ -537,6 +763,7 @@ fn prim_center(p: &Prim) -> Vector3<f64> {
     match p {
         Prim::Obb { c, .. } | Prim::Sphere { c, .. } => *c,
         Prim::Convex { points, .. } => points.iter().sum::<Vector3<f64>>() / points.len() as f64,
+        Prim::Capsule { a, b, .. } => (a + b) * 0.5,
     }
 }
 
@@ -676,6 +903,324 @@ fn simplex4(
         return false;
     }
     true // enclosed
+}
+
+// ===== EPA penetration depth (pure nalgebra) =====
+//
+// On overlap, EPA (the Expanding Polytope Algorithm) recovers the minimum
+// translation vector. It seeds from the GJK terminal tetrahedron enclosing the
+// origin in the Minkowski difference `A ⊖ B`, then repeatedly pushes the closest
+// boundary face outward (querying the support in that face's normal) until the
+// face is on the true boundary. The face normal is the separation axis, its
+// distance to the origin is the penetration depth, and a barycentric blend of the
+// support points-on-A that built the face is the witness point on A. Works for any
+// primitive pair through the shared `prim_support` (box/sphere/convex/capsule).
+
+const EPA_MAX_ITERS: usize = 96;
+/// Convergence threshold: stop once the support in the face normal advances the
+/// boundary by less than this (in the Minkowski-difference metric, metres).
+const EPA_TOL: f64 = 1e-10;
+
+/// A Minkowski-difference vertex carrying the support point on `A` that produced
+/// it, so EPA can map a boundary point back to a witness on `A`'s surface.
+#[derive(Clone, Copy, Debug)]
+struct Sv {
+    /// `supportA(d) - supportB(-d)` — the vertex in the Minkowski difference.
+    v: Vector3<f64>,
+    /// `supportA(d)` — the contributing point on `A` (world coords).
+    sa: Vector3<f64>,
+}
+
+/// Support of the Minkowski difference in direction `d`, tracking the point on A.
+#[inline]
+fn mink_sv(a: &Prim, b: &Prim, d: &Vector3<f64>) -> Sv {
+    let pa = prim_support(a, d);
+    let pb = prim_support(b, &(-d));
+    Sv { v: pa - pb, sa: pa }
+}
+
+/// An EPA polytope face: a triangle (indices into the vertex list), its OUTWARD
+/// unit normal, and the (non-negative) distance from the origin to its plane.
+struct Face {
+    i: usize,
+    j: usize,
+    k: usize,
+    normal: Vector3<f64>,
+    dist: f64,
+}
+
+/// Build a face from three vertices, orienting the normal OUTWARD (away from the
+/// polytope interior reference `centroid`). `None` if the triangle is degenerate.
+fn make_face(verts: &[Sv], i: usize, j: usize, k: usize, centroid: &Vector3<f64>) -> Option<Face> {
+    let (vi, vj, vk) = (verts[i].v, verts[j].v, verts[k].v);
+    let mut n = (vj - vi).cross(&(vk - vi));
+    let nn = n.norm();
+    if nn < 1e-18 {
+        return None; // degenerate (collinear) triangle
+    }
+    n /= nn;
+    // Orient outward and keep the winding consistent with the stored order so that
+    // shared horizon edges cancel as reversed pairs during expansion.
+    let (i, j, k, n) = if n.dot(&(vi - centroid)) < 0.0 {
+        (i, k, j, -n)
+    } else {
+        (i, j, k, n)
+    };
+    let dist = n.dot(&verts[i].v).max(0.0);
+    Some(Face {
+        i,
+        j,
+        k,
+        normal: n,
+        dist,
+    })
+}
+
+/// Push a horizon edge, cancelling it against an already-present reverse edge
+/// (the shared edge of two visible faces is interior, not on the horizon).
+fn add_edge(edges: &mut Vec<(usize, usize)>, a: usize, b: usize) {
+    if let Some(pos) = edges.iter().position(|&(x, y)| x == b && y == a) {
+        edges.swap_remove(pos);
+    } else {
+        edges.push((a, b));
+    }
+}
+
+/// Barycentric coords `(u, v, w)` of `p` w.r.t. triangle `(a, b, c)` (Ericson).
+/// `None` if the triangle is degenerate.
+fn barycentric(
+    p: &Vector3<f64>,
+    a: &Vector3<f64>,
+    b: &Vector3<f64>,
+    c: &Vector3<f64>,
+) -> Option<(f64, f64, f64)> {
+    let v0 = b - a;
+    let v1 = c - a;
+    let v2 = p - a;
+    let d00 = v0.dot(&v0);
+    let d01 = v0.dot(&v1);
+    let d11 = v1.dot(&v1);
+    let d20 = v2.dot(&v0);
+    let d21 = v2.dot(&v1);
+    let denom = d00 * d11 - d01 * d01;
+    if denom.abs() < 1e-30 {
+        return None;
+    }
+    let v = (d11 * d20 - d01 * d21) / denom;
+    let w = (d00 * d21 - d01 * d20) / denom;
+    Some((1.0 - v - w, v, w))
+}
+
+/// Build a [`Contact`] from a converged closest face: project the origin onto the
+/// face plane, recover its barycentric coords, and blend the per-vertex points-on-A
+/// into a witness point on A.
+fn contact_from_face(verts: &[Sv], f: &Face) -> Option<Contact> {
+    let (vi, vj, vk) = (verts[f.i].v, verts[f.j].v, verts[f.k].v);
+    let proj = f.normal * f.dist; // closest point on the face plane to the origin
+    let (u, v, w) = barycentric(&proj, &vi, &vj, &vk)?;
+    let witness = verts[f.i].sa * u + verts[f.j].sa * v + verts[f.k].sa * w;
+    Some(Contact {
+        normal: f.normal,
+        depth: f.dist,
+        witness,
+    })
+}
+
+/// GJK that, on overlap, returns the terminal tetrahedron enclosing the origin in
+/// `A ⊖ B` (each vertex tracks its point-on-A for EPA). `None` when separated or
+/// only touching (the boundary case is ill-conditioned for EPA and not a true
+/// penetration). Mirrors [`gjk_intersect`]'s simplex evolution on [`Sv`] vertices.
+fn gjk_tetra(pa: &Prim, pb: &Prim) -> Option<[Sv; 4]> {
+    let s = |dir: &Vector3<f64>| mink_sv(pa, pb, dir);
+
+    let mut search = prim_center(pa) - prim_center(pb);
+    if search.norm_squared() < 1e-24 {
+        search = Vector3::new(1.0, 0.0, 0.0);
+    }
+    let mut c = s(&search);
+    search = -c.v;
+    let mut b = s(&search);
+    if b.v.dot(&search) < 0.0 {
+        return None;
+    }
+    let cb = c.v - b.v;
+    search = cb.cross(&(-b.v)).cross(&cb);
+    if search.norm_squared() < 1e-24 {
+        search = cb.cross(&Vector3::new(1.0, 0.0, 0.0));
+        if search.norm_squared() < 1e-24 {
+            search = cb.cross(&Vector3::new(0.0, 0.0, -1.0));
+        }
+    }
+
+    let mut a;
+    let mut d = Sv {
+        v: Vector3::zeros(),
+        sa: Vector3::zeros(),
+    };
+    let mut simp_dim = 2usize;
+    for _ in 0..GJK_MAX_ITERS {
+        a = s(&search);
+        if a.v.dot(&search) < 0.0 {
+            return None; // farthest point short of the origin → separated
+        }
+        simp_dim += 1;
+        if simp_dim == 3 {
+            simplex3_sv(&mut a, &mut b, &mut c, &mut d, &mut simp_dim, &mut search);
+        } else if simplex4_sv(&mut a, &mut b, &mut c, &mut d, &mut simp_dim, &mut search) {
+            return Some([a, b, c, d]);
+        }
+        if search.norm_squared() < 1e-24 {
+            return None; // origin on the simplex boundary (touching) → no EPA
+        }
+    }
+    None
+}
+
+/// [`simplex3`] specialised to [`Sv`] vertices (decisions use `.v`; `.sa` rides along).
+fn simplex3_sv(
+    a: &mut Sv,
+    b: &mut Sv,
+    c: &mut Sv,
+    d: &mut Sv,
+    simp_dim: &mut usize,
+    search: &mut Vector3<f64>,
+) {
+    let n = (b.v - a.v).cross(&(c.v - a.v));
+    let ao = -a.v;
+    *simp_dim = 2;
+    if (b.v - a.v).cross(&n).dot(&ao) > 0.0 {
+        *c = *a;
+        *search = (b.v - a.v).cross(&ao).cross(&(b.v - a.v));
+        return;
+    }
+    if n.cross(&(c.v - a.v)).dot(&ao) > 0.0 {
+        *b = *a;
+        *search = (c.v - a.v).cross(&ao).cross(&(c.v - a.v));
+        return;
+    }
+    *simp_dim = 3;
+    if n.dot(&ao) > 0.0 {
+        *d = *c;
+        *c = *b;
+        *b = *a;
+        *search = n;
+    } else {
+        *d = *b;
+        *b = *a;
+        *search = -n;
+    }
+}
+
+/// [`simplex4`] specialised to [`Sv`] vertices. Returns `true` iff origin enclosed.
+fn simplex4_sv(
+    a: &mut Sv,
+    b: &mut Sv,
+    c: &mut Sv,
+    d: &mut Sv,
+    simp_dim: &mut usize,
+    search: &mut Vector3<f64>,
+) -> bool {
+    let abc = (b.v - a.v).cross(&(c.v - a.v));
+    let acd = (c.v - a.v).cross(&(d.v - a.v));
+    let adb = (d.v - a.v).cross(&(b.v - a.v));
+    let ao = -a.v;
+    *simp_dim = 3;
+    if abc.dot(&ao) > 0.0 {
+        *d = *c;
+        *c = *b;
+        *b = *a;
+        *search = abc;
+        return false;
+    }
+    if acd.dot(&ao) > 0.0 {
+        *b = *a;
+        *search = acd;
+        return false;
+    }
+    if adb.dot(&ao) > 0.0 {
+        *c = *d;
+        *d = *b;
+        *b = *a;
+        *search = adb;
+        return false;
+    }
+    true
+}
+
+/// EPA on the GJK terminal tetra `tetra` (enclosing the origin in `A ⊖ B`).
+/// Returns the penetration [`Contact`] (normal/depth/witness), or `None` if the
+/// polytope degenerates. Convention: `normal` is the OUTWARD Minkowski-difference
+/// normal at the closest boundary point, so `A` and `B` separate by translating
+/// `A` by `-depth * normal`.
+fn epa(pa: &Prim, pb: &Prim, tetra: [Sv; 4]) -> Option<Contact> {
+    let s = |dir: &Vector3<f64>| mink_sv(pa, pb, dir);
+    let mut verts: Vec<Sv> = tetra.to_vec();
+    // A fixed interior reference: the seed tetra's centroid stays inside the
+    // (only-outward-growing) polytope, so it orients every face's normal.
+    let centroid = (verts[0].v + verts[1].v + verts[2].v + verts[3].v) / 4.0;
+
+    let mut faces: Vec<Face> = Vec::new();
+    for (i, j, k) in [(0, 1, 2), (0, 1, 3), (0, 2, 3), (1, 2, 3)] {
+        if let Some(f) = make_face(&verts, i, j, k, &centroid) {
+            faces.push(f);
+        }
+    }
+    if faces.len() < 4 {
+        return None; // degenerate seed tetra
+    }
+
+    for _ in 0..EPA_MAX_ITERS {
+        // closest face to the origin
+        let ci = (0..faces.len()).min_by(|&x, &y| {
+            faces[x]
+                .dist
+                .partial_cmp(&faces[y].dist)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })?;
+        let normal = faces[ci].normal;
+        let dist = faces[ci].dist;
+
+        // farthest support along the closest-face normal
+        let p = s(&normal);
+        if p.v.dot(&normal) - dist < EPA_TOL {
+            return contact_from_face(&verts, &faces[ci]); // converged
+        }
+
+        // expand: drop every face the new point can see; stitch the horizon to it
+        let np = p.v;
+        let mut horizon: Vec<(usize, usize)> = Vec::new();
+        let mut keep: Vec<Face> = Vec::with_capacity(faces.len());
+        for f in faces.drain(..) {
+            if f.normal.dot(&(np - verts[f.i].v)) > 1e-12 {
+                add_edge(&mut horizon, f.i, f.j);
+                add_edge(&mut horizon, f.j, f.k);
+                add_edge(&mut horizon, f.k, f.i);
+            } else {
+                keep.push(f);
+            }
+        }
+        faces = keep;
+        let ni = verts.len();
+        verts.push(p);
+        for (e0, e1) in horizon {
+            if let Some(f) = make_face(&verts, e0, e1, ni, &centroid) {
+                faces.push(f);
+            }
+        }
+        if faces.is_empty() {
+            return None;
+        }
+    }
+
+    // iteration cap: return the best face we have (best-effort, still a valid lower
+    // bound on the depth → conservative).
+    let ci = (0..faces.len()).min_by(|&x, &y| {
+        faces[x]
+            .dist
+            .partial_cmp(&faces[y].dist)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    })?;
+    contact_from_face(&verts, &faces[ci])
 }
 
 #[cfg(test)]
@@ -1220,5 +1765,345 @@ mod tests {
             !cm2.query(&[0.0]).unwrap().has_collision(),
             "negative extents must clamp to a degenerate, non-colliding box"
         );
+    }
+
+    // ===== capsule (swept-sphere) closed-form cross-validation =====
+
+    #[test]
+    fn capsule_sphere_closed_form() {
+        // Capsule core along x from (-0.5,0,0) to (0.5,0,0), radius 0.1.
+        let cap = Prim::Capsule {
+            a: Vector3::new(-0.5, 0.0, 0.0),
+            b: Vector3::new(0.5, 0.0, 0.0),
+            radius: 0.1,
+        };
+        // sphere above the middle: surface gap = z - (0.1 + r_s).
+        let clear = Prim::Sphere {
+            c: Vector3::new(0.0, 0.0, 0.25),
+            radius: 0.1,
+        }; // dist 0.25 > 0.2 → clear
+        assert!(!intersects(&cap, &clear));
+        let hit = Prim::Sphere {
+            c: Vector3::new(0.0, 0.0, 0.15),
+            radius: 0.1,
+        }; // dist 0.15 < 0.2 → hit
+        assert!(intersects(&cap, &hit));
+        assert!(intersects(&hit, &cap), "symmetry");
+        // beyond the cap end (clamped to the endpoint): point-to-(0.5,0,0) distance
+        // probes the hemispherical cap. 0.2 == r1+r2 → touching counts (`<=`).
+        let touch = Prim::Sphere {
+            c: Vector3::new(0.7, 0.0, 0.0),
+            radius: 0.1,
+        };
+        assert!(intersects(&cap, &touch), "0.2 == r1+r2 touch must collide");
+        let past = Prim::Sphere {
+            c: Vector3::new(0.71, 0.0, 0.0),
+            radius: 0.1,
+        };
+        assert!(!intersects(&cap, &past), "0.21 > 0.2 must be clear");
+    }
+
+    #[test]
+    fn capsule_capsule_closed_form() {
+        // Reference x-capsule at z=0, radius 0.1.
+        let a = Prim::Capsule {
+            a: Vector3::new(-0.5, 0.0, 0.0),
+            b: Vector3::new(0.5, 0.0, 0.0),
+            radius: 0.1,
+        };
+        // parallel x-capsule lifted by 0.15: segment-segment dist 0.15 < 0.2 → hit.
+        let near = Prim::Capsule {
+            a: Vector3::new(-0.5, 0.0, 0.15),
+            b: Vector3::new(0.5, 0.0, 0.15),
+            radius: 0.1,
+        };
+        assert!(intersects(&a, &near));
+        // lifted by 0.25: dist 0.25 > 0.2 → clear.
+        let far = Prim::Capsule {
+            a: Vector3::new(-0.5, 0.0, 0.25),
+            b: Vector3::new(0.5, 0.0, 0.25),
+            radius: 0.1,
+        };
+        assert!(!intersects(&a, &far));
+        // perpendicular (y-axis) capsule crossing over the origin at z=0.18: the
+        // segment-segment closest distance is the pure z gap 0.18 < 0.2 → hit. A
+        // naive endpoint-only distance (≈0.52) would WRONGLY report clear, so this
+        // exercises the interior-interior branch of segment_segment_dist2.
+        let perp = Prim::Capsule {
+            a: Vector3::new(0.0, -0.5, 0.18),
+            b: Vector3::new(0.0, 0.5, 0.18),
+            radius: 0.1,
+        };
+        assert!(intersects(&a, &perp));
+    }
+
+    #[test]
+    fn capsule_halfspace_closed_form() {
+        // vertical capsule core z in [-0.2,0.2], radius 0.1 → lowest point z=-0.3.
+        let cap = Prim::Capsule {
+            a: Vector3::new(0.0, 0.0, -0.2),
+            b: Vector3::new(0.0, 0.0, 0.2),
+            radius: 0.1,
+        };
+        let zup = Vector3::new(0.0, 0.0, 1.0);
+        assert!(
+            prim_below_plane(&cap, zup, -0.25),
+            "cap bottom -0.3 dips into z<=-0.25"
+        );
+        assert!(
+            !prim_below_plane(&cap, zup, -0.35),
+            "cap bottom -0.3 clears z<=-0.35"
+        );
+    }
+
+    #[test]
+    fn capsule_obb_via_gjk_known_distance() {
+        // Horizontal capsule (core along x, radius 0.1) at height z=d, spanning over
+        // a box of half 0.3 at the origin. The segment passes above the +z face, so
+        // the closest distance is d - 0.3; collide iff d - 0.3 <= 0.1 → d <= 0.4.
+        let box_ = Prim::Obb {
+            c: Vector3::zeros(),
+            r: Matrix3::identity(),
+            h: Vector3::new(0.3, 0.3, 0.3),
+        };
+        let cap = |d: f64| Prim::Capsule {
+            a: Vector3::new(-0.5, 0.0, d),
+            b: Vector3::new(0.5, 0.0, d),
+            radius: 0.1,
+        };
+        assert!(intersects(&cap(0.35), &box_), "0.05 gap < r → collide");
+        assert!(intersects(&box_, &cap(0.35)), "symmetry");
+        assert!(!intersects(&cap(0.45), &box_), "0.15 gap > r → clear");
+    }
+
+    #[test]
+    fn capsule_convex_matches_capsule_obb() {
+        // GJK(capsule, convex-cube) must agree with GJK(capsule, the equivalent OBB)
+        // — the convex hull is the same body, so the swept-sphere verdicts must match
+        // across the contact threshold.
+        let i = Matrix3::identity();
+        let h = Vector3::new(0.3, 0.3, 0.3);
+        let cube = cube_prim(Vector3::zeros(), i, h);
+        let obb = Prim::Obb {
+            c: Vector3::zeros(),
+            r: i,
+            h,
+        };
+        for &d in &[0.35_f64, 0.45, 0.2] {
+            let cap = Prim::Capsule {
+                a: Vector3::new(-0.5, 0.0, d),
+                b: Vector3::new(0.5, 0.0, d),
+                radius: 0.1,
+            };
+            assert_eq!(
+                intersects(&cap, &cube),
+                intersects(&cap, &obb),
+                "capsule/convex vs capsule/obb must agree at d={d}"
+            );
+        }
+    }
+
+    #[test]
+    fn capsule_link_is_now_covered_and_collides() {
+        // collide_capsule.urdf: l1 carries a <capsule> (radius 0.1, length 0.4). The
+        // capsule frame is now COVERED (only the collider-less base is uncovered) and
+        // participates in real world-collision queries.
+        let m = model("collide_capsule.urdf");
+        assert!(
+            m.dropped_collider_frames.is_empty(),
+            "a parsed capsule must not be dropped"
+        );
+        let cm = CollisionModel::new(m.clone(), WorldScene::new(), 0.0);
+        assert_eq!(cm.num_colliders(), 1, "the capsule collider");
+        assert_eq!(
+            cm.uncovered_frames(),
+            1,
+            "only `base` is uncovered now; l1's capsule is covered"
+        );
+        // capsule core spans z in [-0.2,0.2], r0.1 at the origin; a world box there
+        // overlaps it.
+        let hit = CollisionModel::new(
+            m.clone(),
+            WorldScene::new().add_box([0.0, 0.0, 0.0], [0.2, 0.2, 0.2]),
+            0.0,
+        );
+        assert!(
+            hit.query(&[0.0]).unwrap().has_collision(),
+            "capsule must collide with an overlapping world box"
+        );
+        // distant box → clear (FK consistency through the capsule path)
+        let clear = CollisionModel::new(
+            m.clone(),
+            WorldScene::new().add_box([5.0, 0.0, 0.0], [0.2, 0.2, 0.2]),
+            0.0,
+        );
+        assert!(!clear.query(&[0.0]).unwrap().has_collision());
+        // ground catching the capsule's lowest point (z=-0.3); far below → clear
+        let ground = CollisionModel::new(m.clone(), WorldScene::new().with_ground(-0.25), 0.0);
+        assert!(!ground.query(&[0.0]).unwrap().world_hits.is_empty());
+        let deep = CollisionModel::new(m, WorldScene::new().with_ground(-1.0), 0.0);
+        assert!(deep.query(&[0.0]).unwrap().world_hits.is_empty());
+    }
+
+    // ===== EPA penetration depth =====
+
+    #[test]
+    fn epa_two_boxes_exact_depth_and_normal() {
+        // Two unit boxes overlapping 0.1 along x: A at origin, B at +0.9x (each half
+        // 0.5). The Minkowski difference is a box, so EPA converges EXACTLY — depth
+        // 0.1 along +x, witness on A's +x face (x=0.5).
+        let i = Matrix3::identity();
+        let h = Vector3::new(0.5, 0.5, 0.5);
+        let a = Prim::Obb {
+            c: Vector3::zeros(),
+            r: i,
+            h,
+        };
+        let b = Prim::Obb {
+            c: Vector3::new(0.9, 0.0, 0.0),
+            r: i,
+            h,
+        };
+        let tetra = gjk_tetra(&a, &b).expect("overlap must yield a GJK tetra");
+        let ct = epa(&a, &b, tetra).expect("EPA must return a contact");
+        assert!((ct.depth - 0.1).abs() < 1e-9, "depth {}", ct.depth);
+        assert!(
+            (ct.normal - Vector3::new(1.0, 0.0, 0.0)).norm() < 1e-9,
+            "normal {:?}",
+            ct.normal
+        );
+        assert!(
+            (ct.normal.norm() - 1.0).abs() < 1e-12,
+            "normal must be unit"
+        );
+        assert!(
+            (ct.witness.x - 0.5).abs() < 1e-9,
+            "witness on A's +x face, got {:?}",
+            ct.witness
+        );
+        // Resolution check: translating A by slightly MORE than -depth*normal must
+        // clear the boolean overlap (the reported MTV genuinely separates them).
+        let a_clear = Prim::Obb {
+            c: -ct.normal * (ct.depth + 1e-6),
+            r: i,
+            h,
+        };
+        assert!(
+            !intersects(&a_clear, &b),
+            "translating A past -depth*normal must remove the overlap"
+        );
+    }
+
+    #[test]
+    fn epa_two_spheres_exact_depth_and_normal() {
+        // Smooth-support cross-check: spheres r0.5 @ origin and r0.4 @ +0.7x overlap
+        // by 0.9-0.7 = 0.2 along +x. The Minkowski difference is a perfect sphere, so
+        // EPA converges cleanly. Witness on A's surface along +x = (0.5,0,0).
+        let a = Prim::Sphere {
+            c: Vector3::zeros(),
+            radius: 0.5,
+        };
+        let b = Prim::Sphere {
+            c: Vector3::new(0.7, 0.0, 0.0),
+            radius: 0.4,
+        };
+        let tetra = gjk_tetra(&a, &b).expect("overlap");
+        let ct = epa(&a, &b, tetra).expect("contact");
+        // Depth converges exactly; the NORMAL carries a polytope-order angular
+        // approximation on a curved (sphere) Minkowski surface — 1e-3 is the honest
+        // bar for a smooth support (box-box pins the exact 1e-9 polytope case).
+        assert!((ct.depth - 0.2).abs() < 1e-6, "depth {}", ct.depth);
+        assert!(
+            (ct.normal - Vector3::new(1.0, 0.0, 0.0)).norm() < 1e-3,
+            "normal {:?}",
+            ct.normal
+        );
+        assert!(
+            (ct.witness - Vector3::new(0.5, 0.0, 0.0)).norm() < 1e-2,
+            "witness {:?}",
+            ct.witness
+        );
+    }
+
+    #[test]
+    fn epa_sphere_into_box_matches_analytic() {
+        // Sphere (r0.3) centered at +0.6x penetrates box A (half 0.5): the sphere's
+        // left tip reaches x=0.3, the box's +x face is at 0.5 → depth 0.2 along +x.
+        // EPA's depth is a LOWER bound on the true penetration (the polytope is
+        // inscribed) and converges to it; the box's discrete corner support limits
+        // flat-face precision, so bracket tightly-but-safely rather than demand
+        // machine precision. The box-box / sphere-sphere tests pin the exact path.
+        let i = Matrix3::identity();
+        let box_a = Prim::Obb {
+            c: Vector3::zeros(),
+            r: i,
+            h: Vector3::new(0.5, 0.5, 0.5),
+        };
+        let sphere_b = Prim::Sphere {
+            c: Vector3::new(0.6, 0.0, 0.0),
+            radius: 0.3,
+        };
+        let tetra = gjk_tetra(&box_a, &sphere_b).expect("overlap");
+        let ct = epa(&box_a, &sphere_b, tetra).expect("contact");
+        assert!(
+            ct.depth > 0.2 - 1e-3 && ct.depth <= 0.2 + 1e-9,
+            "depth {} must bracket the analytic 0.2",
+            ct.depth
+        );
+        assert!(
+            ct.normal.x > 0.999 && ct.normal.y.abs() < 1e-2 && ct.normal.z.abs() < 1e-2,
+            "normal {:?} must point ~+x",
+            ct.normal
+        );
+        assert!(
+            (ct.witness.x - 0.5).abs() < 1e-6,
+            "witness on the box's +x face, got {:?}",
+            ct.witness
+        );
+    }
+
+    #[test]
+    fn contacts_report_penetration_on_self_collision() {
+        // End-to-end through FK: the folded arm self-collides (l1 vs l3 boxes), and
+        // contacts() must surface that pair with a positive penetration depth and a
+        // unit normal, while a clear config yields none.
+        let m = model("collide_arm.urdf");
+        let cm = CollisionModel::new(m.clone(), WorldScene::new(), 0.0);
+        let pi = std::f64::consts::PI;
+        assert!(cm.query(&[0.0, pi, pi]).unwrap().has_collision());
+        let cts = cm.contacts(&[0.0, pi, pi]).unwrap();
+        assert!(
+            !cts.is_empty(),
+            "folded self-collision must yield a contact"
+        );
+        let l1 = m.frame_id("l1").unwrap();
+        let l3 = m.frame_id("l3").unwrap();
+        assert!(
+            cts.iter()
+                .any(|&(a, b, _)| (a, b) == (l1.min(l3), l1.max(l3))),
+            "the (l1,l3) pair must be reported, got {:?}",
+            cts.iter().map(|&(a, b, _)| (a, b)).collect::<Vec<_>>()
+        );
+        for (a, b, c) in &cts {
+            assert!(a < b, "canonical frame order a<b");
+            assert!(c.depth > 0.0, "penetration depth must be positive");
+            assert!(
+                (c.normal.norm() - 1.0).abs() < 1e-9,
+                "contact normal must be unit"
+            );
+            assert!(c.depth.is_finite() && c.witness.iter().all(|x| x.is_finite()));
+        }
+        assert!(
+            cm.contacts(&[0.0, 0.0, 0.0]).unwrap().is_empty(),
+            "a clear config yields no contacts"
+        );
+        assert!(
+            matches!(cm.contacts(&[0.0]), Err(CollisionError::Dim { .. })),
+            "dim guard"
+        );
+        assert!(matches!(
+            cm.contacts(&[0.0, f64::NAN, 0.0]),
+            Err(CollisionError::NonFinite)
+        ));
     }
 }

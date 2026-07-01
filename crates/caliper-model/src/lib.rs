@@ -50,11 +50,10 @@ pub struct LinkFrame {
     pub offset: Se3,
 }
 
-/// A collision shape, in the shape's own local frame. Box/sphere/cylinder are
-/// exact primitives; a `<mesh>` collision is loaded (STL), scaled, and reduced to
-/// a [`CollisionShape::ConvexHull`] of its vertices (see `parse_collisions`).
-/// Capsules are still skipped (no loader). Not `Copy` because `ConvexHull` owns a
-/// `Vec`; clone explicitly.
+/// A collision shape, in the shape's own local frame. Box/sphere/cylinder/capsule
+/// are exact primitives; a `<mesh>` collision is loaded (STL), scaled, and reduced
+/// to a [`CollisionShape::ConvexHull`] of its vertices (see `parse_collisions`).
+/// Not `Copy` because `ConvexHull` owns a `Vec`; clone explicitly.
 #[derive(Clone, Debug, PartialEq)]
 pub enum CollisionShape {
     /// Axis-aligned box; `half` are the half-extents (URDF `size`/2).
@@ -66,6 +65,14 @@ pub enum CollisionShape {
     },
     /// Z-aligned cylinder (URDF convention).
     Cylinder {
+        radius: f64,
+        length: f64,
+    },
+    /// Z-aligned capsule (URDF convention): a cylinder of `length` (the core
+    /// segment, from `-length/2` to `+length/2` along local Z) capped by a
+    /// hemisphere of `radius` at each end. The total tip-to-tip extent is
+    /// `length + 2*radius`. Checked as a swept sphere (segment ⊕ sphere).
+    Capsule {
         radius: f64,
         length: f64,
     },
@@ -115,16 +122,16 @@ pub struct Model {
     /// True iff every movable link AND every fixed link folded onto a movable
     /// parent carried a real `<inertial>` (mass>0). Dynamics entry points gate on this.
     pub has_inertia: bool,
-    /// Parsed `<collision>` geometry — box/sphere/cylinder primitives plus mesh
-    /// colliders loaded as a [`CollisionShape::ConvexHull`] — each attached to a
-    /// link frame. ⚠ A `<capsule>`, or a `<mesh>` that could not be loaded
-    /// (missing/`package://`/non-STL file, unparsable, degenerate), is still
+    /// Parsed `<collision>` geometry — box/sphere/cylinder/capsule primitives plus
+    /// mesh colliders loaded as a [`CollisionShape::ConvexHull`] — each attached to
+    /// a link frame. ⚠ A `<mesh>` that could not be loaded
+    /// (missing/`package://`/non-STL file, unparsable, degenerate) is still
     /// SKIPPED: that link carries NO collider for the dropped part and is NOT
     /// collision-checked there. Callers should surface the uncovered count
     /// (`caliper_collision::CollisionModel::uncovered_frames`). Empty when absent.
     pub collision: Vec<CollisionGeom>,
     /// Frame indices of link frames that had a `<collision>` whose geometry was
-    /// DROPPED (capsule, or an unloadable mesh). Such a frame may carry other
+    /// DROPPED (an unloadable mesh). Such a frame may carry other
     /// colliders too, so it is only PARTIALLY covered — a query can still report
     /// "clear" for its dropped part. Callers must treat these as not-fully-covered
     /// (see `caliper_collision::CollisionModel::uncovered_frames`).
@@ -207,7 +214,7 @@ struct RobotTree {
     /// Parallel to `links`: parsed `<collision>` primitives (link-frame local).
     link_collision: Vec<Vec<(Se3, CollisionShape)>>,
     /// Parallel to `links`: true if the link had a `<collision>` whose geometry
-    /// was DROPPED (mesh/capsule, no loader) — that link is only partially covered.
+    /// was DROPPED (an unloadable mesh) — that link is only partially covered.
     link_dropped: Vec<bool>,
     joints: Vec<EditJoint>,
     link_index: HashMap<String, usize>,
@@ -307,11 +314,11 @@ fn parse_inertial(inr: &urdf_rs::Inertial) -> Option<SpatialInertia> {
 }
 
 /// Parse a link's `<collision>` primitives into `(link-local origin, shape)`.
-/// Box/sphere/cylinder are exact; a `<mesh>` is loaded (STL), scaled, and reduced
-/// to a [`CollisionShape::ConvexHull`]. A mesh that cannot be loaded (missing
-/// file, unsupported/`package://` path, unparsable STL, degenerate hull) and a
-/// `<capsule>` are SKIPPED (no collider; `dropped=true`) — the pre-existing,
-/// safe-by-omission behavior (see the `Model::collision` note).
+/// Box/sphere/cylinder/capsule are exact; a `<mesh>` is loaded (STL), scaled, and
+/// reduced to a [`CollisionShape::ConvexHull`]. A mesh that cannot be loaded
+/// (missing file, unsupported/`package://` path, unparsable STL, degenerate hull)
+/// is SKIPPED (no collider; `dropped=true`) — the pre-existing, safe-by-omission
+/// behavior (see the `Model::collision` note).
 fn parse_collisions(
     link: &urdf_rs::Link,
     base_dir: Option<&Path>,
@@ -332,6 +339,10 @@ fn parse_collisions(
                 radius: *radius,
                 length: *length,
             },
+            urdf_rs::Geometry::Capsule { radius, length } => CollisionShape::Capsule {
+                radius: *radius,
+                length: *length,
+            },
             urdf_rs::Geometry::Mesh { filename, scale } => {
                 match load_mesh_hull(filename, scale.as_ref(), base_dir) {
                     Some(points) => CollisionShape::ConvexHull { points },
@@ -340,10 +351,6 @@ fn parse_collisions(
                         continue;
                     }
                 }
-            }
-            _ => {
-                dropped = true; // Capsule: no loader → dropped (NOT checked)
-                continue;
             }
         };
         out.push((origin, shape));
@@ -721,6 +728,26 @@ mod tests {
     #[test]
     fn no_collision_geometry_is_empty() {
         assert!(load("toy.urdf").collision.is_empty());
+    }
+
+    #[test]
+    fn parses_capsule_collision_not_dropped() {
+        // <capsule radius=0.1 length=0.4> on l1 must now parse into a
+        // CollisionShape::Capsule (NOT be dropped), closing the silent-drop gap.
+        let m = load("collide_capsule.urdf");
+        assert_eq!(m.collision.len(), 1, "the capsule became one collider");
+        assert!(
+            m.dropped_collider_frames.is_empty(),
+            "a parsed capsule must NOT be reported as dropped"
+        );
+        match &m.collision[0].shape {
+            CollisionShape::Capsule { radius, length } => {
+                assert!((radius - 0.1).abs() < 1e-12);
+                assert!((length - 0.4).abs() < 1e-12);
+            }
+            other => panic!("expected Capsule, got {other:?}"),
+        }
+        assert_eq!(m.collision[0].frame, m.frame_id("l1").unwrap());
     }
 
     #[test]

@@ -9,6 +9,7 @@ mod limits;
 mod movej;
 mod poses;
 mod scurve;
+mod topp;
 mod trajectory;
 mod waypoints;
 
@@ -17,6 +18,7 @@ pub use limits::{JointOverride, MotionLimits, MotionLimitsConfig};
 pub use movej::move_j;
 pub use poses::{NamedPose, PoseLibrary};
 pub use scurve::{ScurveProfile, plan_scurve, plan_scurve_to_duration};
+pub use topp::retime_time_optimal;
 pub use trajectory::{TrajKind, TrajState, Trajectory};
 pub use waypoints::retime_waypoints;
 

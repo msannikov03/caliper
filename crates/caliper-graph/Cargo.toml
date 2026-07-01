@@ -30,3 +30,6 @@ caliper-motion.workspace = true
 caliper-hal.workspace = true
 caliper-planning.workspace = true
 caliper-collision.workspace = true
+
+[dev-dependencies]
+proptest = "1"

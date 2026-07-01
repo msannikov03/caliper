@@ -715,6 +715,7 @@ dependencies = [
  "caliper-planning",
  "caliper-spatial",
  "nalgebra",
+ "proptest",
  "serde",
  "thiserror 2.0.18",
 ]

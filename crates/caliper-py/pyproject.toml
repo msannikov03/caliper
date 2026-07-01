@@ -13,3 +13,5 @@ classifiers = ["Programming Language :: Rust"]
 module-name = "caliper._caliper"
 python-source = "python"
 features = ["pyo3/extension-module"]
+# Ship the PEP 561 type stubs + marker so `import caliper` is fully typed.
+include = ["python/caliper/py.typed", "python/caliper/*.pyi"]

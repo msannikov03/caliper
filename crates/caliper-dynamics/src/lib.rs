@@ -194,6 +194,50 @@ pub fn potential_energy(model: &Model, joint_world: &[Se3], gravity: &Vector3<f6
     pe
 }
 
+/// Total mass of the movable mechanism: `Σ mᵢ` over every movable link's
+/// composite inertia (including any folded fixed-welded descendants). The fixed
+/// base is not part of this sum (its inertia is dropped for a fixed-base model),
+/// matching Pinocchio's `centerOfMass`, which excludes the universe body.
+pub fn total_mass(model: &Model) -> f64 {
+    model.inertia.iter().map(|si| si.mass()).sum()
+}
+
+/// Mass-weighted world center of mass `r_com = Σ mᵢ·r_com_i / Σ mᵢ` at `q`.
+///
+/// Reuses `fk_joints` for each movable link's world placement and the same
+/// COM-offset extraction as [`potential_energy`] (recovered from the `−m·[c]×`
+/// block of the spatial inertia). The fixed base is excluded, so this matches
+/// Pinocchio's `centerOfMass` (which sums only the movable joint subtrees).
+/// Errors [`DynError::NoInertia`] when the model lacks `<inertial>` data.
+pub fn center_of_mass(model: &Model, q: &[f64]) -> Result<Vector3<f64>, DynError> {
+    check_dims(model, &[("q", q.len())])?;
+    let mut jw = vec![Se3::identity(); model.ndof];
+    fk_joints(model, q, &mut jw);
+    let mut m_total = 0.0;
+    let mut weighted = Vector3::zeros();
+    for (si, jw_i) in model.inertia.iter().zip(jw.iter()) {
+        let m = si.mass();
+        if m <= 0.0 {
+            continue;
+        }
+        // COM offset c in the link frame, recovered from the (0,3) block −m·[c]×
+        // (same indices as potential_energy).
+        let g = si.matrix();
+        let cx = -g[(2, 4)] / m; // c.x
+        let cy = -g[(0, 5)] / m; // c.y
+        let cz = -g[(1, 3)] / m; // c.z
+        let r = jw_i.0 * nalgebra::Point3::new(cx, cy, cz);
+        weighted += m * r.coords;
+        m_total += m;
+    }
+    // has_inertia guaranteed a nonzero movable mass; guard anyway so a degenerate
+    // all-zero-mass model returns the origin instead of a NaN division.
+    if m_total <= 0.0 {
+        return Ok(Vector3::zeros());
+    }
+    Ok(weighted / m_total)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IntegratorKind {
     Symplectic,

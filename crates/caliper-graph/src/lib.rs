@@ -362,3 +362,339 @@ mod tests {
         assert_eq!(PortRef::Index(0).resolve(&k.out_port_names()), Some(0));
     }
 }
+
+/// Property-based **fuzz** tests over ARBITRARY (incl. adversarial / degenerate)
+/// [`GraphDoc`]s — this is exactly the untrusted input a Studio / CLI / PyO3 user
+/// can hand to `graph_run`. The invariants proved here:
+///
+/// 1. [`validate`] NEVER panics and always returns a self-consistent
+///    [`Diagnostics`] (`topo_order` XOR `cycle`; `is_ok()` iff no errors).
+/// 2. [`run`] NEVER unwinds: it returns `Ok(GraphResult)` or a *structured*
+///    `Err(GraphError)` (validation-class or per-node-compute), never a panic.
+/// 3. Validation FULLY protects the executor: a doc that `validate().is_ok()`
+///    never makes `run` bail at the validation gate — any later failure is a
+///    structured [`GraphError::Node`]; and reaching `Ok` implies the doc validated.
+/// 4. A well-formed pipeline over the runtime-total node family (sources → MoveJ →
+///    View/Scope) both validates and runs to `Ok` (the positive protection path).
+///
+/// Strategies deliberately generate degenerate params (empty / wrong-ndof /
+/// non-finite / huge / negative configs, non-finite pose & box values, unknown
+/// frames & scope signals) and adversarial edges (dangling ids, wrong ports,
+/// type-mismatches, cycles, multi-feeders) on a fixed loaded robot. Bounds keep it
+/// fast + deterministic (proptest defaults): almost every random doc short-circuits
+/// at the validation gate, and the rare valid one only touches cheap, bounded ops.
+#[cfg(test)]
+mod fuzz {
+    use super::*;
+    use caliper_model::Robot;
+    use proptest::prelude::*;
+    use proptest::strategy::BoxedStrategy;
+    use std::path::Path;
+
+    fn robot(name: &str) -> Robot {
+        Robot::from_urdf(Path::new(&format!(
+            "{}/../../oracle/fixtures/robots/{}",
+            env!("CARGO_MANIFEST_DIR"),
+            name
+        )))
+        .unwrap()
+    }
+
+    // ----- scalar / vector building blocks (normal values + degenerate specials) -----
+
+    /// A "wild" `f64`: ordinary finite values salted with the degenerate cases a
+    /// validator must reject (NaN / ±inf / zero) AND a finite HUGE magnitude. Used
+    /// only for scalars whose magnitude cannot drive an unbounded executor loop —
+    /// gains, gravity, obstacle boxes, ground — never for a config/pose (see below).
+    fn any_f64() -> impl Strategy<Value = f64> {
+        prop_oneof![
+            6 => -3.0f64..3.0,
+            1 => Just(f64::NAN),
+            1 => Just(f64::INFINITY),
+            1 => Just(f64::NEG_INFINITY),
+            1 => Just(1e18),
+            1 => Just(-1e18),
+            1 => Just(0.0),
+        ]
+    }
+
+    /// A "tame" `f64` for CONFIG and POSE components: bounded finite magnitude plus
+    /// the non-finite degenerates (NaN / ±inf) that validation must reject. It omits
+    /// the finite-HUGE value on purpose: validation treats a large-finite config
+    /// exactly like a normal one (only finiteness/length matter), yet a huge-finite
+    /// config or pose would make `move_j`/`move_l` bake an astronomically long
+    /// trajectory — so excluding it costs zero validation coverage while keeping the
+    /// (rare) executed motion node provably bounded and the fuzz run fast.
+    fn tame_f64() -> impl Strategy<Value = f64> {
+        prop_oneof![
+            6 => -3.0f64..3.0,
+            1 => Just(f64::NAN),
+            1 => Just(f64::INFINITY),
+            1 => Just(f64::NEG_INFINITY),
+            1 => Just(0.0),
+        ]
+    }
+
+    /// A config vector of *arbitrary* length 0..=8 — exercises empty, wrong-ndof
+    /// (model.ndof is 6 / 3), and matching-length configs, all with degenerate values.
+    fn any_qvec() -> impl Strategy<Value = Vec<f64>> {
+        prop::collection::vec(tame_f64(), 0..=8)
+    }
+
+    /// A duration / dt scalar for GravityDrop. The valid arm is COARSE (`dt ≥ 1e-3`,
+    /// `dur ≤ 1`) so any pairing that survives validation implies ≤ ~1000 sim steps;
+    /// the degenerate values (NaN / inf / 0 / negative / huge) either fail validation
+    /// or (huge/huge) collapse to one step — so no validation-passing combination can
+    /// drive an expensive rollout.
+    fn dur_dt() -> impl Strategy<Value = f64> {
+        prop_oneof![
+            4 => 0.001f64..1.0,
+            1 => Just(f64::NAN),
+            1 => Just(f64::INFINITY),
+            1 => Just(0.0),
+            1 => Just(-1.0),
+            1 => Just(1e18),
+        ]
+    }
+
+    fn arr3() -> impl Strategy<Value = [f64; 3]> {
+        proptest::array::uniform3(any_f64())
+    }
+
+    fn boxes() -> impl Strategy<Value = Vec<([f64; 3], [f64; 3])>> {
+        prop::collection::vec((arr3(), arr3()), 0..=2)
+    }
+
+    fn small_name() -> impl Strategy<Value = String> {
+        prop::sample::select(vec!["home", "ready", "", "x"]).prop_map(String::from)
+    }
+
+    /// Optional frame name: mostly `None` / unknown frames (validation rejects), so
+    /// the frame-check path is exercised without needing a real frame id.
+    fn opt_frame() -> impl Strategy<Value = Option<String>> {
+        proptest::option::of(
+            prop::sample::select(vec!["tool0", "flange", "wrist_3", "bogus_frame", ""])
+                .prop_map(String::from),
+        )
+    }
+
+    /// Scope signal string mixing valid (`q0`, `qd2`, `tip_x`, `energy`, `t`) and
+    /// invalid (`q99` out-of-range, `bogus`, bare `q`, empty) forms.
+    fn signal_strat() -> impl Strategy<Value = String> {
+        prop::sample::select(vec![
+            "q0", "q5", "q99", "qd0", "qd2", "tip_x", "tip_y", "tip_z", "energy", "t", "bogus",
+            "q", "qd", "",
+        ])
+        .prop_map(String::from)
+    }
+
+    // ----- node kinds (grouped so each prop_oneof! stays within the tuple arity) -----
+
+    fn sources() -> BoxedStrategy<NodeKind> {
+        prop_oneof![
+            any_qvec().prop_map(|q| NodeKind::StartConfig { q }),
+            // Pose components are `tame` too: a huge-finite goal pose would drive
+            // `move_l`'s Cartesian duration unbounded (non-finite is rejected anyway).
+            proptest::array::uniform16(tame_f64()).prop_map(|m| NodeKind::GoalPose { m }),
+            (any_qvec(), small_name()).prop_map(|(q, name)| NodeKind::NamedConfig { q, name }),
+        ]
+        .boxed()
+    }
+
+    fn compute() -> BoxedStrategy<NodeKind> {
+        prop_oneof![
+            (opt_frame(), proptest::option::of(any_qvec()))
+                .prop_map(|(frame, seed)| NodeKind::Ik { frame, seed }),
+            Just(NodeKind::MoveJ {}),
+            opt_frame().prop_map(|frame| NodeKind::MoveL { frame }),
+            (any::<u64>(), proptest::option::of(any_f64()), boxes()).prop_map(
+                |(seed, ground, boxes)| NodeKind::PlanRrt {
+                    seed,
+                    ground,
+                    boxes
+                }
+            ),
+            (any_f64(), any_f64()).prop_map(|(kp, kd)| NodeKind::Control { kp, kd }),
+            (proptest::option::of(arr3()), dur_dt(), dur_dt()).prop_map(
+                |(gravity, duration, dt)| NodeKind::GravityDrop {
+                    gravity,
+                    duration,
+                    dt
+                }
+            ),
+            (proptest::option::of(any_f64()), boxes())
+                .prop_map(|(ground, boxes)| NodeKind::CollisionCheck { ground, boxes }),
+        ]
+        .boxed()
+    }
+
+    fn sinks() -> BoxedStrategy<NodeKind> {
+        prop_oneof![
+            Just(NodeKind::View {}),
+            signal_strat().prop_map(|signal| NodeKind::Scope { signal }),
+        ]
+        .boxed()
+    }
+
+    fn node_kind() -> BoxedStrategy<NodeKind> {
+        prop_oneof![sources(), compute(), sinks()].boxed()
+    }
+
+    // ----- ids / ports / edges (a small id pool ⇒ realistic dangling + duplicates) -----
+
+    /// Node ids drawn from a tiny pool so duplicate ids arise naturally.
+    fn node_id() -> impl Strategy<Value = String> {
+        prop::sample::select(vec!["a", "b", "c", "d", "e"]).prop_map(String::from)
+    }
+
+    /// Edge endpoints from a slightly larger pool (incl. `ghost`, never a node) so
+    /// dangling-endpoint edges are common.
+    fn edge_id() -> impl Strategy<Value = String> {
+        prop::sample::select(vec!["a", "b", "c", "d", "e", "ghost"]).prop_map(String::from)
+    }
+
+    /// A port ref that is EITHER a positional index (some out of range) OR a name
+    /// (some valid for one node kind, some — like `bogus` — for none).
+    fn port_ref() -> impl Strategy<Value = PortRef> {
+        prop_oneof![
+            (0usize..4).prop_map(PortRef::Index),
+            prop::sample::select(vec![
+                "config", "pose", "clip", "report", "start", "goal", "seed", "bogus",
+            ])
+            .prop_map(|s| PortRef::Name(s.into())),
+        ]
+    }
+
+    fn edge_strat() -> impl Strategy<Value = Edge> {
+        (edge_id(), port_ref(), edge_id(), port_ref()).prop_map(|(from, from_port, to, to_port)| {
+            Edge {
+                from,
+                from_port,
+                to,
+                to_port,
+            }
+        })
+    }
+
+    fn node_strat() -> impl Strategy<Value = Node> {
+        (node_id(), node_kind()).prop_map(|(id, kind)| Node { id, kind })
+    }
+
+    fn doc_strat() -> impl Strategy<Value = GraphDoc> {
+        (
+            prop::collection::vec(node_strat(), 1..=6),
+            prop::collection::vec(edge_strat(), 0..=8),
+        )
+            .prop_map(|(nodes, edges)| GraphDoc {
+                nodes,
+                edges,
+                metadata: Default::default(),
+            })
+    }
+
+    /// Shared structural invariants of any [`Diagnostics`], regardless of the doc.
+    fn assert_diag_consistent(d: &Diagnostics, n_nodes: usize) -> Result<(), TestCaseError> {
+        // topo_order and cycle are mutually exclusive.
+        prop_assert!(
+            d.topo_order.is_empty() || d.cycle.is_empty(),
+            "topo_order and cycle both populated"
+        );
+        if d.is_ok() {
+            prop_assert!(
+                d.node_errors.is_empty() && d.edge_errors.is_empty() && d.cycle.is_empty()
+            );
+            prop_assert_eq!(d.topo_order.len(), n_nodes, "ok ⇒ full topo order");
+        } else {
+            prop_assert!(
+                !d.node_errors.is_empty() || !d.edge_errors.is_empty() || !d.cycle.is_empty(),
+                "not ok ⇒ some error/cycle recorded"
+            );
+        }
+        Ok(())
+    }
+
+    proptest! {
+        /// `validate` never panics and returns a self-consistent `Diagnostics` on
+        /// arbitrary adversarial docs — over both a 6-dof and a 3-dof model.
+        #[test]
+        fn validate_never_panics(doc in doc_strat()) {
+            for name in ["showcase6.urdf", "collide_arm.urdf"] {
+                let r = robot(name);
+                let d = validate(&doc, &r.model);
+                assert_diag_consistent(&d, doc.nodes.len())?;
+            }
+        }
+
+        /// `run` never unwinds on arbitrary adversarial docs: it yields `Ok` or a
+        /// STRUCTURED `Err`. Proves validation fully guards the executor —
+        ///  * `Ok`                        ⇒ the doc validated,
+        ///  * `Err(Validation)`           ⇒ the doc did NOT validate (run bailed at the gate),
+        ///  * `Err(Node)`                 ⇒ the doc DID validate (failure is a per-node compute error).
+        #[test]
+        fn run_never_panics_and_validation_guards_executor(doc in doc_strat()) {
+            let r = robot("showcase6.urdf");
+            // Pre-validation must agree with run's internal gate (same model, deterministic).
+            let pre = validate(&doc, &r.model);
+            assert_diag_consistent(&pre, doc.nodes.len())?;
+            match run(&doc, &r) {
+                Ok(res) => {
+                    prop_assert!(pre.is_ok(), "run produced Ok but pre-validation was not ok");
+                    prop_assert!(res.diagnostics.is_ok(), "Ok result must carry ok diagnostics");
+                }
+                Err(GraphError::Validation { diagnostics }) => {
+                    prop_assert!(!diagnostics.is_ok(), "Validation error must carry failing diagnostics");
+                    prop_assert!(!pre.is_ok(), "run bailed at validation but the doc validated");
+                }
+                Err(GraphError::Node { .. }) => {
+                    prop_assert!(pre.is_ok(), "a Node error is only reachable after validation passed");
+                }
+            }
+        }
+
+        /// Positive path: a well-formed pipeline over the runtime-TOTAL node family
+        /// (StartConfig → MoveJ → View + Scope) ALWAYS validates and runs to `Ok`
+        /// for any bounded configs and any valid scope signal — i.e. validation
+        /// passing is *sufficient* for these nodes to execute cleanly.
+        #[test]
+        fn valid_movej_pipeline_always_runs_ok(
+            start in prop::collection::vec(-1.0f64..1.0, 6),
+            goal in prop::collection::vec(-1.0f64..1.0, 6),
+            signal in prop::sample::select(vec![
+                "q0", "qd0", "tip_x", "tip_y", "tip_z", "t", "energy",
+            ]),
+        ) {
+            let r = robot("showcase6.urdf");
+            let n = |id: &str, kind| Node { id: id.into(), kind };
+            let e = |from: &str, fp: &str, to: &str, tp: &str| Edge {
+                from: from.into(),
+                from_port: PortRef::Name(fp.into()),
+                to: to.into(),
+                to_port: PortRef::Name(tp.into()),
+            };
+            let doc = GraphDoc {
+                nodes: vec![
+                    n("s", NodeKind::StartConfig { q: start }),
+                    n("g", NodeKind::StartConfig { q: goal }),
+                    n("mj", NodeKind::MoveJ {}),
+                    n("v", NodeKind::View {}),
+                    n("sc", NodeKind::Scope { signal: signal.into() }),
+                ],
+                edges: vec![
+                    e("s", "config", "mj", "start"),
+                    e("g", "config", "mj", "goal"),
+                    e("mj", "clip", "v", "clip"),
+                    e("mj", "clip", "sc", "clip"),
+                ],
+                ..Default::default()
+            };
+            let d = validate(&doc, &r.model);
+            prop_assert!(d.is_ok(), "constructed pipeline must validate: {:?}", d);
+            let res = run(&doc, &r)
+                .map_err(|err| TestCaseError::fail(format!("valid pipeline failed to run: {err:?}")))?;
+            let clip = res.terminal_clip.ok_or_else(|| TestCaseError::fail("no terminal clip"))?;
+            prop_assert!(!clip.is_empty(), "terminal clip must be non-empty");
+            prop_assert_eq!(res.scopes.len(), 1, "exactly one scope series");
+            prop_assert_eq!(res.scopes[0].y.len(), clip.len(), "scope y len == clip len");
+        }
+    }
+}

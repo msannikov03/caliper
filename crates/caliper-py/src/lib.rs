@@ -497,6 +497,30 @@ impl Robot {
             .map_err(dyn_err)
     }
 
+    /// Mass-weighted world center of mass `[x,y,z]` at `q` (metres). Sums the
+    /// movable links (fixed base excluded), matching Pinocchio's `centerOfMass`.
+    fn center_of_mass(&self, q: Vec<f64>) -> PyResult<[f64; 3]> {
+        let m = &self.inner.model;
+        if q.len() != m.ndof {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "q length {} != ndof {}",
+                q.len(),
+                m.ndof
+            )));
+        }
+        finite_or_err("q", &q)?;
+        dynamics::center_of_mass(m, &q)
+            .map(|c| [c.x, c.y, c.z])
+            .map_err(dyn_err)
+    }
+
+    /// Total mass of the movable mechanism (kg); fixed base excluded, matching
+    /// the sum of Pinocchio's movable-body masses.
+    #[getter]
+    fn total_mass(&self) -> f64 {
+        dynamics::total_mass(&self.inner.model)
+    }
+
     /// True iff the URDF carried `<inertial>` on every link (dynamics available).
     #[getter]
     fn has_inertia(&self) -> bool {

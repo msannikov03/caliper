@@ -1,0 +1,24 @@
+[book]
+title = "Caliper — the open robotics engine"
+description = "One deterministic Rust engine for serial-arm robotics, exposed through three faces (CLI, Python, Studio). Reference documentation, capability guide, and the honest verification story."
+authors = ["The Caliper authors"]
+language = "en"
+src = "src"
+
+[output.html]
+default-theme = "navy"
+preferred-dark-theme = "navy"
+git-repository-url = "https://github.com/msannikov03/caliper"
+edit-url-template = "https://github.com/msannikov03/caliper/edit/main/docs/book/{path}"
+no-section-label = false
+
+[output.html.fold]
+enable = true
+level = 1
+
+# NOTE: this book is authored as plain Markdown and is the deliverable regardless
+# of whether `mdbook` is installed. To render it locally:
+#   cargo install mdbook          # once
+#   mdbook serve docs/book        # live preview at http://localhost:3000
+#   mdbook build docs/book        # static site into docs/book/book/
+# There is deliberately no CI mdbook step — nothing here should fail a build.

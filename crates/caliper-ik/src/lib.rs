@@ -11,6 +11,11 @@ use nalgebra::{Cholesky, DVector};
 mod analytic;
 pub use analytic::analytic_ik_6r;
 
+mod redundancy;
+pub use redundancy::{
+    RedundancyOpts, joint_limit_avoidance_gradient, nullspace_step, resolved_rate,
+};
+
 const UNBOUNDED: f64 = 1.0e6;
 
 #[derive(Clone, Debug)]

@@ -11,6 +11,7 @@
 //! Reachability analysis lives in [`reach`]. Planning is a pure-CPU, dependency-
 //! light crate (the cuRobo GPU sidecar is deferred).
 
+mod prm;
 mod rng;
 mod rrt;
 mod rrtstar;
@@ -25,6 +26,7 @@ use caliper_ik::{IkOpts, ik};
 use caliper_model::Model;
 use caliper_motion::{MotionLimits, Trajectory, retime_waypoints};
 use caliper_spatial::Se3;
+use prm::{PrmParams, build_roadmap};
 use rng::Rng;
 use rrt::{Tree, dist, lerp, steer};
 use rrtstar::{StarParams, rrt_star};
@@ -250,6 +252,69 @@ impl Planner {
             self.motion_valid(a, b)
         })
         .ok_or(PlanError::Unreachable(iters))?;
+        Ok(self.smooth(raw))
+    }
+
+    /// Plan a collision-free, smoothed joint-space waypoint path from `start` to
+    /// `goal` with a **PRM** (Probabilistic RoadMap — a multi-query sampling
+    /// planner). Rejection-samples `samples` collision-free milestones inside the
+    /// joint bounds, wires each to its `k` nearest collision-free neighbours, then
+    /// connects `start`/`goal` and returns the shortest roadmap path (Dijkstra over
+    /// joint-space edge lengths), shortcut-smoothed.
+    ///
+    /// Unlike [`plan`](Self::plan) (RRT-Connect) and [`plan_optimal`](Self::plan_optimal)
+    /// (RRT*), which grow a fresh tree per query, PRM's strength is a reusable
+    /// roadmap; this MVP builds + queries it in one call. Same validity model and
+    /// resolution, same determinism (a given `seed`/`samples`/`k` yields the same
+    /// path). Endpoints equal `start`/`goal` and every edge is collision-free at the
+    /// planner resolution (independently re-checkable with
+    /// [`verify_path`](Self::verify_path)). `Unreachable` if the roadmap fails to
+    /// connect the endpoints (try more `samples` or a larger `k`).
+    pub fn plan_prm(
+        &self,
+        start: &[f64],
+        goal: &[f64],
+        samples: usize,
+        k: usize,
+    ) -> Result<Vec<Vec<f64>>, PlanError> {
+        self.validate_cfg()?;
+        if samples == 0 {
+            return Err(PlanError::InvalidConfig("samples must be > 0"));
+        }
+        if k == 0 {
+            return Err(PlanError::InvalidConfig("k must be > 0"));
+        }
+        let n = self.model.ndof;
+        for (name, q) in [("start", start), ("goal", goal)] {
+            if q.len() != n {
+                return Err(PlanError::Dim {
+                    expected: n,
+                    got: q.len(),
+                });
+            }
+            if !q.iter().all(|x| x.is_finite()) {
+                return Err(PlanError::NonFinite(name));
+            }
+        }
+        self.check_bounds(start, "start")?;
+        self.check_bounds(goal, "goal")?;
+        self.check_endpoint(start, true)?;
+        self.check_endpoint(goal, false)?;
+
+        let params = PrmParams {
+            seed: self.cfg.seed,
+            samples,
+            k,
+        };
+        let roadmap = build_roadmap(
+            &self.bounds,
+            &params,
+            |q| self.config_free(q),
+            |a, b| self.motion_valid(a, b),
+        );
+        let raw = roadmap
+            .query(start, goal, k, |a, b| self.motion_valid(a, b))
+            .ok_or(PlanError::Unreachable(samples))?;
         Ok(self.smooth(raw))
     }
 
@@ -728,6 +793,138 @@ mod tests {
         assert!(matches!(
             p.plan(&[0.0, f64::NAN, 0.0], &[0.0, 0.0, 0.0]),
             Err(PlanError::NonFinite(_))
+        ));
+    }
+
+    // ---- PRM (plan_prm) cross-validation ----
+
+    #[test]
+    fn prm_connects_collision_free_endpoints() {
+        let p = arm_planner(WorldScene::new());
+        let start = vec![0.0, 0.0, 0.0];
+        let goal = vec![0.4, -0.4, 0.4];
+        let path = p.plan_prm(&start, &goal, 250, 8).unwrap();
+        assert!(path.len() >= 2);
+        assert_eq!(&path[0], &start, "endpoint must equal start exactly");
+        assert_eq!(
+            path.last().unwrap(),
+            &goal,
+            "endpoint must equal goal exactly"
+        );
+        // Cross-validate against the engine's own dense collision check.
+        assert!(
+            p.verify_path(&path),
+            "PRM path must be collision-free at fine resolution"
+        );
+        // Any valid path is at least the straight-line joint distance.
+        assert!(path_length(&path) >= dist(&start, &goal) - 1e-9);
+    }
+
+    #[test]
+    fn prm_deterministic_same_seed() {
+        let a = arm_planner(WorldScene::new())
+            .plan_prm(&[0.0, 0.0, 0.0], &[0.4, -0.4, 0.4], 200, 6)
+            .unwrap();
+        let b = arm_planner(WorldScene::new())
+            .plan_prm(&[0.0, 0.0, 0.0], &[0.4, -0.4, 0.4], 200, 6)
+            .unwrap();
+        assert_eq!(a, b, "same seed ⇒ identical PRM path");
+    }
+
+    #[test]
+    fn prm_with_world_scene_collision_free() {
+        // Ground half-space + a box obstacle. Endpoints self-checked clear against
+        // the same CollisionModel the planner uses; the returned roadmap path must
+        // be collision-free under that world (verified at finer resolution).
+        let scene = WorldScene::new()
+            .with_ground(-0.1)
+            .add_box([0.6, 0.0, 0.3], [0.15, 0.15, 0.15]);
+        let start = vec![0.0, 0.0, 0.0];
+        let goal = vec![0.4, -0.4, 0.4];
+        let cm = CollisionModel::new(model("collide_arm.urdf"), scene.clone(), 0.0);
+        assert!(
+            !cm.query(&start).unwrap().has_collision(),
+            "start must be clear"
+        );
+        assert!(
+            !cm.query(&goal).unwrap().has_collision(),
+            "goal must be clear"
+        );
+        let p = arm_planner(scene);
+        let path = p.plan_prm(&start, &goal, 300, 10).unwrap();
+        assert_eq!(&path[0], &start);
+        assert_eq!(path.last().unwrap(), &goal);
+        assert!(
+            p.verify_path(&path),
+            "PRM path must be collision-free under the world"
+        );
+    }
+
+    #[test]
+    fn prm_trivial_query_is_short() {
+        // start/goal are directly connectable in free space → the roadmap's
+        // direct-edge fallback yields a straight, minimal path (post-smoothing a
+        // single segment), not a long detour through milestones.
+        let p = arm_planner(WorldScene::new());
+        let start = vec![0.0, 0.0, 0.0];
+        let goal = vec![0.2, -0.1, 0.15];
+        assert!(
+            p.motion_valid(&start, &goal),
+            "test premise: endpoints are directly connectable"
+        );
+        let path = p.plan_prm(&start, &goal, 150, 6).unwrap();
+        assert!(p.verify_path(&path));
+        // A directly-connectable query smooths to the straight line.
+        assert!(
+            (path_length(&path) - dist(&start, &goal)).abs() < 1e-9,
+            "trivial query should collapse to the straight segment, got len {:.6} vs {:.6}",
+            path_length(&path),
+            dist(&start, &goal),
+        );
+    }
+
+    #[test]
+    fn prm_invalid_samples_or_k_errors() {
+        let p = arm_planner(WorldScene::new());
+        let start = vec![0.0, 0.0, 0.0];
+        let goal = vec![0.4, -0.4, 0.4];
+        assert!(matches!(
+            p.plan_prm(&start, &goal, 0, 6),
+            Err(PlanError::InvalidConfig(_))
+        ));
+        assert!(matches!(
+            p.plan_prm(&start, &goal, 100, 0),
+            Err(PlanError::InvalidConfig(_))
+        ));
+    }
+
+    #[test]
+    fn prm_guards_dim_bounds_collision() {
+        let p = arm_planner(WorldScene::new());
+        assert!(matches!(
+            p.plan_prm(&[0.0, 0.0], &[0.0, 0.0, 0.0], 100, 6),
+            Err(PlanError::Dim { .. })
+        ));
+        assert!(matches!(
+            p.plan_prm(&[0.0, f64::NAN, 0.0], &[0.0, 0.0, 0.0], 100, 6),
+            Err(PlanError::NonFinite(_))
+        ));
+        assert!(matches!(
+            p.plan_prm(&[100.0, 0.0, 0.0], &[0.0, 0.0, 0.0], 100, 6),
+            Err(PlanError::OutOfBounds { which: "start", .. })
+        ));
+        assert!(matches!(
+            p.plan_prm(&[0.0, 0.0, 0.0], &[0.0, 100.0, 0.0], 100, 6),
+            Err(PlanError::OutOfBounds { which: "goal", .. })
+        ));
+        let folded = vec![0.0, std::f64::consts::PI, std::f64::consts::PI];
+        assert!(matches!(
+            p.plan_prm(&folded, &[0.0, 0.0, 0.0], 100, 6),
+            Err(PlanError::StartInCollision(_))
+        ));
+        assert!(matches!(
+            p.plan_prm(&[0.0, 0.0, 0.0], &folded, 100, 6),
+            Err(PlanError::GoalInCollision(_))
         ));
     }
 }

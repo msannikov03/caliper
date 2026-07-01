@@ -650,6 +650,7 @@ dependencies = [
  "caliper-motion",
  "caliper-planning",
  "caliper-spatial",
+ "caliper-trajopt",
 ]
 
 [[package]]
@@ -812,6 +813,17 @@ version = "0.1.0"
 dependencies = [
  "nalgebra",
  "proptest",
+]
+
+[[package]]
+name = "caliper-trajopt"
+version = "0.1.0"
+dependencies = [
+ "caliper-collision",
+ "caliper-kinematics",
+ "caliper-model",
+ "nalgebra",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

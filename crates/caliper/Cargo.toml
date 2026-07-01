@@ -26,6 +26,7 @@ caliper-ik.workspace = true
 caliper-motion.workspace = true
 caliper-hal.workspace = true
 caliper-planning.workspace = true
+caliper-trajopt.workspace = true
 caliper-collision.workspace = true
 caliper-graph.workspace = true
 caliper-calib.workspace = true

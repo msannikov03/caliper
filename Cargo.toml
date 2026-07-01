@@ -10,6 +10,7 @@ members = [
   "crates/caliper-hal",
   "crates/caliper-collision",
   "crates/caliper-planning",
+  "crates/caliper-trajopt",
   "crates/caliper-graph",
   "crates/caliper-calib",
   "crates/caliper",
@@ -52,6 +53,7 @@ caliper-motion     = { path = "crates/caliper-motion", version = "0.1.0" }
 caliper-hal        = { path = "crates/caliper-hal", version = "0.1.0" }
 caliper-collision  = { path = "crates/caliper-collision", version = "0.1.0" }
 caliper-planning   = { path = "crates/caliper-planning", version = "0.1.0" }
+caliper-trajopt    = { path = "crates/caliper-trajopt", version = "0.1.0" }
 caliper-graph      = { path = "crates/caliper-graph", version = "0.1.0" }
 caliper-calib      = { path = "crates/caliper-calib", version = "0.1.0" }
 caliper            = { path = "crates/caliper", version = "0.1.0" }

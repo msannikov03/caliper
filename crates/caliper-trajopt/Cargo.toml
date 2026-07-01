@@ -1,0 +1,24 @@
+[package]
+name = "caliper-trajopt"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+description = "CHOMP-style collision-aware trajectory optimization (smoothness + obstacle)"
+keywords = ["robotics", "trajectory-optimization", "chomp", "motion-planning", "collision"]
+categories = ["science::robotics", "algorithms"]
+
+# CHOMP-style trajectory optimizer: minimizes a smoothness (finite-difference
+# acceleration) cost plus an obstacle-proximity cost by projected gradient descent
+# with FIXED endpoints. Pure nalgebra/std — ZERO heavy deps, deterministic (no
+# `rand`), so the lean `caliper` facade can re-export it. The authoritative
+# collision gate is the validated `caliper_collision::CollisionModel`.
+[dependencies]
+thiserror.workspace = true
+nalgebra.workspace = true
+caliper-model.workspace = true
+caliper-kinematics.workspace = true
+caliper-collision.workspace = true

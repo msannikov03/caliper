@@ -15,6 +15,7 @@ pub use caliper_model as model;
 pub use caliper_motion as motion;
 pub use caliper_planning as planning;
 pub use caliper_spatial as spatial;
+pub use caliper_trajopt as trajopt;
 
 /// Engine version (from Cargo).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

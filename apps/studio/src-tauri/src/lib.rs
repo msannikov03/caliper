@@ -426,6 +426,18 @@ fn ext_ok(p: &Path) -> bool {
 
 // ===== commands =====
 
+/// Log-and-forward for command results: a `Result::Err` headed for the webview
+/// is recorded at error level (target `studio::cmd`) so backend failures leave
+/// a trace in the log file even if the UI only flashes a transient banner.
+/// Used ONLY on low-frequency, user-initiated commands (graph/plan/sim runs) —
+/// never on per-frame paths like `get_frames`/`solve_ik`, which would flood.
+fn logged<T>(cmd: &str, r: Result<T, String>) -> Result<T, String> {
+    if let Err(e) = &r {
+        log::error!(target: "studio::cmd", "{cmd} failed: {e}");
+    }
+    r
+}
+
 /// Engine version (proves the UI is talking to the real Rust core).
 #[tauri::command]
 fn engine_version() -> String {
@@ -503,21 +515,44 @@ fn load_robot(path: String) -> Result<RobotSummary, String> {
 /// the model cached here, so the engine owns all kinematics.
 #[tauri::command]
 fn robot_info(path: String, state: tauri::State<'_, AppState>) -> Result<RobotInfo, String> {
+    let t0 = std::time::Instant::now();
     let p = Path::new(&path);
     if !ext_ok(p) {
         return Err("only .urdf or .xacro files are supported".into());
     }
-    let model = Model::from_urdf(p).map_err(|_| "failed to load robot from the given URDF")?;
+    let model = Model::from_urdf(p).map_err(|e| {
+        log::error!(target: "studio::cmd", "robot_info: URDF load failed for {path}: {e}");
+        "failed to load robot from the given URDF"
+    })?;
     let info = robot_info_from_model(&model);
     if let Ok(mut p) = state.poses.lock() {
         p.clear();
     }
     // Record the resolved visual-mesh paths BEFORE publishing the model, so a
     // `read_mesh` racing this load can never see the new model with a stale list.
+    let allowlist = visual_mesh_allowlist(&model);
+    // Mesh visuals whose file no longer canonicalizes are silently dropped from
+    // the allowlist — surface the count so a blank-geometry report is diagnosable.
+    let mesh_visuals = model
+        .visuals
+        .iter()
+        .filter(|v| matches!(&v.shape, VisualShape::Mesh { path: Some(_), .. }))
+        .count();
+    let dropped = mesh_visuals.saturating_sub(allowlist.len());
+    log::info!(
+        target: "studio::cmd",
+        "robot_info: loaded '{}' ndof={} visuals={} mesh_allowlist={} dropped_meshes={} in {} ms",
+        info.name,
+        info.ndof,
+        info.visuals.len(),
+        allowlist.len(),
+        dropped,
+        t0.elapsed().as_millis()
+    );
     *state
         .mesh_allowlist
         .lock()
-        .map_err(|_| "state lock poisoned")? = visual_mesh_allowlist(&model);
+        .map_err(|_| "state lock poisoned")? = allowlist;
     *state.model.lock().map_err(|_| "state lock poisoned")? = Some(model);
     Ok(info)
 }
@@ -539,7 +574,11 @@ fn read_mesh(
             .mesh_allowlist
             .lock()
             .map_err(|_| "state lock poisoned")?;
-        allowed_mesh_path(&allow, &path)?
+        allowed_mesh_path(&allow, &path).inspect_err(|e| {
+            // Security signal: the webview asked for a file outside the loaded
+            // robot's visual meshes (or a path that no longer resolves).
+            log::warn!(target: "studio::mesh", "read_mesh REJECTED {path}: {e}");
+        })?
     };
     let bytes = std::fs::read(&canon).map_err(|e| format!("could not read mesh: {e}"))?;
     Ok(tauri::ipc::Response::new(bytes))
@@ -1060,6 +1099,13 @@ fn sim_drop(
     req: SimDropReq,
     state: tauri::State<'_, AppState>,
 ) -> Result<SimTrajectoryDto, String> {
+    logged("sim_drop", sim_drop_impl(req, state))
+}
+
+fn sim_drop_impl(
+    req: SimDropReq,
+    state: tauri::State<'_, AppState>,
+) -> Result<SimTrajectoryDto, String> {
     let guard = state.model.lock().map_err(|_| "state lock poisoned")?;
     let model = guard.as_ref().ok_or("no robot loaded")?;
     if !model.has_inertia {
@@ -1233,6 +1279,13 @@ struct ControlRunReq {
 /// the SAME Phase-3 transport (kind = "control").
 #[tauri::command]
 fn control_run(
+    req: ControlRunReq,
+    state: tauri::State<'_, AppState>,
+) -> Result<SimTrajectoryDto, String> {
+    logged("control_run", control_run_impl(req, state))
+}
+
+fn control_run_impl(
     req: ControlRunReq,
     state: tauri::State<'_, AppState>,
 ) -> Result<SimTrajectoryDto, String> {
@@ -1458,6 +1511,13 @@ fn scene_from(ground: Option<f64>, boxes: Option<Vec<([f64; 3], [f64; 3])>>) -> 
 /// Phase-3 transport (kind = "plan").
 #[tauri::command]
 fn plan_run(
+    req: PlanRunReq,
+    state: tauri::State<'_, AppState>,
+) -> Result<SimTrajectoryDto, String> {
+    logged("plan_run", plan_run_impl(req, state))
+}
+
+fn plan_run_impl(
     req: PlanRunReq,
     state: tauri::State<'_, AppState>,
 ) -> Result<SimTrajectoryDto, String> {
@@ -1730,6 +1790,13 @@ fn clip_to_trajectory(model: &Model, clip: &caliper::graph::ClipData) -> Traject
 /// diagnostics + per-node out-port summaries.
 #[tauri::command]
 fn graph_run(graph_json: String, state: tauri::State<'_, AppState>) -> Result<GraphRunDto, String> {
+    logged("graph_run", graph_run_impl(graph_json, state))
+}
+
+fn graph_run_impl(
+    graph_json: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<GraphRunDto, String> {
     let doc: caliper::graph::GraphDoc =
         serde_json::from_str(&graph_json).map_err(|e| format!("invalid graph JSON: {e}"))?;
 
@@ -1898,8 +1965,53 @@ fn delete_graph(app: tauri::AppHandle, name: String) -> Result<(), String> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Panic hook FIRST — before the Builder ever runs — so even a panic during
+    // plugin/setup init leaves a trace. Captures message + location at error
+    // level, then chains to the previous hook so the default stderr backtrace
+    // still prints. (Panics before the log plugin initializes only reach
+    // stderr via that chained hook; everything after also lands in the file.)
+    let previous_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let msg = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_string())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "<non-string panic payload>".to_string());
+        let loc = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "<unknown location>".to_string());
+        log::error!(target: "studio::panic", "panic at {loc}: {msg}");
+        previous_hook(info);
+    }));
+
+    // DEBUG in dev builds, INFO in release.
+    #[cfg(debug_assertions)]
+    let log_level = log::LevelFilter::Debug;
+    #[cfg(not(debug_assertions))]
+    let log_level = log::LevelFilter::Info;
+
     tauri::Builder::default()
         .manage(AppState::default())
+        .plugin(
+            // Stdout (dev terminal) + rotating file in the OS log dir.
+            // macOS resolves LogDir to ~/Library/Logs/com.sannikov.studio/
+            // (studio.log, rotated at 5 MB, 5 most-recent files kept).
+            // timezone_strategy also installs the timestamp[level][target] line format.
+            tauri_plugin_log::Builder::new()
+                .targets([
+                    tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::Stdout),
+                    tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::LogDir {
+                        file_name: Some("studio".into()),
+                    }),
+                ])
+                .level(log_level)
+                .max_file_size(5 * 1024 * 1024)
+                .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepSome(5))
+                .timezone_strategy(tauri_plugin_log::TimezoneStrategy::UseLocal)
+                .build(),
+        )
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![

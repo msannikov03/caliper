@@ -7,7 +7,9 @@ use caliper::hal::{
 };
 use caliper::ik::{IkOpts, analytic_ik_6r, ik};
 use caliper::kinematics::{JacFrame, Jacobian, SingularityParams, fk_frame, jacobian};
-use caliper::motion::{CartesianMoveOpts, MotionLimits, MotionLimitsConfig, move_j, move_l};
+use caliper::motion::{
+    CartesianMoveOpts, MotionLimits, MotionLimitsConfig, move_j, move_l, retime_time_optimal,
+};
 use caliper::planning::path_length;
 use caliper::planning::reach::{ReachChecker, ReachConfig, ReachStatus};
 use caliper::planning::{Planner, PlannerConfig};
@@ -93,6 +95,11 @@ enum Cmd {
         dt: f64,
         #[arg(long)]
         frame: Option<String>,
+        /// Time-optimal (acceleration-limited, corner-stop bang-bang TOPP)
+        /// retiming instead of the jerk-limited S-curve.
+        /// Joint-space --goal only (not Cartesian --target).
+        #[arg(long)]
+        time_optimal: bool,
     },
     /// Inverse/forward dynamics at a configuration (Phase 4).
     Dyn {
@@ -188,6 +195,10 @@ enum Cmd {
         /// Collider inflation margin (m).
         #[arg(long, default_value_t = 0.0)]
         margin: f64,
+        /// Also print EPA penetration contacts (normal, depth, witness) per
+        /// self-colliding pair.
+        #[arg(long)]
+        contacts: bool,
     },
     /// Plan a collision-free path to a joint goal or Cartesian --target (Phase 6).
     Plan {
@@ -220,6 +231,16 @@ enum Cmd {
         /// RRT* sample budget (only with --optimal).
         #[arg(long, default_value_t = 4000)]
         iters: usize,
+        /// Use the PRM (Probabilistic RoadMap) planner instead of RRT-Connect.
+        /// Joint-space --goal only (not Cartesian --target).
+        #[arg(long)]
+        prm: bool,
+        /// PRM milestone budget (only with --prm).
+        #[arg(long, default_value_t = 400)]
+        samples: usize,
+        /// PRM nearest-neighbour degree (only with --prm).
+        #[arg(long, default_value_t = 8)]
+        k: usize,
     },
     /// Calibrate joint-zero offsets from measured tip poses (kinematic calibration).
     ///
@@ -488,6 +509,7 @@ fn main() -> anyhow::Result<()> {
             start,
             dt,
             frame,
+            time_optimal,
         } => {
             let robot = caliper::model::Robot::from_urdf(&urdf)?;
             let m = &robot.model;
@@ -512,8 +534,18 @@ fn main() -> anyhow::Result<()> {
                     goal.iter().all(|x| x.is_finite()),
                     "goal contains a non-finite value"
                 );
-                (move_j(m, &start, &goal, &limits)?, "MOVE_J")
+                if time_optimal {
+                    // Fine internal knot grid; --dt only paces the printed table.
+                    let traj = retime_time_optimal(&[start.clone(), goal], &limits, 1e-3)?;
+                    (traj, "MOVE_J (time-optimal)")
+                } else {
+                    (move_j(m, &start, &goal, &limits)?, "MOVE_J")
+                }
             } else {
+                anyhow::ensure!(
+                    !time_optimal,
+                    "--time-optimal supports only joint-space --goal, not Cartesian --target"
+                );
                 let t = target.unwrap();
                 anyhow::ensure!(
                     t.len() == 12 && t.iter().all(|x| x.is_finite()),
@@ -875,6 +907,7 @@ fn main() -> anyhow::Result<()> {
             joints,
             ground,
             margin,
+            contacts,
         } => {
             let robot = caliper::model::Robot::from_urdf(&urdf)?;
             let m = &robot.model;
@@ -915,6 +948,28 @@ fn main() -> anyhow::Result<()> {
             for f in &rep.world_hits {
                 println!("  world: {}", m.frame_name(*f));
             }
+            if contacts {
+                let cs = cm.contacts(&joints)?;
+                if cs.is_empty() {
+                    println!("  contacts: (none)");
+                } else {
+                    println!("  contacts ({}):", cs.len());
+                    for (a, b, c) in &cs {
+                        println!(
+                            "    {} <-> {}  depth={:.5}  normal=[{:.4}, {:.4}, {:.4}]  witness=[{:.4}, {:.4}, {:.4}]",
+                            m.frame_name(*a),
+                            m.frame_name(*b),
+                            c.depth,
+                            c.normal.x,
+                            c.normal.y,
+                            c.normal.z,
+                            c.witness.x,
+                            c.witness.y,
+                            c.witness.z
+                        );
+                    }
+                }
+            }
         }
         Cmd::Plan {
             urdf,
@@ -927,6 +982,9 @@ fn main() -> anyhow::Result<()> {
             frame,
             optimal,
             iters,
+            prm,
+            samples,
+            k,
         } => {
             let robot = caliper::model::Robot::from_urdf(&urdf)?;
             let m = &robot.model;
@@ -934,6 +992,7 @@ fn main() -> anyhow::Result<()> {
                 goal.is_some() ^ target.is_some(),
                 "pass exactly one of --goal / --target"
             );
+            anyhow::ensure!(!(optimal && prm), "pass at most one of --optimal / --prm");
             let start = start.unwrap_or_else(|| vec![0.0; m.ndof]);
             anyhow::ensure!(start.len() == m.ndof, "--start needs {} values", m.ndof);
             anyhow::ensure!(
@@ -956,13 +1015,17 @@ fn main() -> anyhow::Result<()> {
                 if optimal {
                     anyhow::ensure!(iters > 0, "--iters must be > 0");
                     planner.plan_optimal(&start, &goal, iters)?
+                } else if prm {
+                    anyhow::ensure!(samples > 0, "--samples must be > 0");
+                    anyhow::ensure!(k > 0, "--k must be > 0");
+                    planner.plan_prm(&start, &goal, samples, k)?
                 } else {
                     planner.plan(&start, &goal)?
                 }
             } else {
                 anyhow::ensure!(
-                    !optimal,
-                    "--optimal supports only joint-space --goal, not Cartesian --target"
+                    !optimal && !prm,
+                    "--optimal/--prm support only joint-space --goal, not Cartesian --target"
                 );
                 let t = target.unwrap();
                 let goal_se3 = target_to_se3(&t)?;
@@ -975,6 +1038,8 @@ fn main() -> anyhow::Result<()> {
                 "  planner     : {}",
                 if optimal {
                     format!("RRT* (optimal, iters={iters})")
+                } else if prm {
+                    format!("PRM (samples={samples}, k={k})")
                 } else {
                     "RRT-Connect".to_string()
                 }

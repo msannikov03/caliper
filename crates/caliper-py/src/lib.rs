@@ -1,16 +1,16 @@
 //! Python bindings (`import caliper`) — the scripting / analysis face.
 use caliper::dynamics::{self, DynError, GRAVITY_EARTH};
 use caliper::hal::{
-    ControlLoop as EngineLoop, DatasetReader as EngineReader, DatasetSpec, Gains, HoldSetpoint,
-    JointMap, LeaderFollowerSource, PhysicsSimBackend, Recorder as EngineRecorder, RobotBackend,
-    SafetyConfig, SafetyMonitor as EngineMonitor, SimBackend,
+    ControlLoop as EngineLoop, DatasetReader as EngineReader, DatasetSpec, Frame, Gains,
+    HoldSetpoint, JointMap, LeaderFollowerSource, PhysicsSimBackend, Recorder as EngineRecorder,
+    RobotBackend, SafetyConfig, SafetyMonitor as EngineMonitor, SimBackend,
 };
-use caliper::ik::{IkOpts, ik};
+use caliper::ik::{IkOpts, RedundancyOpts, ik, nullspace_step, resolved_rate};
 use caliper::kinematics::{JacFrame, Jacobian, SingularityKind, SingularityParams, jacobian};
 use caliper::model::Model;
 use caliper::motion::{
     CartesianMoveOpts, MotionLimits as EngineLimits, MotionLimitsConfig, Trajectory as EngineTraj,
-    move_j, move_l,
+    move_j, move_l, retime_time_optimal,
 };
 use caliper::planning::reach::{ReachChecker as EngineReach, ReachConfig, ReachStatus};
 use caliper::planning::{PlanError, Planner as EnginePlanner, PlannerConfig};
@@ -413,6 +413,114 @@ impl Robot {
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
     }
 
+    /// Time-optimal (acceleration-limited, corner-stop bang-bang TOPP) retiming
+    /// of a waypoint path (each row length = ndof). `vmax`/`amax` are per-joint
+    /// bounds (pass both or neither; default = model limits). Jerk is NOT
+    /// limited — bang-bang has step accelerations, so `jerk_limit` reports inf.
+    #[pyo3(signature = (waypoints, vmax=None, amax=None, dt=1e-3))]
+    fn retime_time_optimal(
+        &self,
+        waypoints: Vec<Vec<f64>>,
+        vmax: Option<Vec<f64>>,
+        amax: Option<Vec<f64>>,
+        dt: f64,
+    ) -> PyResult<Trajectory> {
+        let model = &self.inner.model;
+        for (i, w) in waypoints.iter().enumerate() {
+            if w.len() != model.ndof {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "waypoint {i} has length {}, expected ndof={}",
+                    w.len(),
+                    model.ndof
+                )));
+            }
+            finite_or_err("waypoints", w)?;
+        }
+        if !dt.is_finite() || dt <= 0.0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "dt must be finite and > 0",
+            ));
+        }
+        let mut lim = match (vmax, amax) {
+            (None, None) => motion_limits(model, None)?,
+            (Some(v), Some(a)) => {
+                for (label, xs) in [("vmax", &v), ("amax", &a)] {
+                    if xs.len() != model.ndof {
+                        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                            "{label} has length {}, expected ndof={}",
+                            xs.len(),
+                            model.ndof
+                        )));
+                    }
+                    if xs.iter().any(|x| !x.is_finite() || *x <= 0.0) {
+                        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                            "{label} must be finite and > 0"
+                        )));
+                    }
+                }
+                EngineLimits {
+                    vmax: v,
+                    amax: a,
+                    jmax: vec![],
+                }
+            }
+            _ => {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "pass both vmax and amax, or neither",
+                ));
+            }
+        };
+        // TOPP is jerk-unlimited; report that honestly through Trajectory.jerk_limit.
+        lim.jmax = vec![f64::INFINITY; model.ndof];
+        retime_time_optimal(&waypoints, &lim, dt)
+            .map(|inner| Trajectory { inner })
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
+    /// Resolved-rate (operational-space) control: joint velocities `qd` realizing
+    /// the desired end-effector spatial velocity `v` (length-6 `[v; ω]`, world-
+    /// aligned) at `q`, via the manipulability-gated damped pseudo-inverse.
+    #[pyo3(signature = (q, v, frame=None))]
+    fn resolved_rate(&self, q: Vec<f64>, v: Vec<f64>, frame: Option<&str>) -> PyResult<Vec<f64>> {
+        let model = &self.inner.model;
+        self.check_redundancy_args(&q, &v)?;
+        let f = resolve_frame(model, frame)?;
+        Ok(resolved_rate(model, f, &q, &v, &RedundancyOpts::default()))
+    }
+
+    /// Resolved-rate with a null-space secondary objective:
+    /// `qd = J⁺·v + (I − J⁺J)·z`. `z` (length ndof) is a desired joint velocity
+    /// for a secondary goal; only its component inside ker(J) is applied, so the
+    /// secondary motion leaves the end-effector velocity unchanged.
+    #[pyo3(signature = (q, v, z, frame=None))]
+    fn nullspace_step(
+        &self,
+        q: Vec<f64>,
+        v: Vec<f64>,
+        z: Vec<f64>,
+        frame: Option<&str>,
+    ) -> PyResult<Vec<f64>> {
+        let model = &self.inner.model;
+        self.check_redundancy_args(&q, &v)?;
+        if z.len() != model.ndof {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "z has length {}, expected ndof={}",
+                z.len(),
+                model.ndof
+            )));
+        }
+        finite_or_err("z", &z)?;
+        let f = resolve_frame(model, frame)?;
+        Ok(nullspace_step(
+            model,
+            f,
+            &q,
+            &v,
+            &z,
+            &RedundancyOpts::default(),
+        ))
+    }
+
     /// Inverse dynamics (RNEA): tau = ID(q,qd,qdd) incl. gravity + Coriolis (ndof).
     #[pyo3(signature = (q, qd, qdd, gravity=None))]
     fn rnea(
@@ -533,6 +641,29 @@ impl Robot {
             self.inner.name,
             self.inner.ndof()
         )
+    }
+}
+
+impl Robot {
+    /// Shared validation for the redundancy-resolution entry points: `q` is a
+    /// finite config of length ndof, `v` a finite length-6 spatial velocity.
+    /// (The engine silently returns zeros on bad input; the FFI boundary errors.)
+    fn check_redundancy_args(&self, q: &[f64], v: &[f64]) -> PyResult<()> {
+        let ndof = self.inner.model.ndof;
+        if q.len() != ndof {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "q has length {}, expected ndof={ndof}",
+                q.len()
+            )));
+        }
+        if v.len() != 6 {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "v has length {}, expected 6 ([v; omega])",
+                v.len()
+            )));
+        }
+        finite_or_err("q", q)?;
+        finite_or_err("v", v)
     }
 }
 
@@ -1001,6 +1132,59 @@ impl ControlLoop {
         Ok((times, states, actions))
     }
 
+    /// Regulate to `goal` for `ticks` steps, calling `callback(frame)` on every
+    /// `emit_every`-th tick with a dict {tick, t, measured, measured_qd, command,
+    /// warn}. The streamed frames are bit-identical to the `rollout_to` /
+    /// `run_record` sequence (same computation; decimation only thins emission —
+    /// every tick is still stepped). The callback returns False to cancel
+    /// cooperatively (None / any other value continues). Returns the number of
+    /// ticks actually executed (== ticks on a full run, fewer on a cancel).
+    #[pyo3(signature = (goal, ticks, callback, emit_every=1))]
+    fn run_stream(
+        &mut self,
+        py: Python<'_>,
+        goal: Vec<f64>,
+        ticks: usize,
+        callback: Bound<'_, PyAny>,
+        emit_every: usize,
+    ) -> PyResult<usize> {
+        self.check_goal(&goal)?;
+        let mut sp = HoldSetpoint::new(goal);
+        // The engine sink can't carry a PyErr; stash it and cancel, then re-raise.
+        let mut cb_err: Option<PyErr> = None;
+        let mut sink = |f: &Frame| -> bool {
+            let call = || -> PyResult<bool> {
+                let d = PyDict::new(py);
+                d.set_item("tick", f.tick)?;
+                d.set_item("t", f.t)?;
+                d.set_item("measured", f.measured.clone())?;
+                d.set_item("measured_qd", f.measured_qd.clone())?;
+                d.set_item("command", f.command.clone())?;
+                d.set_item("warn", f.warn)?;
+                let ret = callback.call1((d,))?;
+                if ret.is_none() {
+                    return Ok(true);
+                }
+                ret.is_truthy()
+            };
+            match call() {
+                Ok(cont) => cont,
+                Err(e) => {
+                    cb_err = Some(e);
+                    false
+                }
+            }
+        };
+        let executed = self
+            .inner
+            .run_stream_every(&mut sp, ticks, emit_every, &mut sink)
+            .map_err(hal_err)?;
+        match cb_err {
+            Some(e) => Err(e),
+            None => Ok(executed),
+        }
+    }
+
     /// Step the loop ONE tick toward `action` (a joint-space target) and return the
     /// post-step measured q (the next observation). The policy-deployment primitive:
     /// `obs -> policy.predict -> step_with_target -> obs`. Routes through the safety
@@ -1199,6 +1383,25 @@ impl CollisionModel {
         d.set_item("colliding_frames", r.colliding_frames.clone())?;
         Ok(d.into())
     }
+    /// Penetration contacts (EPA) for every self-colliding link pair at `q`.
+    /// Returns a list of `(frame_a, frame_b, {normal: [3], depth: float,
+    /// witness: [3]})` with `frame_a < frame_b` (indices, as in `query()`'s
+    /// `self_pairs`); translate A by `-depth * normal` to separate the pair.
+    /// World geometry (ground/boxes) is not included — see `query()`.
+    #[allow(clippy::type_complexity)]
+    fn contacts(&self, py: Python<'_>, q: Vec<f64>) -> PyResult<Vec<(usize, usize, Py<PyDict>)>> {
+        finite_or_err("q", &q)?;
+        let cs = self.inner.contacts(&q).map_err(col_err)?;
+        cs.into_iter()
+            .map(|(a, b, c)| {
+                let d = PyDict::new(py);
+                d.set_item("normal", [c.normal.x, c.normal.y, c.normal.z])?;
+                d.set_item("depth", c.depth)?;
+                d.set_item("witness", [c.witness.x, c.witness.y, c.witness.z])?;
+                Ok((a, b, d.into()))
+            })
+            .collect()
+    }
 }
 
 /// The pure safety monitor: position clamp, velocity rate-limit, e-stop latch.
@@ -1350,6 +1553,24 @@ impl Planner {
         finite_or_err("goal", &goal)?;
         self.inner
             .plan_optimal(&start, &goal, iters)
+            .map_err(plan_err)
+    }
+    /// Plan a collision-free, smoothed path with a PRM (Probabilistic RoadMap):
+    /// rejection-samples `samples` free milestones, wires each to its `k` nearest
+    /// free neighbours, then returns the shortest roadmap path (Dijkstra),
+    /// shortcut-smoothed. Deterministic for a given seed/samples/k; raises
+    /// ValueError if the roadmap fails to connect (try more samples / larger k).
+    fn plan_prm(
+        &self,
+        start: Vec<f64>,
+        goal: Vec<f64>,
+        samples: usize,
+        k: usize,
+    ) -> PyResult<Vec<Vec<f64>>> {
+        finite_or_err("start", &start)?;
+        finite_or_err("goal", &goal)?;
+        self.inner
+            .plan_prm(&start, &goal, samples, k)
             .map_err(plan_err)
     }
     /// Plan to a Cartesian goal pose (12 numbers); `frame` index defaults to tip.

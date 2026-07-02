@@ -12,7 +12,7 @@ Conventions carried over from the Rust side:
     (9 row-major rotation, then tx, ty, tz).
 """
 
-from typing import Any, Optional, Sequence
+from typing import Any, Callable, Optional, Sequence
 
 __version__: str
 
@@ -176,6 +176,37 @@ class Robot:
         """Cartesian straight line (MOVE_L) to a 4x4 COLUMN-MAJOR target."""
         ...
 
+    def retime_time_optimal(
+        self,
+        waypoints: Sequence[_Vec],
+        vmax: Optional[_Vec] = ...,
+        amax: Optional[_Vec] = ...,
+        dt: float = ...,
+    ) -> "Trajectory":
+        """Time-optimal (acceleration-limited, corner-stop bang-bang TOPP)
+        retiming of a waypoint path (each row length = ndof).
+
+        `vmax`/`amax` are per-joint bounds (pass both or neither; default =
+        model limits). Jerk is NOT limited — `jerk_limit` reports inf.
+        """
+        ...
+
+    def resolved_rate(
+        self, q: _Vec, v: _Vec, frame: Optional[str] = ...
+    ) -> list[float]:
+        """Joint velocities realizing the desired end-effector spatial velocity
+        `v` (length-6 `[v; w]`, world-aligned) at `q`, via the
+        manipulability-gated damped pseudo-inverse."""
+        ...
+
+    def nullspace_step(
+        self, q: _Vec, v: _Vec, z: _Vec, frame: Optional[str] = ...
+    ) -> list[float]:
+        """Resolved-rate with a null-space secondary objective:
+        `qd = J+ v + (I - J+ J) z`. Only the component of `z` (length ndof)
+        inside ker(J) is applied, leaving the end-effector velocity unchanged."""
+        ...
+
     def rnea(
         self,
         q: _Vec,
@@ -329,6 +360,22 @@ class ControlLoop:
         """Step one tick toward `action`; return post-step measured q."""
         ...
 
+    def run_stream(
+        self,
+        goal: _Vec,
+        ticks: int,
+        callback: Callable[[dict[str, Any]], Optional[bool]],
+        emit_every: int = ...,
+    ) -> int:
+        """Regulate to `goal`, calling `callback(frame)` on every
+        `emit_every`-th tick with a dict {tick, t, measured, measured_qd,
+        command, warn} — bit-identical to the `rollout_to` sequence.
+
+        The callback returns False to cancel cooperatively (None / any other
+        value continues). Returns the number of ticks actually executed.
+        """
+        ...
+
     def estop(self) -> None: ...
 
     @property
@@ -397,6 +444,18 @@ class CollisionModel:
         """Query at `q` → dict(collision, self_pairs, world_hits, colliding_frames)."""
         ...
 
+    def contacts(
+        self, q: _Vec
+    ) -> list[tuple[int, int, dict[str, Any]]]:
+        """Penetration contacts (EPA) for every self-colliding link pair at `q`.
+
+        Each item is `(frame_a, frame_b, {normal: [3], depth: float,
+        witness: [3]})` with `frame_a < frame_b` (indices, as in `query()`'s
+        `self_pairs`); translate A by `-depth * normal` to separate the pair.
+        World geometry (ground/boxes) is not included — see `query()`.
+        """
+        ...
+
 class SafetyMonitor:
     """The pure safety monitor: position clamp, velocity rate-limit, e-stop latch."""
 
@@ -448,6 +507,15 @@ class Planner:
         self, start: _Vec, goal: _Vec, iters: int
     ) -> list[list[float]]:
         """Plan an asymptotically-optimal (RRT*) smoothed joint-space path."""
+        ...
+
+    def plan_prm(
+        self, start: _Vec, goal: _Vec, samples: int, k: int
+    ) -> list[list[float]]:
+        """Plan a collision-free, smoothed path with a PRM (Probabilistic
+        RoadMap): `samples` free milestones, each wired to its `k` nearest
+        free neighbours; shortest roadmap path, shortcut-smoothed.
+        Deterministic for a given seed/samples/k."""
         ...
 
     def plan_to_pose(

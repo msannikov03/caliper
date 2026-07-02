@@ -457,6 +457,14 @@ fn fixtures() -> Vec<(String, String)> {
     .collect()
 }
 
+/// True iff `path` points at an existing regular file. Used by the frontend to
+/// prune "recent URDF" entries whose file was moved/deleted since last opened.
+/// Read-only existence probe — reveals nothing but a boolean.
+#[tauri::command]
+fn path_exists(path: String) -> bool {
+    Path::new(&path).is_file()
+}
+
 /// Baked frame matrices + tip XYZ at `q` (shared by sim_drop with `frames_at`).
 fn bake_frame_row(model: &Model, q: &[f64]) -> (Vec<[f64; 16]>, [f64; 3]) {
     let frames = frames_at(model, q);
@@ -1893,9 +1901,11 @@ pub fn run() {
     tauri::Builder::default()
         .manage(AppState::default())
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             engine_version,
             fixtures,
+            path_exists,
             load_robot,
             robot_info,
             read_mesh,

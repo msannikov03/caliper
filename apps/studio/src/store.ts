@@ -144,6 +144,12 @@ export interface StudioState {
   // independent guard for analyze() so a slow SVD can't gate the FK frame
   _analyzeReqId: number;
 
+  // recent URDFs opened from disk (persisted to localStorage; sample fixtures excluded)
+  recentUrdfs: string[];
+  addRecent: (path: string) => void;
+  removeRecent: (path: string) => void;
+  loadRecent: () => void;
+
   // actions
   loadRobot: (path: string) => Promise<void>;
   setJoint: (i: number, v: number) => void;
@@ -238,6 +244,32 @@ export const useStore = create<StudioState>((set, get) => ({
   graphSaved: [],
   graphName: "",
   _graphRunId: 0,
+  recentUrdfs: [],
+
+  addRecent(path) {
+    const recentUrdfs = mergeRecent(get().recentUrdfs, path);
+    set({ recentUrdfs });
+    persistRecents(recentUrdfs);
+  },
+  removeRecent(path) {
+    const recentUrdfs = get().recentUrdfs.filter((p) => p !== path);
+    set({ recentUrdfs });
+    persistRecents(recentUrdfs);
+  },
+  loadRecent() {
+    let stored: unknown = [];
+    try {
+      stored = JSON.parse(localStorage.getItem(RECENT_KEY) ?? "[]");
+    } catch {
+      stored = [];
+    }
+    const recentUrdfs = Array.isArray(stored)
+      ? stored.filter((p): p is string => typeof p === "string").slice(0, RECENT_CAP)
+      : [];
+    set({ recentUrdfs });
+    // prune entries whose file no longer exists (async; keeps the list honest)
+    void pruneMissingRecents(get, set);
+  },
 
   async loadRobot(path) {
     set({ loading: true, error: null });
@@ -869,6 +901,43 @@ function scheduleRefresh(get: () => StudioState) {
     pending = false;
     void get().refreshFrames();
   });
+}
+
+// ---- recent-URDF persistence (localStorage) ----
+const RECENT_KEY = "caliper.recentUrdfs";
+const RECENT_CAP = 8;
+
+/// Pure recents update: `path` moves to the front, de-duped, capped at `cap`.
+/// Most-recent-first. Exported for unit testing.
+export function mergeRecent(list: string[], path: string, cap = RECENT_CAP): string[] {
+  return [path, ...list.filter((p) => p !== path)].slice(0, cap);
+}
+
+function persistRecents(list: string[]): void {
+  try {
+    localStorage.setItem(RECENT_KEY, JSON.stringify(list));
+  } catch {
+    // storage unavailable (private mode / quota) — recents stay in-memory only.
+  }
+}
+
+/// Drop recents whose file no longer exists, via the backend `path_exists` probe.
+/// On a probe error (e.g. command absent) the entry is KEPT, so a transient IPC
+/// failure never wipes the list.
+async function pruneMissingRecents(
+  get: () => StudioState,
+  set: (p: Partial<StudioState>) => void,
+): Promise<void> {
+  const list = get().recentUrdfs;
+  if (list.length === 0) return;
+  const alive = await Promise.all(
+    list.map((p) => invoke<boolean>("path_exists", { path: p }).catch(() => true)),
+  );
+  const kept = list.filter((_, i) => alive[i]);
+  if (kept.length !== list.length) {
+    set({ recentUrdfs: kept });
+    persistRecents(kept);
+  }
 }
 
 // ---- test-only exports (no runtime behaviour change) ----

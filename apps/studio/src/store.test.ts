@@ -32,6 +32,7 @@ import {
   useStore,
   handleGraphError,
   bumpNodeSeq,
+  mergeRecent,
   _resetNodeSeq,
 } from "./store";
 import type { RobotInfo, TrajectoryDto, StudioState } from "./store";
@@ -139,12 +140,51 @@ const STORE_RESET = {
   graphSaved: [] as string[],
   graphName: "",
   _graphRunId: 0,
+  recentUrdfs: [] as string[],
 };
 
 beforeEach(() => {
   vi.clearAllMocks();
   useStore.setState(STORE_RESET);
   _resetNodeSeq();
+});
+
+// ---- mergeRecent (recents dedupe / cap / most-recent-first) ----
+
+describe("mergeRecent — recents pure logic", () => {
+  it("puts the newest path first and de-dupes an existing entry", () => {
+    expect(mergeRecent(["/a.urdf", "/b.urdf", "/c.urdf"], "/b.urdf")).toEqual([
+      "/b.urdf",
+      "/a.urdf",
+      "/c.urdf",
+    ]);
+  });
+
+  it("re-adding the current head is a no-op in length and order", () => {
+    const list = ["/a.urdf", "/b.urdf", "/c.urdf"];
+    const out = mergeRecent(list, "/a.urdf");
+    expect(out).toEqual(list);
+    expect(out).toHaveLength(3);
+  });
+
+  it("caps at 8, dropping the oldest entry", () => {
+    const list = ["/1", "/2", "/3", "/4", "/5", "/6", "/7", "/8"];
+    expect(mergeRecent(list, "/9")).toEqual([
+      "/9",
+      "/1",
+      "/2",
+      "/3",
+      "/4",
+      "/5",
+      "/6",
+      "/7",
+    ]);
+  });
+
+  it("a brand-new path prepends without duplicates", () => {
+    const out = mergeRecent(["/a"], "/b");
+    expect(out).toEqual(["/b", "/a"]);
+  });
 });
 
 // ---- _reqId latest-wins (FK / IK reply guard) ----

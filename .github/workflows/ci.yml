@@ -66,3 +66,13 @@ jobs:
       - run: uv run maturin develop -m crates/caliper-py/Cargo.toml
       - run: uv pip install -e learn
       - run: uv run python -m pytest learn -v
+
+  docs:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      # mdBook docs site must BUILD (catches broken SUMMARY links, malformed
+      # chapters, missing files) — prebuilt binary, no cargo install needed.
+      - run: |
+          curl -sL https://github.com/rust-lang/mdBook/releases/download/v0.4.52/mdbook-v0.4.52-aarch64-apple-darwin.tar.gz | tar xz
+          ./mdbook build docs/book

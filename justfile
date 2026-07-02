@@ -49,3 +49,7 @@ app:
 # Full local CI gate (engine)
 ci: fmt-check lint test light
     @echo "local CI green ✓"
+
+# build the mdBook docs site (needs mdbook on PATH)
+docs:
+    mdbook build docs/book

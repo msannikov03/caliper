@@ -1,10 +1,11 @@
 import { useLayoutEffect, useMemo, useRef } from "react";
 import * as THREE from "three";
 import { useStore } from "../store";
-import type { FrameInfo } from "../store";
+import type { FrameInfo, VisualInfo } from "../store";
 import { DISPLAY_UP } from "../coords";
 import { Ellipsoid } from "./Ellipsoid";
 import { TipPath } from "./TipPath";
+import { Visuals } from "./Visuals";
 
 const AX_X = "#ff5a5a";
 const AX_Y = "#5aff7a";
@@ -127,6 +128,13 @@ function Rods() {
   );
 }
 
+/** Subscribes to the live frame matrices HERE (not in RobotView) so per-q FK
+ *  updates re-render only this layer, mirroring how Rods/FrameNode subscribe. */
+function VisualsLayer({ visuals, robotKey }: { visuals: VisualInfo[]; robotKey: string }) {
+  const frames = useStore((s) => s.frames);
+  return <Visuals visuals={visuals} frames={frames} robotKey={robotKey} />;
+}
+
 /** Machined base plate at the root, on the floor. */
 function BasePlate() {
   return (
@@ -142,10 +150,15 @@ export function RobotView() {
   const robot = useStore((s) => s.robot);
   const matrix = useMemo(() => DISPLAY_UP.clone(), []);
   if (!robot) return null;
+  const visuals = robot.visuals ?? [];
+  const hasVisuals = visuals.length > 0;
   return (
     <group matrixAutoUpdate={false} matrix={matrix}>
       <BasePlate />
-      <Rods />
+      {/* URDF <visual> geometry is the robot body when present; the plain rod
+          skeleton remains the fallback. Triads + joint markers stay as a
+          subtle overlay either way. */}
+      {hasVisuals ? <VisualsLayer visuals={visuals} robotKey={robot.name} /> : <Rods />}
       <TipPath />
       <Ellipsoid />
       {robot.frames.map((_, i) => (

@@ -33,6 +33,29 @@ export interface FrameInfo {
   axis: [number, number, number] | null;
 }
 
+export type VisualKind = "box" | "sphere" | "cylinder" | "capsule" | "mesh";
+
+/** One render-only URDF `<visual>`, flattened (mirrors `VisualDto` in lib.rs).
+ *  `kind` selects the populated size fields: box → halfExtents; sphere → radius;
+ *  cylinder/capsule → radius+length (Z-aligned, URDF convention); mesh →
+ *  meshPath (absolute, null = unresolvable) + meshScale + raw. */
+export interface VisualInfo {
+  /** index into frames[]; world pose = frames[frame] · origin. */
+  frame: number;
+  /** shape-local offset within the frame, column-major 4x4. */
+  origin: number[];
+  kind: VisualKind;
+  halfExtents: [number, number, number] | null;
+  radius: number | null;
+  length: number | null;
+  /** URDF material RGBA in [0,1], else null (renderer picks a neutral tone). */
+  color: [number, number, number, number] | null;
+  meshPath: string | null;
+  meshScale: [number, number, number] | null;
+  /** raw URDF filename attribute (diagnostics for unresolved meshes). */
+  raw: string | null;
+}
+
 export interface RobotInfo {
   name: string;
   ndof: number;
@@ -42,6 +65,8 @@ export interface RobotInfo {
   frames: FrameInfo[];
   tip: number; // index into frames
   hasInertia: boolean; // dynamics available (every link has <inertial>)
+  /** render-only <visual> geometry; empty/absent → the UI draws the rod skeleton. */
+  visuals?: VisualInfo[];
 }
 
 /** column-major 4x4 (THREE.Matrix4 element order), exactly what fromArray wants. */

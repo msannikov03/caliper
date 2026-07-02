@@ -3,8 +3,10 @@
 //!
 //! The webview holds a parsed [`Model`] in shared state after `robot_info`, then
 //! drives it with `get_frames` (live FK for every frame) and `solve_ik` (engine
-//! IK on a gizmo-supplied target). Geometry is drawn procedurally from frame
-//! world poses — the oracle fixtures carry no `<visual>` meshes.
+//! IK on a gizmo-supplied target). When the URDF carries `<visual>` geometry it
+//! is shipped in `RobotInfo.visuals` (primitives inline; meshes as resolved
+//! paths served via `read_mesh`); otherwise geometry is drawn procedurally from
+//! frame world poses.
 //!
 //! Matrix convention end-to-end: every 4×4 crossing the IPC boundary is
 //! **column-major** `[f64; 16]`, i.e. THREE.Matrix4 element order
@@ -17,7 +19,7 @@ use caliper::kinematics::{
     fk_frame, fk_joints, frame_pose, jacobian, JacFrame, Jacobian, SingularityGovernor,
     SingularityKind, SingularityParams,
 };
-use caliper::model::{JointKind, Model};
+use caliper::model::{JointKind, Model, VisualShape};
 use caliper::motion::{
     move_j, move_l, retime_waypoints, CartesianMoveOpts, MotionLimits, MotionLimitsConfig,
     PoseLibrary,
@@ -30,6 +32,7 @@ use nalgebra::{
     Cholesky, DVector, Isometry3, Matrix3, SymmetricEigen, Translation3, UnitQuaternion, Vector3,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tauri::Manager;
@@ -39,6 +42,10 @@ use tauri::Manager;
 struct AppState {
     model: Mutex<Option<Model>>,
     poses: Mutex<PoseLibrary>,
+    /// Canonicalized absolute paths of the loaded robot's resolved visual
+    /// meshes. `read_mesh` serves ONLY these — the webview can never read an
+    /// arbitrary file. Rebuilt on every `robot_info` load.
+    mesh_allowlist: Mutex<HashSet<PathBuf>>,
 }
 
 // ===== wire types (serde-facing; all kinematics live in the engine) =====
@@ -67,6 +74,77 @@ struct FrameInfo {
     axis: Option<[f64; 3]>,
 }
 
+/// One render-only `<visual>` element, flattened for the wire. `kind` selects
+/// which size fields are set: box → `half_extents`; sphere → `radius`;
+/// cylinder/capsule → `radius` + `length` (Z-aligned, URDF convention); mesh →
+/// `mesh_path` (absolute, only when resolved) + `mesh_scale` + `raw`.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct VisualDto {
+    /// Index into `frames`; world pose = frames[frame] · origin.
+    frame: usize,
+    /// Shape-local offset within the frame, column-major 4×4 (THREE order).
+    origin: [f64; 16],
+    /// "box" | "sphere" | "cylinder" | "capsule" | "mesh".
+    kind: String,
+    half_extents: Option<[f64; 3]>,
+    radius: Option<f64>,
+    length: Option<f64>,
+    /// URDF material RGBA in [0,1], if the visual carried one.
+    color: Option<[f32; 4]>,
+    /// Resolved absolute mesh path (`None` = unresolvable; renderer falls back).
+    mesh_path: Option<String>,
+    mesh_scale: Option<[f64; 3]>,
+    /// Raw URDF `filename` attribute (diagnostics for unresolved meshes).
+    raw: Option<String>,
+}
+
+fn visual_dto(v: &caliper::model::VisualGeom) -> VisualDto {
+    let base = VisualDto {
+        frame: v.frame,
+        origin: col_major_from_se3(&v.origin),
+        kind: String::new(),
+        half_extents: None,
+        radius: None,
+        length: None,
+        color: v.color,
+        mesh_path: None,
+        mesh_scale: None,
+        raw: None,
+    };
+    match &v.shape {
+        VisualShape::Box { half } => VisualDto {
+            kind: "box".into(),
+            half_extents: Some([half.x, half.y, half.z]),
+            ..base
+        },
+        VisualShape::Sphere { radius } => VisualDto {
+            kind: "sphere".into(),
+            radius: Some(*radius),
+            ..base
+        },
+        VisualShape::Cylinder { radius, length } => VisualDto {
+            kind: "cylinder".into(),
+            radius: Some(*radius),
+            length: Some(*length),
+            ..base
+        },
+        VisualShape::Capsule { radius, length } => VisualDto {
+            kind: "capsule".into(),
+            radius: Some(*radius),
+            length: Some(*length),
+            ..base
+        },
+        VisualShape::Mesh { path, raw, scale } => VisualDto {
+            kind: "mesh".into(),
+            mesh_path: path.as_ref().map(|p| p.to_string_lossy().into_owned()),
+            mesh_scale: Some(*scale),
+            raw: Some(raw.clone()),
+            ..base
+        },
+    }
+}
+
 /// Full structure the UI needs to build the scene + slider panel.
 #[derive(Serialize)]
 struct RobotInfo {
@@ -89,6 +167,9 @@ struct RobotInfo {
     frames: Vec<FrameInfo>,
     /// Index into `frames` of the default tool/tip frame.
     tip: usize,
+    /// Render-only `<visual>` geometry (empty when the URDF has none — the UI
+    /// then falls back to the procedural rod skeleton).
+    visuals: Vec<VisualDto>,
 }
 
 #[derive(Serialize)]
@@ -297,6 +378,34 @@ fn robot_info_from_model(model: &Model) -> RobotInfo {
         has_inertia: model.has_inertia,
         frames,
         tip: model.tip_frame(),
+        visuals: model.visuals.iter().map(visual_dto).collect(),
+    }
+}
+
+/// Canonicalized paths of every RESOLVED visual mesh — the `read_mesh`
+/// allowlist (pure; shared with the tests). A path that no longer
+/// canonicalizes (deleted since parse) is simply dropped.
+fn visual_mesh_allowlist(model: &Model) -> HashSet<PathBuf> {
+    model
+        .visuals
+        .iter()
+        .filter_map(|v| match &v.shape {
+            VisualShape::Mesh { path: Some(p), .. } => std::fs::canonicalize(p).ok(),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Resolve + gate a webview-supplied mesh path against the allowlist (pure
+/// w.r.t. state; shared with the tests). Canonicalizing the INCOMING path
+/// before the check defeats `..`/symlink tricks.
+fn allowed_mesh_path(allow: &HashSet<PathBuf>, path: &str) -> Result<PathBuf, String> {
+    let canon = std::fs::canonicalize(Path::new(path))
+        .map_err(|_| "mesh path does not resolve".to_string())?;
+    if allow.contains(&canon) {
+        Ok(canon)
+    } else {
+        Err("path is not a visual mesh of the loaded robot".into())
     }
 }
 
@@ -336,6 +445,7 @@ fn fixtures() -> Vec<(String, String)> {
     );
     [
         "showcase6",
+        "visual_arm",
         "dyn_pendulum2",
         "toy",
         "prismatic",
@@ -394,8 +504,37 @@ fn robot_info(path: String, state: tauri::State<'_, AppState>) -> Result<RobotIn
     if let Ok(mut p) = state.poses.lock() {
         p.clear();
     }
+    // Record the resolved visual-mesh paths BEFORE publishing the model, so a
+    // `read_mesh` racing this load can never see the new model with a stale list.
+    *state
+        .mesh_allowlist
+        .lock()
+        .map_err(|_| "state lock poisoned")? = visual_mesh_allowlist(&model);
     *state.model.lock().map_err(|_| "state lock poisoned")? = Some(model);
     Ok(info)
+}
+
+/// Raw bytes of a visual mesh file, as a BINARY IPC response (no JSON/base64
+/// overhead — `invoke` resolves to an `ArrayBuffer` in the webview).
+///
+/// SECURITY: only paths recorded by the last `robot_info` load (the resolved
+/// visual meshes of the CURRENT robot) are served; anything else — including
+/// symlink/`..` detours, checked via canonicalization — is rejected, so the
+/// webview cannot read arbitrary files.
+#[tauri::command]
+fn read_mesh(
+    path: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<tauri::ipc::Response, String> {
+    let canon = {
+        let allow = state
+            .mesh_allowlist
+            .lock()
+            .map_err(|_| "state lock poisoned")?;
+        allowed_mesh_path(&allow, &path)?
+    };
+    let bytes = std::fs::read(&canon).map_err(|e| format!("could not read mesh: {e}"))?;
+    Ok(tauri::ipc::Response::new(bytes))
 }
 
 /// World pose of **every** frame at configuration `q`, as column-major `[f64;16]`
@@ -1759,6 +1898,7 @@ pub fn run() {
             fixtures,
             load_robot,
             robot_info,
+            read_mesh,
             get_frames,
             solve_ik,
             analyze,
@@ -2107,6 +2247,69 @@ mod tests {
         let d = diag_to_dto(&caliper::graph::validate(&doc, &robot.model));
         assert!(!d.ok);
         assert!(!d.cycle.is_empty());
+    }
+
+    // ===== visual rendering (R1.3) =====
+
+    /// The VisualDto flattening: kinds, size fields, colors, origins, and
+    /// resolved-vs-unresolved mesh paths, straight off the live fixtures.
+    #[test]
+    fn visual_dtos_map_shapes_and_meshes() {
+        let info = robot_info_from_model(&load("visual_arm.urdf"));
+        assert_eq!(info.visuals.len(), 6, "box+cylinder+sphere+3 meshes");
+
+        let b = info.visuals.iter().find(|v| v.kind == "box").unwrap();
+        assert_eq!(b.half_extents, Some([0.1, 0.1, 0.05]));
+        assert_eq!(b.color, Some([0.9, 0.1, 0.1, 1.0]), "inline rgba");
+        // origin xyz="0 0 0.05" → translation z in col-major slot 14
+        assert!((b.origin[14] - 0.05).abs() < 1e-12);
+
+        let c = info.visuals.iter().find(|v| v.kind == "cylinder").unwrap();
+        assert_eq!((c.radius, c.length), (Some(0.04), Some(0.3)));
+        assert_eq!(c.color, Some([0.2, 0.4, 0.8, 1.0]), "named material");
+
+        let meshes: Vec<_> = info.visuals.iter().filter(|v| v.kind == "mesh").collect();
+        assert_eq!(meshes.len(), 3);
+        // resolved meshes carry absolute paths; the ghost is KEPT with path=None
+        assert_eq!(meshes.iter().filter(|v| v.mesh_path.is_some()).count(), 2);
+        let hand = meshes
+            .iter()
+            .find(|v| v.raw.as_deref() == Some("visual_hand.stl"))
+            .unwrap();
+        assert!(hand
+            .mesh_path
+            .as_ref()
+            .unwrap()
+            .ends_with("visual_hand.stl"));
+        assert_eq!(hand.mesh_scale, Some([2.0, 2.0, 2.0]));
+        assert!(info.visuals.iter().all(|v| v.frame < info.frames.len()));
+
+        // showcase6: 7 primitive visuals, no meshes; toy: none at all.
+        let s = robot_info_from_model(&load("showcase6.urdf"));
+        assert_eq!(s.visuals.len(), 7);
+        assert!(s.visuals.iter().all(|v| v.kind != "mesh"));
+        assert!(robot_info_from_model(&load("toy.urdf")).visuals.is_empty());
+    }
+
+    /// read_mesh's gate: only the robot's own resolved visual meshes pass.
+    #[test]
+    fn mesh_allowlist_serves_own_meshes_only() {
+        let m = load("visual_arm.urdf");
+        let allow = visual_mesh_allowlist(&m);
+        assert_eq!(allow.len(), 2, "visual_hand.stl + demo_pkg part.stl");
+
+        // the exact paths the DTO hands the frontend are accepted…
+        let info = robot_info_from_model(&m);
+        for v in info.visuals.iter().filter(|v| v.mesh_path.is_some()) {
+            allowed_mesh_path(&allow, v.mesh_path.as_ref().unwrap()).expect("own mesh allowed");
+        }
+        // …while any other existing file (even a sibling fixture) is rejected.
+        let urdf = fixture("visual_arm.urdf");
+        assert!(allowed_mesh_path(&allow, urdf.to_str().unwrap()).is_err());
+        assert!(allowed_mesh_path(&allow, "/does/not/exist.stl").is_err());
+        // a `..` detour to an allowed file still resolves and passes (canonicalized)…
+        let dodge = fixture("../robots/visual_hand.stl");
+        assert!(allowed_mesh_path(&allow, dodge.to_str().unwrap()).is_ok());
     }
 
     #[test]

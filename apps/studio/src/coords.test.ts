@@ -12,6 +12,8 @@
 import { describe, it, expect } from "vitest";
 import * as THREE from "three";
 import { DISPLAY_UP, DISPLAY_UP_INV } from "./coords";
+import { composeWorld, primitiveSpec } from "./three/Visuals";
+import type { VisualInfo } from "./store";
 
 // ---- DISPLAY_UP correctness ----
 
@@ -116,5 +118,46 @@ describe("IK target recovery — DISPLAY_UP_INV * DISPLAY_UP * M = M", () => {
     );
     M.setPosition(0.1, 0.2, -0.3);
     expectMatricesClose(roundTrip(M), M);
+  });
+});
+
+// ---- Visuals pure helpers (URDF <visual> rendering) ----
+
+describe("Visuals helpers — composeWorld / primitiveSpec", () => {
+  it("composeWorld multiplies frame · origin (origin is FRAME-local)", () => {
+    // frame: +90° about Z, sitting at (1,0,0); origin: (0,2,0) in frame space.
+    const frame = new THREE.Matrix4().makeRotationZ(Math.PI / 2).setPosition(1, 0, 0);
+    const origin = new THREE.Matrix4().makeTranslation(0, 2, 0);
+    const p = new THREE.Vector3().setFromMatrixPosition(
+      composeWorld(frame.toArray(), origin.toArray()),
+    );
+    // frame-local +Y lands on world -X under Rz(90°) → (1-2, 0, 0).
+    expect(p.x).toBeCloseTo(-1, 12);
+    expect(p.y).toBeCloseTo(0, 12);
+    expect(p.z).toBeCloseTo(0, 12);
+  });
+
+  it("primitiveSpec maps DTO size fields to three constructor args", () => {
+    const base: Omit<VisualInfo, "kind"> = {
+      frame: 0,
+      origin: new THREE.Matrix4().toArray(),
+      halfExtents: null,
+      radius: null,
+      length: null,
+      color: null,
+      meshPath: null,
+      meshScale: null,
+      raw: null,
+    };
+    // engine ships HALF-extents; three's BoxGeometry takes full extents.
+    const box = primitiveSpec({ ...base, kind: "box", halfExtents: [0.1, 0.2, 0.3] });
+    expect(box).toEqual({ shape: "box", args: [0.2, 0.4, 0.6], zAligned: false });
+    // URDF cylinders are Z-aligned → need the +90° X wrapper (three is Y-aligned).
+    const cyl = primitiveSpec({ ...base, kind: "cylinder", radius: 0.04, length: 0.3 });
+    expect(cyl?.shape).toBe("cylinder");
+    expect(cyl?.args.slice(0, 3)).toEqual([0.04, 0.04, 0.3]);
+    expect(cyl?.zAligned).toBe(true);
+    // meshes carry no primitive spec (loaded asynchronously instead).
+    expect(primitiveSpec({ ...base, kind: "mesh" })).toBeNull();
   });
 });

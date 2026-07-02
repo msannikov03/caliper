@@ -38,6 +38,27 @@ pub enum CompileError {
     ZeroAxis(String),
     #[error("link `{0}` is unreachable from the root (cycle or disconnected subtree)")]
     Disconnected(String),
+    #[error("joint `{joint}` mimics unknown movable joint `{src_joint}`")]
+    MimicUnknownSource { joint: String, src_joint: String },
+    #[error(
+        "joint `{joint}` mimics `{src_joint}`, which is itself a mimic (mimic chains not supported)"
+    )]
+    MimicOfMimic { joint: String, src_joint: String },
+    #[error("mimic on joint `{0}` is only supported for revolute/continuous/prismatic joints")]
+    MimicUnsupportedJoint(String),
+}
+
+/// A URDF `<mimic>` constraint on a movable joint: `q_this = multiplier * q[source] + offset`.
+/// The mimicking joint remains a FULL-SPACE dof (see [`Model::mimic`]); this struct only
+/// records the constraint so reduced-space helpers/wrappers can enforce it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MimicInfo {
+    /// Full-space movable-joint index of the DRIVING joint (never itself a mimic).
+    pub source: usize,
+    /// URDF `multiplier` (default `1.0`).
+    pub multiplier: f64,
+    /// URDF `offset` (default `0.0`).
+    pub offset: f64,
 }
 
 /// A renderable / queryable link frame, hung off its nearest movable joint.
@@ -192,6 +213,16 @@ pub struct Model {
     /// so a renderer can fall back to a procedural shape). Visual parsing can
     /// never fail `compile()`. Empty when the URDF has no `<visual>` elements.
     pub visuals: Vec<VisualGeom>,
+    /// Per-movable-joint URDF `<mimic>` constraint (len == ndof; `None` = independent).
+    ///
+    /// ⚠ Mimic joints stay in the full-space arrays: `ndof`, `q`, and EVERY existing
+    /// API remain FULL-SPACE, exactly as without mimics. A `Some(MimicInfo)` entry only
+    /// RECORDS the constraint `q[i] = m * q[source] + b`; nothing here enforces it.
+    /// Callers that want the constraint enforced work in the REDUCED space via
+    /// [`Model::expand_mimic`] / [`Model::reduce_config`] and the `*_reduced` wrappers
+    /// in `caliper-kinematics`. Mimic chains (a mimic whose source is a mimic) are
+    /// rejected at compile time, so one expansion pass is always sufficient.
+    pub mimic: Vec<Option<MimicInfo>>,
 }
 
 impl Model {
@@ -215,6 +246,63 @@ impl Model {
                 q[i] = q[i].clamp(*lo, *hi);
             }
         }
+    }
+
+    // ===== mimic-joint helpers (reduced <-> full configuration mapping) =====
+    //
+    // The full space is UNCHANGED by mimics: every API on `Model` and every
+    // algorithm crate keeps taking `q.len() == ndof`. The reduced space contains
+    // only the independent joints, in full-space order; these helpers map between
+    // the two so reduced-space wrappers can be built on the validated full-space math.
+
+    /// True iff any movable joint carries a `<mimic>` constraint.
+    pub fn has_mimic(&self) -> bool {
+        self.mimic.iter().any(|m| m.is_some())
+    }
+
+    /// Number of INDEPENDENT dofs (`ndof` minus the mimic joints).
+    pub fn ndof_independent(&self) -> usize {
+        self.mimic.iter().filter(|m| m.is_none()).count()
+    }
+
+    /// Full-space indices of the independent joints, in full-space order. The k-th
+    /// entry is the full-space dof that reduced coordinate k drives.
+    pub fn independent_dofs(&self) -> Vec<usize> {
+        (0..self.ndof)
+            .filter(|&i| self.mimic[i].is_none())
+            .collect()
+    }
+
+    /// Expand a reduced configuration (`q_red.len() == ndof_independent()`, ordered
+    /// as [`Model::independent_dofs`]) to the full space: independents are placed
+    /// by order, then every mimic is filled as `m * q_full[source] + b`. Sources are
+    /// never mimics themselves (chains are rejected at compile), so one pass suffices.
+    pub fn expand_mimic(&self, q_red: &[f64]) -> Vec<f64> {
+        debug_assert_eq!(q_red.len(), self.ndof_independent());
+        let mut q = vec![0.0; self.ndof];
+        let mut k = 0;
+        for (qi, mi) in q.iter_mut().zip(&self.mimic) {
+            if mi.is_none() {
+                *qi = q_red[k];
+                k += 1;
+            }
+        }
+        for i in 0..self.ndof {
+            if let Some(mi) = &self.mimic[i] {
+                q[i] = mi.multiplier * q[mi.source] + mi.offset;
+            }
+        }
+        q
+    }
+
+    /// Project a full configuration onto the independent dofs (drops the mimic
+    /// entries; it does NOT check that they satisfied their constraints).
+    pub fn reduce_config(&self, q_full: &[f64]) -> Vec<f64> {
+        debug_assert_eq!(q_full.len(), self.ndof);
+        (0..self.ndof)
+            .filter(|&i| self.mimic[i].is_none())
+            .map(|i| q_full[i])
+            .collect()
     }
 }
 
@@ -259,6 +347,8 @@ struct EditJoint {
     limits: Option<(f64, f64)>,
     vel: Option<f64>,
     effort: Option<f64>,
+    /// Raw `<mimic>`: (source joint NAME, multiplier, offset); defaults m=1, b=0.
+    mimic: Option<(String, f64, f64)>,
 }
 
 #[derive(Default)]
@@ -323,6 +413,21 @@ impl RobotTree {
             // default) → surfaces as CompileError::Parse, which is correct.
             let vel = (j.limit.velocity > 0.0).then_some(j.limit.velocity);
             let effort = (j.limit.effort > 0.0).then_some(j.limit.effort);
+            // <mimic>: only meaningful on a 1-dof movable joint (urdf-rs defaults:
+            // multiplier=1, offset=0 when the attributes are omitted).
+            let mimic = match &j.mimic {
+                Some(mm) => {
+                    if matches!(kind, RawKind::Fixed) {
+                        return Err(CompileError::MimicUnsupportedJoint(j.name.clone()));
+                    }
+                    Some((
+                        mm.joint.clone(),
+                        mm.multiplier.unwrap_or(1.0),
+                        mm.offset.unwrap_or(0.0),
+                    ))
+                }
+                None => None,
+            };
             let a = j.axis.xyz.0;
             t.joints.push(EditJoint {
                 name: j.name.clone(),
@@ -334,6 +439,7 @@ impl RobotTree {
                 limits,
                 vel,
                 effort,
+                mimic,
             });
         }
         Ok(t)
@@ -632,7 +738,11 @@ fn compile(t: &RobotTree) -> Result<Model, CompileError> {
         collision: vec![],
         dropped_collider_frames: vec![],
         visuals: vec![],
+        mimic: vec![],
     };
+    // per-MOVABLE-joint raw mimic spec (source NAME, m, b) gathered during the DFS;
+    // resolved to full-space indices once all movable joints are numbered.
+    let mut mimic_raw: Vec<Option<(String, f64, f64)>> = Vec::new();
     // per link: (nearest movable-joint ancestor, accumulated fixed offset from it)
     let mut anchor: Vec<(Option<usize>, Se3)> = vec![(None, Se3::identity()); nlinks];
     // per-MOVABLE-joint composite spatial inertia in that joint's frame, summed over
@@ -678,6 +788,7 @@ fn compile(t: &RobotTree) -> Result<Model, CompileError> {
                     m.limits.push(j.limits);
                     m.vel_limit.push(j.vel);
                     m.effort_limit.push(j.effort);
+                    mimic_raw.push(j.mimic.clone());
                     anchor[j.child] = (Some(mi), Se3::identity());
                     register_frame(&mut m, &t.links[j.child], Some(mi), Se3::identity());
                     // seed this movable joint's composite with its own child link
@@ -706,6 +817,41 @@ fn compile(t: &RobotTree) -> Result<Model, CompileError> {
     }
     m.inertia = inertia_accum;
     m.has_inertia = full_inertia && m.ndof > 0;
+    // Resolve mimic sources to full-space movable-joint indices. Chains (a mimic
+    // whose source is itself a mimic, including self-mimic) are rejected so that a
+    // single expand_mimic pass is always correct.
+    let jname_index: HashMap<&str, usize> = m
+        .joint_names
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (n.as_str(), i))
+        .collect();
+    m.mimic = mimic_raw
+        .iter()
+        .enumerate()
+        .map(|(i, raw)| match raw {
+            None => Ok(None),
+            Some((src, mult, off)) => {
+                let source = *jname_index.get(src.as_str()).ok_or_else(|| {
+                    CompileError::MimicUnknownSource {
+                        joint: m.joint_names[i].clone(),
+                        src_joint: src.clone(),
+                    }
+                })?;
+                if mimic_raw[source].is_some() {
+                    return Err(CompileError::MimicOfMimic {
+                        joint: m.joint_names[i].clone(),
+                        src_joint: src.clone(),
+                    });
+                }
+                Ok(Some(MimicInfo {
+                    source,
+                    multiplier: *mult,
+                    offset: *off,
+                }))
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     // Attach parsed collisions to their link frames (every link is a frame, so the
     // frame's offset already encodes any folded fixed chain — no separate fold).
     for (li, geoms) in t.link_collision.iter().enumerate() {
@@ -1108,6 +1254,169 @@ mod tests {
         let p = p.expect("env root must resolve R/<pkg>/<rest>");
         assert!(p.is_absolute() && p.is_file(), "resolved: {p:?}");
         assert!(p.ends_with("demo_pkg/meshes/part.stl"));
+    }
+
+    // ===== mimic joints =====
+
+    /// Compile a URDF from a literal string via a scratch temp file (bad-input
+    /// cases don't warrant committed fixtures).
+    fn compile_str(tag: &str, urdf: &str) -> Result<Model, CompileError> {
+        let dir = std::env::temp_dir().join("caliper_mimic_tests");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join(format!("{tag}_{}.urdf", std::process::id()));
+        std::fs::write(&p, urdf).unwrap();
+        let r = Model::from_urdf(&p);
+        let _ = std::fs::remove_file(&p);
+        r
+    }
+
+    #[test]
+    fn parses_mimic_constraints() {
+        let m = load("gripper_mimic.urdf");
+        // full space is untouched: 4 movable joints, all arrays len 4
+        assert_eq!(m.ndof, 4);
+        assert_eq!(m.joint_names, vec!["arm", "wrist", "finger1", "finger2"]);
+        assert_eq!(m.mimic.len(), 4);
+        assert!(m.has_mimic());
+        assert_eq!(m.mimic[0], None);
+        assert_eq!(
+            m.mimic[1],
+            Some(MimicInfo {
+                source: 0,
+                multiplier: 0.5,
+                offset: 0.1
+            }),
+            "wrist mimics arm"
+        );
+        assert_eq!(m.mimic[2], None);
+        assert_eq!(
+            m.mimic[3],
+            Some(MimicInfo {
+                source: 2,
+                multiplier: -1.0,
+                offset: 0.0
+            }),
+            "finger2 mimics finger1; omitted offset defaults to 0"
+        );
+        assert_eq!(m.ndof_independent(), 2);
+        assert_eq!(m.independent_dofs(), vec![0, 2]);
+    }
+
+    #[test]
+    fn mimic_defaults_multiplier_one_offset_zero() {
+        let m = compile_str(
+            "defaults",
+            r#"<robot name="d">
+                 <link name="a"/><link name="b"/><link name="c"/>
+                 <joint name="j1" type="revolute">
+                   <parent link="a"/><child link="b"/><axis xyz="0 0 1"/>
+                   <limit lower="-1" upper="1" effort="1" velocity="1"/>
+                 </joint>
+                 <joint name="j2" type="revolute">
+                   <parent link="b"/><child link="c"/><axis xyz="0 0 1"/>
+                   <limit lower="-1" upper="1" effort="1" velocity="1"/>
+                   <mimic joint="j1"/>
+                 </joint>
+               </robot>"#,
+        )
+        .unwrap();
+        assert_eq!(
+            m.mimic[1],
+            Some(MimicInfo {
+                source: 0,
+                multiplier: 1.0,
+                offset: 0.0
+            })
+        );
+    }
+
+    #[test]
+    fn expand_reduce_round_trip() {
+        let m = load("gripper_mimic.urdf");
+        let q_red = [0.7, 0.03];
+        let q_full = m.expand_mimic(&q_red);
+        assert_eq!(q_full.len(), 4);
+        assert_eq!(q_full[0], 0.7);
+        assert!(
+            (q_full[1] - (0.5 * 0.7 + 0.1)).abs() < 1e-15,
+            "wrist = 0.5*arm + 0.1"
+        );
+        assert_eq!(q_full[2], 0.03);
+        assert!((q_full[3] - (-0.03)).abs() < 1e-15, "finger2 = -finger1");
+        assert_eq!(m.reduce_config(&q_full), q_red.to_vec());
+    }
+
+    #[test]
+    fn no_mimic_helpers_degrade_to_identity() {
+        let m = load("showcase6.urdf");
+        assert!(!m.has_mimic());
+        assert!(m.mimic.iter().all(|x| x.is_none()));
+        assert_eq!(m.mimic.len(), m.ndof);
+        assert_eq!(m.ndof_independent(), m.ndof);
+        assert_eq!(m.independent_dofs(), (0..m.ndof).collect::<Vec<_>>());
+        let q = [0.3, -0.4, 0.6, 0.2, -0.5, 0.1];
+        assert_eq!(m.expand_mimic(&q), q.to_vec());
+        assert_eq!(m.reduce_config(&q), q.to_vec());
+    }
+
+    #[test]
+    fn rejects_mimic_of_mimic_and_unknown_source() {
+        let base = |mimic2: &str| {
+            format!(
+                r#"<robot name="bad">
+                     <link name="a"/><link name="b"/><link name="c"/><link name="d"/>
+                     <joint name="j1" type="revolute">
+                       <parent link="a"/><child link="b"/><axis xyz="0 0 1"/>
+                       <limit lower="-1" upper="1" effort="1" velocity="1"/>
+                     </joint>
+                     <joint name="j2" type="revolute">
+                       <parent link="b"/><child link="c"/><axis xyz="0 0 1"/>
+                       <limit lower="-1" upper="1" effort="1" velocity="1"/>
+                       <mimic joint="j1"/>
+                     </joint>
+                     <joint name="j3" type="revolute">
+                       <parent link="c"/><child link="d"/><axis xyz="0 0 1"/>
+                       <limit lower="-1" upper="1" effort="1" velocity="1"/>
+                       <mimic joint="{mimic2}"/>
+                     </joint>
+                   </robot>"#
+            )
+        };
+        let err = compile_str("chain", &base("j2")).unwrap_err();
+        assert!(
+            matches!(&err, CompileError::MimicOfMimic { joint, src_joint }
+                if joint == "j3" && src_joint == "j2"),
+            "got {err:?}"
+        );
+        let err = compile_str("unknown", &base("ghost")).unwrap_err();
+        assert!(
+            matches!(&err, CompileError::MimicUnknownSource { joint, src_joint }
+                if joint == "j3" && src_joint == "ghost"),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_mimic_on_fixed_joint() {
+        let err = compile_str(
+            "fixedmimic",
+            r#"<robot name="bad">
+                 <link name="a"/><link name="b"/><link name="c"/>
+                 <joint name="j1" type="revolute">
+                   <parent link="a"/><child link="b"/><axis xyz="0 0 1"/>
+                   <limit lower="-1" upper="1" effort="1" velocity="1"/>
+                 </joint>
+                 <joint name="jf" type="fixed">
+                   <parent link="b"/><child link="c"/>
+                   <mimic joint="j1"/>
+                 </joint>
+               </robot>"#,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, CompileError::MimicUnsupportedJoint(j) if j == "jf"),
+            "got {err:?}"
+        );
     }
 
     #[test]

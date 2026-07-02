@@ -64,6 +64,54 @@ pub fn fk_tip(model: &Model, q: &[f64]) -> Se3 {
     fk_frame(model, q, model.tip_frame())
 }
 
+// ===== reduced-space wrappers for mimic joints =====
+//
+// URDF `<mimic joint="src" multiplier="m" offset="b"/>` constrains
+// `q[i] = m·q[src] + b`, so joint i is not an independent dof. Caliper keeps the
+// FULL space untouched (every existing function still takes `q.len() == ndof`);
+// these wrappers work in the REDUCED space (independent dofs only, ordered as
+// `Model::independent_dofs`) by expanding through the validated full-space math.
+// On a model without mimics they degrade exactly to the plain functions.
+
+/// Reduced-space FK: expand `q_red` (`len == ndof_independent()`) through the
+/// mimic constraints, then run the full-space [`fk_frame`].
+pub fn fk_frame_reduced(model: &Model, q_red: &[f64], frame: usize) -> Se3 {
+    fk_frame(model, &model.expand_mimic(q_red), frame)
+}
+
+/// Reduced-space geometric Jacobian (6 × ndof_independent, rows `[v; ω]`) of
+/// `frame` at the expanded configuration, plus the frame pose.
+///
+/// Chain rule: with `q_full = E(q_red)`, `∂q_full[d]/∂q_red[k] = 1` for the
+/// independent dof `d` in slot `k`, and `∂q_full[i]/∂q_red[k] = m_i` for every
+/// mimic joint `i` whose source is `d`. Hence
+/// `J_red[:,k] = J_full[:,d] + Σ_i m_i · J_full[:,i]` — exact, built on the
+/// oracle-validated full-space [`jacobian`] (mimic chains are rejected at
+/// compile, so the sum never recurses).
+pub fn jacobian_reduced(
+    model: &Model,
+    q_red: &[f64],
+    frame: usize,
+    jframe: JacFrame,
+) -> (Se3, DMatrix<f64>) {
+    let q_full = model.expand_mimic(q_red);
+    let (ee, j_full) = jacobian(model, &q_full, frame, jframe);
+    let indep = model.independent_dofs();
+    let mut j_red = DMatrix::<f64>::zeros(6, indep.len());
+    for (k, &d) in indep.iter().enumerate() {
+        let mut col = j_full.column(d).into_owned();
+        for (i, mi) in model.mimic.iter().enumerate() {
+            if let Some(mi) = mi
+                && mi.source == d
+            {
+                col += j_full.column(i) * mi.multiplier;
+            }
+        }
+        j_red.set_column(k, &col);
+    }
+    (ee, j_red)
+}
+
 /// Reference frame for a geometric Jacobian.
 #[derive(Clone, Copy, Debug)]
 pub enum JacFrame {
@@ -729,6 +777,105 @@ mod tests {
         assert!((rep.manipulability - want.manipulability).abs() < 1e-12);
         assert!((rep.sigma_min - want.sigma_min).abs() < 1e-12);
         assert_eq!(rep.kind, SingularityKind::None);
+    }
+
+    // ===== reduced-space mimic wrappers =====
+
+    /// Central finite difference of `fk_frame_reduced` per INDEPENDENT dof —
+    /// the numeric reference for `jacobian_reduced` (same idiom as `fd_jacobian`,
+    /// but stepping the reduced coordinates through the mimic expansion).
+    fn fd_jacobian_reduced(m: &Model, q_red: &[f64], frame: usize, h: f64) -> DMatrix<f64> {
+        let n = m.ndof_independent();
+        let mut jfd = DMatrix::<f64>::zeros(6, n);
+        for k in 0..n {
+            let mut qp = q_red.to_vec();
+            let mut qm = q_red.to_vec();
+            qp[k] += h;
+            qm[k] -= h;
+            let tp = fk_frame_reduced(m, &qp, frame);
+            let tm = fk_frame_reduced(m, &qm, frame);
+            let v = (tp.translation_vec() - tm.translation_vec()) / (2.0 * h);
+            let w = rot_log(&(tp.rotation() * tm.rotation().transpose())) / (2.0 * h);
+            jfd[(0, k)] = v.x;
+            jfd[(1, k)] = v.y;
+            jfd[(2, k)] = v.z;
+            jfd[(3, k)] = w.x;
+            jfd[(4, k)] = w.y;
+            jfd[(5, k)] = w.z;
+        }
+        jfd
+    }
+
+    #[test]
+    fn fk_reduced_equals_fk_of_expanded() {
+        let m = load("gripper_mimic.urdf");
+        assert_eq!(m.ndof_independent(), 2);
+        let q_red = [0.7, 0.03];
+        let q_full = m.expand_mimic(&q_red);
+        for f in 0..m.frames.len() {
+            let a = fk_frame_reduced(&m, &q_red, f);
+            let b = fk_frame(&m, &q_full, f);
+            // definitionally the same call path — must be EXACTLY equal
+            assert_eq!(
+                a.0.to_homogeneous(),
+                b.0.to_homogeneous(),
+                "frame {} ({})",
+                f,
+                m.frame_name(f)
+            );
+        }
+    }
+
+    #[test]
+    fn jacobian_reduced_matches_finite_difference() {
+        let m = load("gripper_mimic.urdf");
+        for frame in [m.frame_id("finger_r").unwrap(), m.frame_id("palm").unwrap()] {
+            for q_red in [[0.7, 0.03], [-0.4, 0.01], [1.2, 0.0]] {
+                let (_, j) = jacobian_reduced(&m, &q_red, frame, JacFrame::World);
+                assert_eq!(j.ncols(), 2);
+                let jfd = fd_jacobian_reduced(&m, &q_red, frame, 1e-6);
+                assert!(
+                    (&j - &jfd).amax() < 1e-6,
+                    "reduced Jacobian vs FD, frame {frame}: analytic=\n{j}\nfd=\n{jfd}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn jacobian_reduced_chain_rule_identity() {
+        // J_red[:,k] == J_full[:,d] + m_i·J_full[:,i] for each mimic i sourced at d.
+        let m = load("gripper_mimic.urdf");
+        let q_red = [0.7, 0.03];
+        let q_full = m.expand_mimic(&q_red);
+        let frame = m.frame_id("finger_r").unwrap();
+        let (ee_r, j_red) = jacobian_reduced(&m, &q_red, frame, JacFrame::World);
+        let (ee_f, j_full) = jacobian(&m, &q_full, frame, JacFrame::World);
+        assert_eq!(ee_r.0.to_homogeneous(), ee_f.0.to_homogeneous());
+        // dof 0 (arm) drives mimic 1 (wrist, m=0.5); dof 2 (finger1) drives 3 (m=-1)
+        let want0 = j_full.column(0) + j_full.column(1) * 0.5;
+        let want1 = j_full.column(2) + j_full.column(3) * (-1.0);
+        assert!((j_red.column(0) - want0).norm() < 1e-15);
+        assert!((j_red.column(1) - want1).norm() < 1e-15);
+    }
+
+    #[test]
+    fn reduced_wrappers_degrade_without_mimic() {
+        // On a mimic-free model the wrappers must EXACTLY reproduce the plain calls.
+        let m = load("showcase6.urdf");
+        assert!(!m.has_mimic());
+        let q = [0.3, -0.4, 0.6, 0.2, -0.5, 0.1];
+        let f = m.tip_frame();
+        assert_eq!(
+            fk_frame_reduced(&m, &q, f).0.to_homogeneous(),
+            fk_frame(&m, &q, f).0.to_homogeneous()
+        );
+        for jf in [JacFrame::World, JacFrame::Body] {
+            let (er, jr) = jacobian_reduced(&m, &q, f, jf);
+            let (ep, jp) = jacobian(&m, &q, f, jf);
+            assert_eq!(er.0.to_homogeneous(), ep.0.to_homogeneous());
+            assert_eq!(jr, jp);
+        }
     }
 
     /// A NaN/Inf Jacobian must yield a degenerate report immediately — nalgebra's

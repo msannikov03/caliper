@@ -48,9 +48,10 @@ export function Toolbar({ version, onPalette }: { version: string; onPalette: ()
 
   useEffect(() => {
     void loadFixtures().then(() => {
-      const f = useStore.getState().fixtures;
-      if (f.length && !useStore.getState().urdfPath) {
-        void useStore.getState().loadRobot(f[0][1]); // auto-load the showcase on startup
+      if (!useStore.getState().urdfPath) {
+        // resume the previous session (robot + pose + mode) when one restores
+        // cleanly; otherwise this falls back to auto-loading the first sample.
+        void useStore.getState().restoreSession(selectRobot);
       }
     });
   }, [loadFixtures]);

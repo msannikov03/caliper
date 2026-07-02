@@ -33,6 +33,9 @@ import {
   handleGraphError,
   bumpNodeSeq,
   mergeRecent,
+  validateSession,
+  clampQ,
+  sessionRestorePlan,
   _resetNodeSeq,
 } from "./store";
 import type { RobotInfo, TrajectoryDto, StudioState } from "./store";
@@ -184,6 +187,92 @@ describe("mergeRecent — recents pure logic", () => {
   it("a brand-new path prepends without duplicates", () => {
     const out = mergeRecent(["/a"], "/b");
     expect(out).toEqual(["/b", "/a"]);
+  });
+});
+
+// ---- session persistence (validate / clamp / restore decision) ----
+
+describe("validateSession — stored-session shape check", () => {
+  const GOOD = { urdfPath: "/robots/arm.urdf", mode: "motion", q: [0.1, -0.2] };
+
+  it("accepts a well-formed session and round-trips exactly the three fields", () => {
+    const s = validateSession({ ...GOOD, extra: "ignored" });
+    expect(s).toEqual(GOOD);
+  });
+
+  it("rejects non-objects (null, undefined, string, number, array)", () => {
+    for (const raw of [null, undefined, "session", 42, [GOOD]]) {
+      expect(validateSession(raw)).toBeNull();
+    }
+  });
+
+  it("rejects a missing / non-string / empty urdfPath", () => {
+    expect(validateSession({ ...GOOD, urdfPath: undefined })).toBeNull();
+    expect(validateSession({ ...GOOD, urdfPath: 7 })).toBeNull();
+    expect(validateSession({ ...GOOD, urdfPath: "" })).toBeNull();
+  });
+
+  it("rejects a mode that is not a real StudioMode", () => {
+    expect(validateSession({ ...GOOD, mode: "fly" })).toBeNull();
+    expect(validateSession({ ...GOOD, mode: 3 })).toBeNull();
+    expect(validateSession({ ...GOOD, mode: undefined })).toBeNull();
+  });
+
+  it("rejects q that is not an array of finite numbers", () => {
+    expect(validateSession({ ...GOOD, q: "0,1" })).toBeNull();
+    expect(validateSession({ ...GOOD, q: [0, "1"] })).toBeNull();
+    expect(validateSession({ ...GOOD, q: [0, NaN] })).toBeNull();
+    expect(validateSession({ ...GOOD, q: [0, Infinity] })).toBeNull();
+    expect(validateSession({ ...GOOD, q: undefined })).toBeNull();
+  });
+
+  it("accepts every real StudioMode and an empty q", () => {
+    for (const mode of ["jog", "motion", "simulate", "graph"]) {
+      expect(validateSession({ ...GOOD, mode })).not.toBeNull();
+    }
+    expect(validateSession({ ...GOOD, q: [] })).toEqual({ ...GOOD, q: [] });
+  });
+});
+
+describe("clampQ — per-joint limit clamp", () => {
+  it("clamps below lo and above hi, passes in-range values through", () => {
+    const limits: ([number, number] | null)[] = [
+      [-1, 1],
+      [-1, 1],
+      [-1, 1],
+    ];
+    expect(clampQ([-5, 0.5, 5], limits)).toEqual([-1, 0.5, 1]);
+  });
+
+  it("a null limit leaves the joint unbounded", () => {
+    expect(clampQ([99, -99], [null, [-1, 1]])).toEqual([99, -1]);
+  });
+});
+
+describe("sessionRestorePlan — restore decision", () => {
+  const sess = (q: number[], mode: "jog" | "motion" | "simulate" | "graph") => ({
+    urdfPath: "/a.urdf",
+    mode,
+    q,
+  });
+
+  it("q-length mismatch → q ignored, mode still restored", () => {
+    const plan = sessionRestorePlan(sess([0.1, 0.2, 0.3], "motion"), MOCK_ROBOT); // ndof 2
+    expect(plan.q).toBeNull();
+    expect(plan.mode).toBe("motion");
+  });
+
+  it("simulate without inertia → mode ignored, q still restored (clamped)", () => {
+    const noInertia = { ...MOCK_ROBOT, hasInertia: false };
+    const plan = sessionRestorePlan(sess([10, -10], "simulate"), noInertia);
+    expect(plan.mode).toBeNull();
+    expect(plan.q).toEqual([Math.PI, -Math.PI]); // clamped to ±π limits
+  });
+
+  it("simulate WITH inertia and matching q → both restored", () => {
+    const plan = sessionRestorePlan(sess([0.5, -0.5], "simulate"), MOCK_ROBOT);
+    expect(plan.mode).toBe("simulate");
+    expect(plan.q).toEqual([0.5, -0.5]);
   });
 });
 

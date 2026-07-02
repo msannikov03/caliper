@@ -7,6 +7,7 @@
     "core:default",
     "opener:default",
     "dialog:allow-open",
-    "log:default"
+    "log:default",
+    "window-state:default"
   ]
 }

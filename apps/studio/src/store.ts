@@ -156,6 +156,12 @@ export interface StudioState {
   removeRecent: (path: string) => void;
   loadRecent: () => void;
 
+  // resume the last session ({urdfPath, mode, q}, persisted to localStorage) on
+  // startup. `load` is the shared selectRobot from Toolbar, injected to avoid a
+  // store↔UI import cycle. Falls back to the first sample fixture when there is
+  // no session, the file vanished, or the load fails — never errors the UI.
+  restoreSession: (load: (path: string, record: boolean) => Promise<void>) => Promise<void>;
+
   // actions
   loadRobot: (path: string) => Promise<void>;
   setJoint: (i: number, v: number) => void;
@@ -286,6 +292,35 @@ export const useStore = create<StudioState>((set, get) => ({
     set({ recentUrdfs });
     // prune entries whose file no longer exists (async; keeps the list honest)
     void pruneMissingRecents(get, set);
+  },
+
+  async restoreSession(load) {
+    const sess = readSession();
+    if (sess) {
+      // sample fixtures are trusted without a probe; anything else must still
+      // exist on disk (path_exists errors count as missing — fall back).
+      const isFixture = get().fixtures.some(([, p]) => p === sess.urdfPath);
+      const exists =
+        isFixture ||
+        (await invoke<boolean>("path_exists", { path: sess.urdfPath }).catch(() => false));
+      if (exists) {
+        await load(sess.urdfPath, get().recentUrdfs.includes(sess.urdfPath));
+        const st = get();
+        if (st.robot && !st.error && st.urdfPath === sess.urdfPath) {
+          const plan = sessionRestorePlan(sess, st.robot);
+          if (plan.q) {
+            // per-joint set path (mode is "jog" right after a load) → one
+            // rAF-coalesced FK refresh, ikOk/ikResidual reset ride along
+            plan.q.forEach((v, i) => get().setJoint(i, v));
+          }
+          if (plan.mode && plan.mode !== get().mode) get().setMode(plan.mode);
+          return;
+        }
+      }
+    }
+    // no / stale / failed session → the original first-fixture startup load
+    const f = get().fixtures;
+    if (f.length && !get().robot && !get().loading) await get().loadRobot(f[0][1]);
   },
 
   async loadRobot(path) {
@@ -956,6 +991,106 @@ async function pruneMissingRecents(
     set({ recentUrdfs: kept });
     persistRecents(kept);
   }
+}
+
+// ---- session persistence (localStorage) ----
+const SESSION_KEY = "caliper.session";
+
+/** The restorable slice of a working session: which robot, which mode, what pose. */
+export interface Session {
+  urdfPath: string;
+  mode: StudioMode;
+  q: number[];
+}
+
+/** Runtime mirror of the StudioMode union (validateSession checks against it). */
+const STUDIO_MODES: readonly StudioMode[] = ["jog", "motion", "simulate", "graph"];
+
+/// Pure shape-check of a stored session: urdfPath a non-empty string, mode a
+/// real StudioMode, q an array of finite numbers. Anything else → null and the
+/// caller falls back to the default startup load. Exported for unit testing.
+export function validateSession(raw: unknown): Session | null {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return null;
+  const o = raw as Record<string, unknown>;
+  if (typeof o.urdfPath !== "string" || o.urdfPath.length === 0) return null;
+  if (typeof o.mode !== "string" || !(STUDIO_MODES as readonly string[]).includes(o.mode)) {
+    return null;
+  }
+  if (!Array.isArray(o.q) || !o.q.every((v) => typeof v === "number" && Number.isFinite(v))) {
+    return null;
+  }
+  return { urdfPath: o.urdfPath, mode: o.mode as StudioMode, q: o.q as number[] };
+}
+
+/// Clamp each joint value into its `[lo, hi]` limit (null = unbounded joint).
+/// Pure; exported for unit testing.
+export function clampQ(q: number[], limits: ([number, number] | null)[]): number[] {
+  return q.map((v, i) => {
+    const lim = limits[i];
+    return lim ? Math.min(Math.max(v, lim[0]), lim[1]) : v;
+  });
+}
+
+/// Decide what a validated session may still restore onto the robot that
+/// ACTUALLY loaded: q only when its length matches ndof (clamped to the joint
+/// limits), mode only when valid for this robot (simulate needs inertia).
+/// A mismatch nulls that field — never an error. Pure; exported for testing.
+export function sessionRestorePlan(
+  sess: Session,
+  robot: RobotInfo,
+): { q: number[] | null; mode: StudioMode | null } {
+  return {
+    q: sess.q.length === robot.ndof ? clampQ(sess.q, robot.limits) : null,
+    mode: sess.mode === "simulate" && !robot.hasInertia ? null : sess.mode,
+  };
+}
+
+/// Parse + validate the stored session; any storage/JSON/shape failure → null.
+function readSession(): Session | null {
+  try {
+    return validateSession(JSON.parse(localStorage.getItem(SESSION_KEY) ?? "null"));
+  } catch {
+    return null;
+  }
+}
+
+/// The state worth saving right now, or null when there is nothing durable:
+/// no robot loaded, or playback owns q (a mid-clip pose is transient — the
+/// last settled pose stays persisted instead).
+function sessionSnapshot(s: StudioState): Session | null {
+  if (!s.robot || !s.urdfPath || s.playing) return null;
+  return { urdfPath: s.urdfPath, mode: s.mode, q: s.q };
+}
+
+let sessionTimer: ReturnType<typeof setTimeout> | undefined;
+let lastSessionJson: string | null = null;
+
+function writeSession(): void {
+  const snap = sessionSnapshot(useStore.getState());
+  if (!snap) return;
+  const json = JSON.stringify(snap);
+  if (json === lastSessionJson) return; // unchanged since the last write
+  lastSessionJson = json;
+  try {
+    localStorage.setItem(SESSION_KEY, json);
+  } catch {
+    // storage unavailable (private mode / quota) — resume degrades gracefully.
+  }
+}
+
+// Debounced writer: any change to the restorable slice schedules one write
+// ~500 ms after the burst settles (a slider drag collapses to a single write).
+useStore.subscribe((s, prev) => {
+  if (s.urdfPath === prev.urdfPath && s.mode === prev.mode && s.q === prev.q) return;
+  if (!sessionSnapshot(s)) return;
+  clearTimeout(sessionTimer);
+  sessionTimer = setTimeout(writeSession, 500);
+});
+
+// Final flush on the way out, so a quit right after a jog still lands.
+if (typeof window !== "undefined") {
+  window.addEventListener("pagehide", writeSession);
+  window.addEventListener("beforeunload", writeSession);
 }
 
 // ---- test-only exports (no runtime behaviour change) ----

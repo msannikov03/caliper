@@ -2014,6 +2014,11 @@ pub fn run() {
         )
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        // Window geometry persistence: size/position/maximized are saved to the
+        // app config dir on close and restored on launch (the plugin's default
+        // behavior; no JS involvement — the capability permission only exists
+        // so the webview COULD trigger a save, which we don't do).
+        .plugin(tauri_plugin_window_state::Builder::default().build())
         .invoke_handler(tauri::generate_handler![
             engine_version,
             fixtures,

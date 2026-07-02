@@ -56,7 +56,7 @@ export function Toolbar({ version }: { version: string }) {
     const picked = await open({
       multiple: false,
       directory: false,
-      filters: [{ name: "URDF", extensions: ["urdf", "xacro"] }],
+      filters: [{ name: "URDF", extensions: ["urdf", "xml"] }],
     });
     if (typeof picked !== "string") return; // dialog cancelled
     await selectRobot(picked, true);

@@ -144,6 +144,12 @@ export interface StudioState {
   // independent guard for analyze() so a slow SVD can't gate the FK frame
   _analyzeReqId: number;
 
+  // sample URDFs bundled with the app, as [name, path] (fetched once at startup)
+  fixtures: [string, string][];
+  loadFixtures: () => Promise<void>;
+  // path of the currently-loaded (or loading) URDF; Reload re-attempts it
+  urdfPath: string | null;
+
   // recent URDFs opened from disk (persisted to localStorage; sample fixtures excluded)
   recentUrdfs: string[];
   addRecent: (path: string) => void;
@@ -244,7 +250,18 @@ export const useStore = create<StudioState>((set, get) => ({
   graphSaved: [],
   graphName: "",
   _graphRunId: 0,
+  fixtures: [],
+  urdfPath: null,
   recentUrdfs: [],
+
+  async loadFixtures() {
+    try {
+      const fixtures = await invoke<[string, string][]>("fixtures");
+      set({ fixtures });
+    } catch {
+      set({ fixtures: [] });
+    }
+  },
 
   addRecent(path) {
     const recentUrdfs = mergeRecent(get().recentUrdfs, path);
@@ -272,7 +289,8 @@ export const useStore = create<StudioState>((set, get) => ({
   },
 
   async loadRobot(path) {
-    set({ loading: true, error: null });
+    // urdfPath is set up-front so Reload can re-attempt a failed load
+    set({ loading: true, error: null, urdfPath: path });
     try {
       const robot = await invoke<RobotInfo>("robot_info", { path });
       stopClock();

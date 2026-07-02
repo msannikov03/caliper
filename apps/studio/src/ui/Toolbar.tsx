@@ -1,24 +1,45 @@
-import { useEffect, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { useEffect } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { useStore } from "../store";
+import { baseName } from "../commands";
 import "./panels.css";
 
-/** Filename (last path segment) for display; full path shown in the title tooltip. */
-function baseName(p: string): string {
-  return p.split(/[\\/]/).pop() || p;
+// Load `path`, recording/pruning it in the recents list. `record` re-adds a
+// successfully-loaded path to the top (used by Open… and reselecting a recent);
+// a failed load of a recent path prunes it (the file likely moved/vanished).
+// Module-scope on purpose: the toolbar, the ⌘K palette and the ⌘O shortcut all
+// share this ONE implementation.
+export async function selectRobot(path: string, record: boolean): Promise<void> {
+  const wasRecent = useStore.getState().recentUrdfs.includes(path);
+  await useStore.getState().loadRobot(path); // surfaces any CompileError in the shared error UI
+  const st = useStore.getState();
+  if (st.robot && !st.error) {
+    if (record) st.addRecent(path);
+  } else if (wasRecent) {
+    st.removeRecent(path);
+  }
 }
 
-export function Toolbar({ version }: { version: string }) {
-  const loadRobot = useStore((s) => s.loadRobot);
+/** Native URDF picker → load + record. The Open… button, ⌘O and the palette. */
+export async function openUrdf(): Promise<void> {
+  const picked = await open({
+    multiple: false,
+    directory: false,
+    filters: [{ name: "URDF", extensions: ["urdf", "xml"] }],
+  });
+  if (typeof picked !== "string") return; // dialog cancelled
+  await selectRobot(picked, true);
+}
+
+export function Toolbar({ version, onPalette }: { version: string; onPalette: () => void }) {
   const robot = useStore((s) => s.robot);
   const loading = useStore((s) => s.loading);
   const recentUrdfs = useStore((s) => s.recentUrdfs);
-  const addRecent = useStore((s) => s.addRecent);
-  const removeRecent = useStore((s) => s.removeRecent);
   const loadRecent = useStore((s) => s.loadRecent);
-  const [fixtures, setFixtures] = useState<[string, string][]>([]);
-  const [sel, setSel] = useState<string>("");
+  const fixtures = useStore((s) => s.fixtures);
+  const loadFixtures = useStore((s) => s.loadFixtures);
+  // the select mirrors whatever the store last (attempted to) load
+  const sel = useStore((s) => s.urdfPath) ?? "";
 
   // hydrate persisted recents once on mount (prunes missing files async)
   useEffect(() => {
@@ -26,41 +47,13 @@ export function Toolbar({ version }: { version: string }) {
   }, [loadRecent]);
 
   useEffect(() => {
-    invoke<[string, string][]>("fixtures")
-      .then((f) => {
-        setFixtures(f);
-        if (f.length) {
-          setSel(f[0][1]);
-          void loadRobot(f[0][1]); // auto-load the showcase on startup
-        }
-      })
-      .catch(() => setFixtures([]));
-  }, [loadRobot]);
-
-  // Load `path`, recording/pruning it in the recents list. `record` re-adds a
-  // successfully-loaded path to the top (used by Open… and reselecting a recent);
-  // a failed load of a recent path prunes it (the file likely moved/vanished).
-  async function selectRobot(path: string, record: boolean) {
-    setSel(path);
-    const wasRecent = useStore.getState().recentUrdfs.includes(path);
-    await loadRobot(path); // surfaces any CompileError in the shared error UI
-    const st = useStore.getState();
-    if (st.robot && !st.error) {
-      if (record) addRecent(path);
-    } else if (wasRecent) {
-      removeRecent(path);
-    }
-  }
-
-  async function openUrdf() {
-    const picked = await open({
-      multiple: false,
-      directory: false,
-      filters: [{ name: "URDF", extensions: ["urdf", "xml"] }],
+    void loadFixtures().then(() => {
+      const f = useStore.getState().fixtures;
+      if (f.length && !useStore.getState().urdfPath) {
+        void useStore.getState().loadRobot(f[0][1]); // auto-load the showcase on startup
+      }
     });
-    if (typeof picked !== "string") return; // dialog cancelled
-    await selectRobot(picked, true);
-  }
+  }, [loadFixtures]);
 
   return (
     <header className="topbar" data-tauri-drag-region>
@@ -105,6 +98,9 @@ export function Toolbar({ version }: { version: string }) {
       <span className="engine">
         {robot ? `· ${robot.name} · ` : ""}engine v{version}
       </span>
+      <button className="kbd-chip" title="Command palette (⌘K)" onClick={onPalette}>
+        ⌘K
+      </button>
     </header>
   );
 }

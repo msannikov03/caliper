@@ -4,7 +4,9 @@ import { Grid, OrbitControls, GizmoHelper, GizmoViewport } from "@react-three/dr
 import { invoke } from "@tauri-apps/api/core";
 import { RobotView } from "./three/RobotView";
 import { IkGizmo } from "./three/IkGizmo";
-import { Toolbar } from "./ui/Toolbar";
+import { Toolbar, openUrdf } from "./ui/Toolbar";
+import { Palette } from "./ui/Palette";
+import { MODE_TABS } from "./commands";
 import { JointPanel } from "./ui/JointPanel";
 import { Hud } from "./ui/Hud";
 import { SingularityHud } from "./ui/SingularityHud";
@@ -13,7 +15,6 @@ import { PosePanel } from "./ui/PosePanel";
 import { SimulatePanel } from "./ui/SimulatePanel";
 import { GraphEditor } from "./graph/GraphEditor";
 import { useStore } from "./store";
-import type { StudioMode } from "./store";
 import "./App.css";
 
 function ModeTabs() {
@@ -21,25 +22,23 @@ function ModeTabs() {
   const setMode = useStore((s) => s.setMode);
   const robot = useStore((s) => s.robot);
   if (!robot) return null;
-  const tabs: { id: StudioMode; label: string; disabled?: boolean }[] = [
-    { id: "jog", label: "Jog" },
-    { id: "motion", label: "Motion" },
-    { id: "simulate", label: "Simulate", disabled: !robot.hasInertia },
-    { id: "graph", label: "Graph" },
-  ];
+  // MODE_TABS is shared with the ⌘K palette so ⌘1…⌘4 always match tab order
   return (
     <div className="mode-tabs">
-      {tabs.map((t) => (
-        <button
-          key={t.id}
-          disabled={t.disabled}
-          title={t.disabled ? "no inertial data" : ""}
-          className={mode === t.id ? "active" : ""}
-          onClick={() => setMode(t.id)}
-        >
-          {t.label}
-        </button>
-      ))}
+      {MODE_TABS.map((t) => {
+        const disabled = t.id === "simulate" && !robot.hasInertia;
+        return (
+          <button
+            key={t.id}
+            disabled={disabled}
+            title={disabled ? "no inertial data" : ""}
+            className={mode === t.id ? "active" : ""}
+            onClick={() => setMode(t.id)}
+          >
+            {t.label}
+          </button>
+        );
+      })}
     </div>
   );
 }
@@ -75,6 +74,7 @@ function SceneChrome() {
 
 export default function App() {
   const [version, setVersion] = useState("…");
+  const [paletteOpen, setPaletteOpen] = useState(false);
   const mode = useStore((s) => s.mode);
   useEffect(() => {
     invoke<string>("engine_version")
@@ -82,11 +82,45 @@ export default function App() {
       .catch(() => setVersion("offline"));
   }, []);
 
+  // Global keymap (ONE window listener): ⌘K palette · ⌘O open URDF · ⌘1…⌘4
+  // modes (ModeTabs order) · Esc closes the palette. macOS-first (metaKey),
+  // ctrlKey accepted. Shortcuts are ignored while typing in a field — except
+  // inside the palette, which stopPropagation()s the keys it consumes itself
+  // and deliberately lets these chords fall through.
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      const t = e.target instanceof HTMLElement ? e.target : null;
+      const typing = !!t?.closest("input, textarea, [contenteditable]");
+      if (typing && !t?.closest(".cmdk")) return;
+      const mod = e.metaKey || e.ctrlKey;
+      if (mod && (e.key === "k" || e.key === "K")) {
+        e.preventDefault();
+        setPaletteOpen((o) => !o);
+      } else if (mod && (e.key === "o" || e.key === "O")) {
+        e.preventDefault();
+        setPaletteOpen(false);
+        void openUrdf();
+      } else if (mod && e.key >= "1" && e.key <= String(MODE_TABS.length)) {
+        const tab = MODE_TABS[Number(e.key) - 1];
+        const st = useStore.getState();
+        // mirror the ModeTabs gating: no robot → no tabs; simulate needs inertia
+        if (st.robot && !(tab.id === "simulate" && !st.robot.hasInertia)) {
+          e.preventDefault();
+          st.setMode(tab.id);
+        }
+      } else if (e.key === "Escape") {
+        setPaletteOpen(false);
+      }
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+
   const isGraph = mode === "graph";
 
   return (
     <div className="app">
-      <Toolbar version={version} />
+      <Toolbar version={version} onPalette={() => setPaletteOpen(true)} />
       {/* segmented mode switch floats centered over the command bar */}
       <ModeTabs key="modetabs" />
       {/*
@@ -115,6 +149,8 @@ export default function App() {
           <Transport />
         </div>
       </main>
+      {/* overlay only — mounting/unmounting it never touches the GL Canvas */}
+      {paletteOpen && <Palette onClose={() => setPaletteOpen(false)} />}
     </div>
   );
 }

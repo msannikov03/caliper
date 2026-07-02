@@ -82,6 +82,42 @@ def test_plan_optimal_is_collision_free_and_not_worse_than_rrt_connect():
     assert cost(opt) <= cost(rrt) * 1.10 + 1e-6, f"opt {cost(opt):.3f} vs rrt {cost(rrt):.3f}"
 
 
+# ---------- MOVE_C ----------
+def test_move_c_reaches_via_and_endpoint_within_limits():
+    r = _robot("showcase6")
+    q0 = [0.3, -0.4, 0.6, 0.2, -0.5, 0.1]
+    T0 = np.array(r.fk(q0))  # row-major
+    pa = T0[:3, 3]
+    # 4 cm circle in the VERTICAL (x-z) plane, center directly below the tip:
+    # start 90deg (== tip), via 120deg, end 180deg — a 90deg short arc heading
+    # away from the base z-axis. (A horizontal arc at this posture grazes the
+    # shoulder singularity — the tip is only ~6 cm off the base axis — and IK
+    # rightly truncates it. The long-way frame-sign regression is pinned by
+    # the Rust fit_arc test.)
+    rad = 0.04
+    c = pa - np.array([0.0, 0.0, rad])
+
+    def pt(th):
+        return c + rad * np.array([np.cos(th), 0.0, np.sin(th)])
+
+    via = pt(2 * np.pi / 3)
+    end = pt(np.pi)
+    T1 = T0.copy()
+    T1[:3, 3] = end
+    traj = r.move_c(q0, via.tolist(), T1.T.tolist())  # col-major target
+    assert traj.completed
+    t, q, qd, qdd = traj.sample_uniform(0.002)
+    tips = np.array([np.array(r.fk(qi))[:3, 3] for qi in q])
+    # endpoint + via reached
+    assert np.linalg.norm(tips[-1] - end) < 1e-4
+    assert np.min(np.linalg.norm(tips - via, axis=1)) < 1e-3
+    # within the model's joint velocity limits
+    assert np.all(np.abs(np.array(qd)) <= np.array(traj.vel_limit) * (1 + 1e-3))
+    # the SHORT 90deg arc, not the long way round
+    path_len = np.linalg.norm(np.diff(tips, axis=0), axis=1).sum()
+    assert path_len < rad * np.pi / 2 * 1.05
+
+
 # ---------- joint-offset calibration ----------
 def test_calibrate_recovers_known_offset():
     r = _robot("showcase6")

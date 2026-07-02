@@ -141,11 +141,14 @@ impl Trajectory {
         let fk = (tt / self.dt).floor() as usize;
         let n = self.knots_q.len();
         if fk + 1 >= n {
+            // Surface the STORED terminal knot state: zeros for a fully-realized
+            // move (rest boundary), the true one-sided qd/qdd at the cut for a
+            // truncated best-effort prefix — never fabricate rest.
             let last = n - 1;
             return TrajState {
                 q: self.knots_q[last].clone(),
-                qd: vec![0.0; self.ndof],
-                qdd: vec![0.0; self.ndof],
+                qd: self.knots_qd[last].clone(),
+                qdd: self.knots_qdd[last].clone(),
             };
         }
         let frac = (tt - fk as f64 * self.dt) / self.dt;

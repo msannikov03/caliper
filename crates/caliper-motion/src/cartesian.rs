@@ -199,15 +199,18 @@ pub fn move_c(
     )
 }
 
-struct ArcGeom {
-    c: Vector3<f64>,
-    r: f64,
-    u: Vector3<f64>,
-    v: Vector3<f64>,
-    phi: f64,
+pub(crate) struct ArcGeom {
+    pub(crate) c: Vector3<f64>,
+    pub(crate) r: f64,
+    pub(crate) u: Vector3<f64>,
+    pub(crate) v: Vector3<f64>,
+    pub(crate) phi: f64,
 }
 
-fn fit_arc(
+/// Fit the unique circle through (p0, pv, p1), parameterized p(θ)=c+r(cosθ·u+sinθ·v)
+/// with θ swept 0→phi such that 0 < angle(via) < phi = angle(end): the arc passes
+/// THROUGH the via point on its way to the end and the sweep is always < 2π.
+pub(crate) fn fit_arc(
     p0: &Vector3<f64>,
     pv: &Vector3<f64>,
     p1: &Vector3<f64>,
@@ -223,31 +226,26 @@ fn fit_arc(
     let r = (p0 - c).norm();
     let n = axb.normalize();
     let u = (p0 - c) / r;
-    let v = n.cross(&u);
-    let ang = |p: &Vector3<f64>| {
-        let d = p - c;
-        d.dot(&v).atan2(d.dot(&u))
-    };
+    let mut v = n.cross(&u);
     let two_pi = std::f64::consts::TAU;
-    let wrap = |x: f64| {
-        let mut y = x % two_pi;
+    let ang = |p: &Vector3<f64>, v: &Vector3<f64>| {
+        let d = p - c;
+        let mut y = d.dot(v).atan2(d.dot(&u)) % two_pi;
         if y < 0.0 {
             y += two_pi;
         }
         y
     };
-    let phi_v = wrap(ang(pv));
-    let mut phi_1 = wrap(ang(p1));
-    if phi_1 < phi_v {
-        phi_1 += two_pi;
+    // Basis sign: with the naive v (from a×b) the end can come BEFORE the via,
+    // and sweeping on to a bumped end angle goes the long way round (>2π−short;
+    // ~634° observed). Flip v so 0 < angle(via) < angle(end); the short sweep
+    // then runs through the via by construction.
+    if ang(pv, &v) > ang(p1, &v) {
+        v = -v;
     }
-    Ok(ArcGeom {
-        c,
-        r,
-        u,
-        v,
-        phi: phi_1,
-    })
+    let phi = ang(p1, &v);
+    debug_assert!(ang(pv, &v) < phi && phi <= two_pi);
+    Ok(ArcGeom { c, r, u, v, phi })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -283,15 +281,19 @@ fn sample_cartesian(
     };
 
     // Solve the whole grid for a given timing profile. Returns (rows, last reached
-    // s, stop reason). A stop reason means the path was truncated at that sample.
-    let solve = |prof: &ScurveProfile| -> (Vec<Vec<f64>>, f64, Option<MotionError>) {
+    // s, stop reason, effective knot period). A stop reason means the path was
+    // truncated at that sample.
+    let solve = |prof: &ScurveProfile| -> (Vec<Vec<f64>>, f64, Option<MotionError>, f64) {
         let total = prof.total().max(opts.dt);
         let n = (total / opts.dt).ceil() as usize + 1;
+        // dt_eff = total/(n-1): the LAST knot lands exactly on the profile total,
+        // so duration() == the s(t) S-curve total (no ≤dt phantom hold at the goal).
+        let dt_eff = total / (n - 1) as f64;
         let mut rows: Vec<Vec<f64>> = Vec::with_capacity(n);
         let mut seed = q_start.to_vec();
         let mut last_s = 0.0;
         for k in 0..n {
-            let t = (k as f64 * opts.dt).min(total);
+            let t = (k as f64 * dt_eff).min(total);
             let (s, _, _) = prof.sample(t); // s ∈ [0,1]
             let pose = pose_of(s);
             let res = ik(model, frame, &pose, &seed, &ikopts);
@@ -303,6 +305,7 @@ fn sample_cartesian(
                         s,
                         residual: res.residual,
                     }),
+                    dt_eff,
                 );
             }
             let jump: f64 = res
@@ -312,18 +315,24 @@ fn sample_cartesian(
                 .map(|(a, b)| (a - b).abs())
                 .fold(0.0, f64::max);
             if k > 0 && jump > opts.continuity_thresh {
-                return (rows, last_s, Some(MotionError::Discontinuity { s, jump }));
+                return (
+                    rows,
+                    last_s,
+                    Some(MotionError::Discontinuity { s, jump }),
+                    dt_eff,
+                );
             }
             seed = res.q.clone();
             rows.push(res.q);
             last_s = s;
         }
-        (rows, 1.0, None)
+        (rows, 1.0, None, dt_eff)
     };
 
     let finish = |rows: Vec<Vec<f64>>,
                   reached: f64,
-                  stop: Option<MotionError>|
+                  stop: Option<MotionError>,
+                  dt_eff: f64|
      -> Result<Trajectory, MotionError> {
         if let Some(e) = &stop {
             // Abort, or too short to interpolate → hard error.
@@ -331,10 +340,12 @@ fn sample_cartesian(
                 return Err(e.clone());
             }
         }
-        let (qd, qdd) = fd_derivs(&rows, opts.dt);
+        // A full path truly ends at rest; a truncated prefix does NOT — carry the
+        // real terminal state so limit/jerk badges stay honest.
+        let (qd, qdd) = fd_derivs(&rows, dt_eff, stop.is_none());
         Ok(Trajectory::from_knots(
             kind,
-            opts.dt,
+            dt_eff,
             rows,
             qd,
             qdd,
@@ -345,11 +356,11 @@ fn sample_cartesian(
     };
 
     // first pass
-    let (rows, reached, stop) = solve(&prof);
+    let (rows, reached, stop, dt_eff) = solve(&prof);
 
     // joint-limit ρ scaling (rare; near-singular) — only on a fully-solved path.
     if stop.is_none() {
-        let (qd, _) = fd_derivs(&rows, opts.dt);
+        let (qd, _) = fd_derivs(&rows, dt_eff, true);
         let mut worst = 0.0f64;
         for row in &qd {
             for (i, &v) in row.iter().enumerate() {
@@ -359,22 +370,32 @@ fn sample_cartesian(
         if worst > 1.0 {
             let new_total = prof.total().max(opts.dt) * worst;
             prof = plan_scurve_to_duration(1.0, new_total, vs, as_, js);
-            let (rows2, reached2, stop2) = solve(&prof);
-            return finish(rows2, reached2, stop2);
+            let (rows2, reached2, stop2, dt_eff2) = solve(&prof);
+            return finish(rows2, reached2, stop2, dt_eff2);
         }
     }
-    finish(rows, reached, stop)
+    finish(rows, reached, stop, dt_eff)
 }
 
-fn fd_derivs(rows: &[Vec<f64>], dt: f64) -> (Vec<Vec<f64>>, Vec<Vec<f64>>) {
+/// Central-difference knot derivatives. `rest_end` says whether the path truly
+/// ends at rest (fully realized move): a truncated best-effort prefix instead
+/// carries one-sided qd/qdd at the cut, so downstream consumers (within-limits /
+/// max-jerk badges) see the real terminal state, not a fabricated stop.
+fn fd_derivs(rows: &[Vec<f64>], dt: f64, rest_end: bool) -> (Vec<Vec<f64>>, Vec<Vec<f64>>) {
     let n = rows.len();
     let d = rows.first().map(|r| r.len()).unwrap_or(0);
     let mut qd = vec![vec![0.0; d]; n];
     let mut qdd = vec![vec![0.0; d]; n];
     for k in 0..n {
         for i in 0..d {
-            qd[k][i] = if k == 0 || k + 1 == n {
-                0.0 // rest boundary
+            qd[k][i] = if k == 0 {
+                0.0 // rest start (Cartesian moves launch from rest)
+            } else if k + 1 == n {
+                if rest_end {
+                    0.0
+                } else {
+                    (rows[k][i] - rows[k - 1][i]) / dt // true velocity at the cut
+                }
             } else {
                 (rows[k + 1][i] - rows[k - 1][i]) / (2.0 * dt)
             };
@@ -382,8 +403,14 @@ fn fd_derivs(rows: &[Vec<f64>], dt: f64) -> (Vec<Vec<f64>>, Vec<Vec<f64>>) {
     }
     for k in 0..n {
         for i in 0..d {
-            qdd[k][i] = if k == 0 || k + 1 == n {
+            qdd[k][i] = if k == 0 {
                 0.0
+            } else if k + 1 == n {
+                if rest_end {
+                    0.0
+                } else {
+                    (qd[k][i] - qd[k - 1][i]) / dt
+                }
             } else {
                 (qd[k + 1][i] - qd[k - 1][i]) / (2.0 * dt)
             };

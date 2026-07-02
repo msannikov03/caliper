@@ -78,9 +78,10 @@ These are stated plainly because pretending otherwise would be the real defect:
 3. **By-design limitations (documented, not bugs).** The collision guarantee is
    sampled-at-resolution (narrow passages can tunnel); mesh/capsule colliders that
    can't be reduced to supported primitives are surfaced via `uncovered_frames`
-   rather than checked; the native `Simulator` has no collision; `MOVE_C` is
-   currently unwired dead code with no oracle; the "singular joint" classification
-   is advisory. There are no dedicated narrow-passage / near-π / at-limit stress
+   rather than checked; the native `Simulator` has no collision; the "singular
+   joint" classification is advisory. (`MOVE_C`, formerly unwired dead code, is
+   now fixed — short-way arc through the via — wired to the CLI/Python faces and
+   oracle-covered.) There are no dedicated narrow-passage / near-π / at-limit stress
    fixtures yet — coverage is random sampling.
 
 ## Repro pointers

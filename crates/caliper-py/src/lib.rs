@@ -10,7 +10,7 @@ use caliper::kinematics::{JacFrame, Jacobian, SingularityKind, SingularityParams
 use caliper::model::Model;
 use caliper::motion::{
     CartesianMoveOpts, MotionLimits as EngineLimits, MotionLimitsConfig, Trajectory as EngineTraj,
-    move_j, move_l, retime_time_optimal,
+    move_c, move_j, move_l, retime_time_optimal,
 };
 use caliper::planning::reach::{ReachChecker as EngineReach, ReachConfig, ReachStatus};
 use caliper::planning::{PlanError, Planner as EnginePlanner, PlannerConfig};
@@ -411,6 +411,70 @@ impl Robot {
         move_l(model, f, &q_start, &goal, &opts)
             .map(|inner| Trajectory { inner })
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
+    /// Cartesian circular arc (MOVE_C) from q_start THROUGH the `via` point
+    /// ([x, y, z], meters) to a 4×4 COLUMN-MAJOR end pose (same convention as
+    /// move_l()). The arc is the unique circle through the start/via/end tip
+    /// positions, swept the short way so it passes the via en route to the end;
+    /// orientation slerps start→end.
+    #[pyo3(signature = (q_start, via, target, frame=None, limits=None))]
+    fn move_c(
+        &self,
+        q_start: Vec<f64>,
+        via: Vec<f64>,
+        target: Vec<Vec<f64>>,
+        frame: Option<&str>,
+        limits: Option<MotionLimits>,
+    ) -> PyResult<Trajectory> {
+        let model = &self.inner.model;
+        if q_start.len() != model.ndof {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "q_start length must be ndof={}",
+                model.ndof
+            )));
+        }
+        if via.len() != 3 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "via must be [x, y, z]",
+            ));
+        }
+        if target.len() != 4 || target.iter().any(|c| c.len() != 4) {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "target must be 4x4 column-major",
+            ));
+        }
+        finite_or_err("q_start", &q_start)?;
+        finite_or_err("via", &via)?;
+        for col in &target {
+            finite_or_err("target", col)?;
+        }
+        let f = resolve_frame(model, frame)?;
+        let rot = Matrix3::new(
+            target[0][0],
+            target[1][0],
+            target[2][0],
+            target[0][1],
+            target[1][1],
+            target[2][1],
+            target[0][2],
+            target[1][2],
+            target[2][2],
+        );
+        let trans = Vector3::new(target[3][0], target[3][1], target[3][2]);
+        let goal = Se3::from_parts(trans, UnitQuaternion::from_matrix(&rot));
+        let lim = motion_limits(model, limits)?;
+        let opts = CartesianMoveOpts::defaults(lim);
+        move_c(
+            model,
+            f,
+            &q_start,
+            &Vector3::new(via[0], via[1], via[2]),
+            &goal,
+            &opts,
+        )
+        .map(|inner| Trajectory { inner })
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
     }
 
     /// Time-optimal (acceleration-limited, corner-stop bang-bang TOPP) retiming

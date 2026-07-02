@@ -255,6 +255,148 @@ fn move_l_abort_on_unreachable() {
     );
 }
 
+// ---- MOVE_C ARC FRAME (regression: long-way sweep) ----
+// Unit circle at the origin, xy-plane. Start at 0°, via at −30°, end at −90°:
+// the correct arc is the 90° clockwise sweep THROUGH the via. The naive frame
+// (v straight from a×b) put via at 330° and end at 270°, then bumped the end
+// angle by 2π → a 630° long-way sweep (the ~634° observed in review).
+#[test]
+fn fit_arc_sweeps_short_way_through_via() {
+    use std::f64::consts::{FRAC_PI_2, FRAC_PI_6};
+    let p0 = Vector3::new(1.0, 0.0, 0.0);
+    let pv = Vector3::new((-FRAC_PI_6).cos(), (-FRAC_PI_6).sin(), 0.0);
+    let p1 = Vector3::new(0.0, -1.0, 0.0);
+    let arc = crate::cartesian::fit_arc(&p0, &pv, &p1).unwrap();
+    assert!((arc.r - 1.0).abs() < 1e-12, "radius {}", arc.r);
+    assert!(
+        (arc.phi - FRAC_PI_2).abs() < 1e-9,
+        "sweep {} rad, expected the short 90° arc",
+        arc.phi
+    );
+    let at = |s: f64| {
+        let ang = s * arc.phi;
+        arc.c + arc.r * (ang.cos() * arc.u + ang.sin() * arc.v)
+    };
+    assert!((at(0.0) - p0).norm() < 1e-12);
+    assert!((at(1.0) - p1).norm() < 1e-9);
+    // via sits at 30° of the 90° sweep → s = 1/3, ON the way to the end
+    assert!(
+        (at(1.0 / 3.0) - pv).norm() < 1e-9,
+        "parameterization does not pass through via"
+    );
+}
+
+#[test]
+fn move_c_traces_short_arc_through_via() {
+    use std::f64::consts::PI;
+    let m = load("showcase6.urdf");
+    let l = lim(&m);
+    let qa = [0.3, -0.4, 0.6, 0.2, -0.5, 0.1];
+    let ta = fk_tip(&m, &qa);
+    let pa = ta.translation_vec();
+    // 4 cm circle in the VERTICAL (x-z) plane, center directly below the tip:
+    // start 90° (== tip), via 120°, end 180° — a 90° short arc heading away
+    // from the base z-axis. (A horizontal arc at this posture grazes the
+    // shoulder singularity — the tip sits only ~6 cm off the base axis — and
+    // IK rightly truncates it.) The long-way frame-sign regression itself is
+    // pinned geometrically by `fit_arc_sweeps_short_way_through_via` above.
+    let r = 0.04;
+    let c = pa - Vector3::new(0.0, 0.0, r);
+    let at = |th: f64| c + r * Vector3::new(th.cos(), 0.0, th.sin());
+    let via = at(2.0 * PI / 3.0);
+    let end = at(PI);
+    let goal = Se3::from_parts(end, ta.0.rotation);
+    let opts = CartesianMoveOpts::defaults(l);
+    let f = m.tip_frame();
+    let traj = move_c(&m, f, &qa, &via, &goal, &opts).unwrap();
+    assert!(traj.completed, "reachable MOVE_C must complete");
+    let n = 400;
+    let mut prev = pa;
+    let mut path_len = 0.0;
+    let mut dvia = f64::INFINITY;
+    for k in 0..=n {
+        let t = traj.duration() * k as f64 / n as f64;
+        let p = fk_frame(&m, &traj.sample(t).q, f).translation_vec();
+        path_len += (p - prev).norm();
+        dvia = dvia.min((p - via).norm());
+        prev = p;
+    }
+    assert!(
+        (prev - end).norm() < 1e-4,
+        "endpoint off by {}",
+        (prev - end).norm()
+    );
+    assert!(dvia < 1e-3, "tip path misses the via point by {dvia}");
+    let short = r * PI / 2.0;
+    assert!(
+        path_len < short * 1.05,
+        "tip swept {path_len} m — long way round? short arc is {short} m"
+    );
+}
+
+// ---- CARTESIAN duration() lands exactly on the s(t) profile total ----
+#[test]
+fn move_l_duration_matches_scurve_total_exactly() {
+    let m = load("showcase6.urdf");
+    let l = lim(&m);
+    let qa = [0.3, -0.4, 0.6, 0.2, -0.5, 0.1];
+    let ta = fk_tip(&m, &qa);
+    let pa = ta.translation_vec();
+    let dist = 0.05;
+    let goal = Se3::from_parts(pa + Vector3::new(0.0, dist, 0.0), ta.0.rotation);
+    // Slow v_lin so no joint outruns its vmax: at this near-axis posture the
+    // default Cartesian speed makes the base yaw exceed its limit and the
+    // (correct, pre-existing) ρ-rescale stretches the move — which is NOT the
+    // phantom-hold defect this test pins. With no rescale, duration() must
+    // land EXACTLY on the s(t) profile total.
+    let opts = CartesianMoveOpts {
+        v_lin: 0.02,
+        ..CartesianMoveOpts::defaults(l)
+    };
+    let traj = move_l(&m, m.tip_frame(), &qa, &goal, &opts).unwrap();
+    assert!(traj.completed);
+    // pure translation (orientation held): s(t) caps come from the linear limits
+    let prof =
+        crate::scurve::plan_scurve(1.0, opts.v_lin / dist, opts.a_lin / dist, opts.j_lin / dist);
+    assert!(
+        (traj.duration() - prof.total()).abs() < 1e-9,
+        "duration {} vs S-curve total {} — trailing ≤dt phantom hold",
+        traj.duration(),
+        prof.total()
+    );
+    // final sample IS the goal, at rest — no padded hold knot
+    let s_end = traj.sample(traj.duration());
+    let p_end = fk_frame(&m, &s_end.q, m.tip_frame()).translation_vec();
+    assert!((p_end - goal.translation_vec()).norm() < 1e-5);
+    for v in &s_end.qd {
+        assert!(v.abs() < 1e-9, "completed move must end at rest");
+    }
+}
+
+// ---- TRUNCATED PREFIX carries the true (non-rest) terminal state ----
+#[test]
+fn truncated_prefix_reports_nonrest_terminal_state() {
+    let m = load("showcase6.urdf");
+    let l = lim(&m);
+    let qa = [0.1, 0.1, 0.1, 0.1, 0.1, 0.1];
+    let ta = fk_tip(&m, &qa);
+    let goal = Se3::from_parts(
+        ta.translation_vec() + Vector3::new(5.0, 5.0, 5.0),
+        ta.0.rotation,
+    );
+    let opts = CartesianMoveOpts::defaults(l); // default = Truncate
+    let traj = move_l(&m, m.tip_frame(), &qa, &goal, &opts).unwrap();
+    assert!(!traj.completed, "must be a truncated prefix");
+    // the arm was cruising toward the wall when IK cut the path: the terminal
+    // sample must expose that motion, not a fabricated qd=qdd=0 rest state.
+    let s_end = traj.sample(traj.duration());
+    let vmax = s_end.qd.iter().fold(0.0f64, |a, &x| a.max(x.abs()));
+    assert!(
+        vmax > 1e-6,
+        "truncated prefix fabricated a rest terminal state (|qd|max={vmax})"
+    );
+}
+
 #[test]
 fn move_l_truncate_returns_prefix() {
     let m = load("showcase6.urdf");

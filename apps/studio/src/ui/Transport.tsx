@@ -45,6 +45,9 @@ export function Transport() {
         max={clip.duration}
         step={0.001}
         value={playhead}
+        // grabbing the scrubber takes the transport: pause so the clock stops
+        // fighting the drag; stay paused on release (standard transport UX).
+        onPointerDown={() => pause()}
         onChange={(e) => seek(parseFloat(e.target.value))}
       />
       <span className="tp-time">

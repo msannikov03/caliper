@@ -176,6 +176,19 @@ class Robot:
         """Cartesian straight line (MOVE_L) to a 4x4 COLUMN-MAJOR target."""
         ...
 
+    def move_c(
+        self,
+        q_start: _Vec,
+        via: _Vec,
+        target: Sequence[Sequence[float]],
+        frame: Optional[str] = ...,
+        limits: Optional["MotionLimits"] = ...,
+    ) -> "Trajectory":
+        """Cartesian circular arc (MOVE_C) THROUGH `via` ([x, y, z], meters)
+        to a 4x4 COLUMN-MAJOR end pose; the short sweep passes the via en
+        route to the end."""
+        ...
+
     def retime_time_optimal(
         self,
         waypoints: Sequence[_Vec],

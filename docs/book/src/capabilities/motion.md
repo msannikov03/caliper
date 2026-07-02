@@ -18,9 +18,12 @@ The Cartesian entry points validate their caps, `dt`, and goal finiteness
 (non-finite goals are rejected), symmetric with the joint-space path — this was
 tightened in the audit.
 
-> **Honest note on MOVE_C.** MOVE_C exists but is, at the time of this writing,
-> unwired dead code with no oracle coverage. Treat it as experimental until it
-> is exercised end-to-end.
+MOVE_C fits the unique circle through the start / via / end tip positions and
+sweeps it the short way, so the parameterization passes **through** the via
+point on its way to the end (the naive arc frame could sweep the long way
+round — regression-tested). It is wired to every face: `move_c` in Rust and
+Python, and `caliper move --target ... --via tx,ty,tz` on the CLI, with oracle
+coverage (endpoint + via reached within joint velocity limits).
 
 ## Waypoint retiming
 

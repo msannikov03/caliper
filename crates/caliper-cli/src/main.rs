@@ -8,7 +8,8 @@ use caliper::hal::{
 use caliper::ik::{IkOpts, analytic_ik_6r, ik};
 use caliper::kinematics::{JacFrame, Jacobian, SingularityParams, fk_frame, jacobian};
 use caliper::motion::{
-    CartesianMoveOpts, MotionLimits, MotionLimitsConfig, move_j, move_l, retime_time_optimal,
+    CartesianMoveOpts, MotionLimits, MotionLimitsConfig, move_c, move_j, move_l,
+    retime_time_optimal,
 };
 use caliper::planning::path_length;
 use caliper::planning::reach::{ReachChecker, ReachConfig, ReachStatus};
@@ -87,6 +88,10 @@ enum Cmd {
         /// MOVE_L Cartesian target: 12 numbers (9 row-major R then tx,ty,tz), as `ik`.
         #[arg(long, value_delimiter = ',', allow_hyphen_values = true)]
         target: Option<Vec<f64>>,
+        /// MOVE_C via point (tx,ty,tz): plan a circular arc THROUGH this
+        /// Cartesian point to --target instead of a straight line.
+        #[arg(long, value_delimiter = ',', allow_hyphen_values = true)]
+        via: Option<Vec<f64>>,
         /// Start config (length = ndof). Defaults to all-zeros (home).
         #[arg(long, value_delimiter = ',', allow_hyphen_values = true)]
         start: Option<Vec<f64>>,
@@ -506,6 +511,7 @@ fn main() -> anyhow::Result<()> {
             urdf,
             goal,
             target,
+            via,
             start,
             dt,
             frame,
@@ -529,6 +535,10 @@ fn main() -> anyhow::Result<()> {
                 "start contains a non-finite value"
             );
             let (traj, kind) = if let Some(goal) = goal {
+                anyhow::ensure!(
+                    via.is_none(),
+                    "--via applies to Cartesian --target (MOVE_C), not joint-space --goal"
+                );
                 anyhow::ensure!(goal.len() == m.ndof, "goal needs {} values", m.ndof);
                 anyhow::ensure!(
                     goal.iter().all(|x| x.is_finite()),
@@ -556,7 +566,16 @@ fn main() -> anyhow::Result<()> {
                 let goal_se3 = Se3::from_parts(trans, UnitQuaternion::from_matrix(&rot));
                 let f = resolve_frame(m, &frame)?;
                 let opts = CartesianMoveOpts::defaults(limits.clone());
-                (move_l(m, f, &start, &goal_se3, &opts)?, "MOVE_L")
+                if let Some(v) = via {
+                    anyhow::ensure!(
+                        v.len() == 3 && v.iter().all(|x| x.is_finite()),
+                        "--via needs 3 finite values (tx,ty,tz)"
+                    );
+                    let via_pt = Vector3::new(v[0], v[1], v[2]);
+                    (move_c(m, f, &start, &via_pt, &goal_se3, &opts)?, "MOVE_C")
+                } else {
+                    (move_l(m, f, &start, &goal_se3, &opts)?, "MOVE_L")
+                }
             };
             println!(
                 "{kind} '{}'  duration {:.4}s  ({} dof, completed={})",

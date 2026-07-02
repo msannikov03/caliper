@@ -7,7 +7,7 @@
 use caliper_spatial::{Se3, SpatialInertia};
 use nalgebra::{Isometry3, Matrix3, Point3, Translation3, UnitQuaternion, Vector3};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub mod hull;
 pub mod stl;
@@ -94,6 +94,56 @@ pub struct CollisionGeom {
     pub shape: CollisionShape,
 }
 
+/// A RENDER-ONLY visual shape, in the shape's own local frame (mirrors
+/// [`CollisionShape`] for primitives). Unlike a collision `<mesh>` (which is
+/// loaded and hulled), a visual `<mesh>` is NOT loaded here — only its filename
+/// is resolved to an absolute on-disk path so a renderer (Studio) can load it
+/// itself. `path: None` means unresolvable: the visual is still KEPT so the
+/// renderer can fall back to a procedural placeholder.
+#[derive(Clone, Debug, PartialEq)]
+pub enum VisualShape {
+    /// `half` are the half-extents (URDF `size`/2), like [`CollisionShape::Box`].
+    Box {
+        half: Vector3<f64>,
+    },
+    Sphere {
+        radius: f64,
+    },
+    /// Z-aligned (URDF convention).
+    Cylinder {
+        radius: f64,
+        length: f64,
+    },
+    /// Z-aligned (URDF convention); `length` is the core segment, tip-to-tip
+    /// extent is `length + 2*radius` (see [`CollisionShape::Capsule`]).
+    Capsule {
+        radius: f64,
+        length: f64,
+    },
+    Mesh {
+        /// RESOLVED absolute path (existed at parse time); `None` if the raw
+        /// filename could not be resolved (see [`resolve_mesh_path`]).
+        path: Option<PathBuf>,
+        /// The raw URDF `filename` attribute, verbatim, for diagnostics/fallback.
+        raw: String,
+        /// Per-axis mesh scale (URDF `scale`, default `[1, 1, 1]`).
+        scale: [f64; 3],
+    },
+}
+
+/// A render-only visual attached to a link [`LinkFrame`]. Its world pose is
+/// `fk_frame(model, q, frame) · origin`, exactly like [`CollisionGeom`] — the
+/// frame already carries any folded fixed-chain offset.
+#[derive(Clone, Debug)]
+pub struct VisualGeom {
+    pub frame: usize,
+    pub origin: Se3,
+    pub shape: VisualShape,
+    /// RGBA in `[0, 1]`: the visual's inline `<material><color>` if present,
+    /// else the color of the named top-level `<material>` it references, else `None`.
+    pub color: Option<[f32; 4]>,
+}
+
 /// Frozen, struct-of-arrays kinematic model. Movable joints are in topological
 /// order (`parent[i] < i`).
 #[derive(Clone, Debug)]
@@ -136,6 +186,12 @@ pub struct Model {
     /// "clear" for its dropped part. Callers must treat these as not-fully-covered
     /// (see `caliper_collision::CollisionModel::uncovered_frames`).
     pub dropped_collider_frames: Vec<usize>,
+    /// Parsed `<visual>` geometry — RENDER-ONLY, never consulted by kinematics,
+    /// collision, or dynamics. Primitives carry exact dims; a `<mesh>` carries a
+    /// resolved absolute path (or `None` when unresolvable — the visual is KEPT
+    /// so a renderer can fall back to a procedural shape). Visual parsing can
+    /// never fail `compile()`. Empty when the URDF has no `<visual>` elements.
+    pub visuals: Vec<VisualGeom>,
 }
 
 impl Model {
@@ -216,6 +272,9 @@ struct RobotTree {
     /// Parallel to `links`: true if the link had a `<collision>` whose geometry
     /// was DROPPED (an unloadable mesh) — that link is only partially covered.
     link_dropped: Vec<bool>,
+    /// Parallel to `links`: parsed render-only `<visual>` shapes
+    /// `(link-frame-local origin, shape, rgba)`.
+    link_visual: Vec<Vec<ParsedVisual>>,
     joints: Vec<EditJoint>,
     link_index: HashMap<String, usize>,
 }
@@ -236,6 +295,7 @@ impl RobotTree {
             let (geoms, dropped) = parse_collisions(l, base_dir);
             t.link_collision.push(geoms);
             t.link_dropped.push(dropped);
+            t.link_visual.push(parse_visuals(l, &u.materials, base_dir));
         }
         for j in &u.joints {
             let parent = *t
@@ -358,6 +418,119 @@ fn parse_collisions(
     (out, dropped)
 }
 
+/// Parse a link's `<visual>` list into `(link-local origin, shape, rgba)` —
+/// RENDER-ONLY, infallible (an unresolvable mesh is KEPT with `path: None`,
+/// see [`VisualShape::Mesh`]). Color: the visual's inline material color wins;
+/// else a named material is resolved against the robot's top-level `materials`;
+/// else `None`.
+/// A parsed `<visual>` before frame attachment: `(link-local origin, shape, rgba)`.
+type ParsedVisual = (Se3, VisualShape, Option<[f32; 4]>);
+
+fn parse_visuals(
+    link: &urdf_rs::Link,
+    materials: &[urdf_rs::Material],
+    base_dir: Option<&Path>,
+) -> Vec<ParsedVisual> {
+    link.visual
+        .iter()
+        .map(|v| {
+            let origin = pose_to_se3(&v.origin);
+            let shape = match &v.geometry {
+                urdf_rs::Geometry::Box { size } => {
+                    let [x, y, z] = size.0;
+                    VisualShape::Box {
+                        half: Vector3::new(x / 2.0, y / 2.0, z / 2.0),
+                    }
+                }
+                urdf_rs::Geometry::Sphere { radius } => VisualShape::Sphere { radius: *radius },
+                urdf_rs::Geometry::Cylinder { radius, length } => VisualShape::Cylinder {
+                    radius: *radius,
+                    length: *length,
+                },
+                urdf_rs::Geometry::Capsule { radius, length } => VisualShape::Capsule {
+                    radius: *radius,
+                    length: *length,
+                },
+                urdf_rs::Geometry::Mesh { filename, scale } => VisualShape::Mesh {
+                    path: resolve_mesh_path(filename, base_dir),
+                    raw: filename.clone(),
+                    scale: scale.as_ref().map(|s| s.0).unwrap_or([1.0; 3]),
+                },
+            };
+            (
+                origin,
+                shape,
+                resolve_visual_color(v.material.as_ref(), materials),
+            )
+        })
+        .collect()
+}
+
+/// The rgba for a visual's material: inline `<color>` wins; else the referenced
+/// top-level named `<material>`'s color; else `None`.
+fn resolve_visual_color(
+    mat: Option<&urdf_rs::Material>,
+    named: &[urdf_rs::Material],
+) -> Option<[f32; 4]> {
+    let m = mat?;
+    let color = m.color.as_ref().or_else(|| {
+        named
+            .iter()
+            .find(|n| n.name == m.name)
+            .and_then(|n| n.color.as_ref())
+    })?;
+    let [r, g, b, a] = color.rgba.0;
+    Some([r as f32, g as f32, b as f32, a as f32])
+}
+
+/// Resolve a URDF `<mesh filename=...>` to an absolute on-disk path, or `None`.
+/// Reusable for both visual and (future) collision meshes. Search order:
+/// - `file://` prefix is stripped first;
+/// - a plain relative path: `urdf_dir/<raw>` if it exists;
+/// - an absolute path: itself, if it exists;
+/// - `package://<pkg>/<rest>`: `urdf_dir/<rest>`; then for `urdf_dir` and each
+///   of its ancestors `A` up to 6 levels: `A/<pkg>/<rest>` and `A/<rest>`; then
+///   for each root `R` in `CALIPER_PACKAGE_PATH` (colon-separated):
+///   `R/<pkg>/<rest>` and `R/<rest>`. First existing file wins.
+pub(crate) fn resolve_mesh_path(raw: &str, urdf_dir: Option<&Path>) -> Option<PathBuf> {
+    let name = raw.strip_prefix("file://").unwrap_or(raw);
+    if let Some(pkg_rest) = name.strip_prefix("package://") {
+        let (pkg, rest) = pkg_rest.split_once('/')?;
+        if pkg.is_empty() || rest.is_empty() {
+            return None;
+        }
+        let mut candidates: Vec<PathBuf> = Vec::new();
+        if let Some(dir) = urdf_dir {
+            candidates.push(dir.join(rest));
+            // ancestors() yields `dir` itself first, then up to 6 parent levels.
+            for a in dir.ancestors().take(7) {
+                candidates.push(a.join(pkg).join(rest));
+                candidates.push(a.join(rest));
+            }
+        }
+        if let Ok(roots) = std::env::var("CALIPER_PACKAGE_PATH") {
+            for r in roots.split(':').filter(|s| !s.is_empty()) {
+                candidates.push(Path::new(r).join(pkg).join(rest));
+                candidates.push(Path::new(r).join(rest));
+            }
+        }
+        return candidates.into_iter().find(|c| c.is_file()).map(absolutize);
+    }
+    let p = Path::new(name);
+    let cand = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        urdf_dir?.join(p)
+    };
+    cand.is_file().then(|| absolutize(cand))
+}
+
+/// Best-effort absolute form of an existing path (canonicalize, falling back to
+/// the path itself — it was just checked to exist, so this normally succeeds).
+fn absolutize(p: PathBuf) -> PathBuf {
+    std::fs::canonicalize(&p).unwrap_or(p)
+}
+
 /// Resolve a `<mesh>` filename, load its STL, apply the URDF per-axis `scale`,
 /// and reduce to a convex hull of vertices. `None` on any failure (the caller
 /// then keeps the mesh dropped). Only plain/relative/`file://` paths are
@@ -458,6 +631,7 @@ fn compile(t: &RobotTree) -> Result<Model, CompileError> {
         has_inertia: false,
         collision: vec![],
         dropped_collider_frames: vec![],
+        visuals: vec![],
     };
     // per link: (nearest movable-joint ancestor, accumulated fixed offset from it)
     let mut anchor: Vec<(Option<usize>, Se3)> = vec![(None, Se3::identity()); nlinks];
@@ -545,6 +719,19 @@ fn compile(t: &RobotTree) -> Result<Model, CompileError> {
             }
             if t.link_dropped.get(li).copied().unwrap_or(false) {
                 m.dropped_collider_frames.push(frame);
+            }
+        }
+    }
+    // Attach render-only visuals to their link frames, exactly like collision.
+    for (li, vis) in t.link_visual.iter().enumerate() {
+        if let Some(&frame) = m.frame_index.get(&t.links[li]) {
+            for (origin, shape, color) in vis {
+                m.visuals.push(VisualGeom {
+                    frame,
+                    origin: *origin,
+                    shape: shape.clone(),
+                    color: *color,
+                });
             }
         }
     }
@@ -816,5 +1003,127 @@ mod tests {
     fn rejects_disconnected() {
         let err = Model::from_urdf(Path::new(&fixture("disconnected.urdf"))).unwrap_err();
         assert!(matches!(err, CompileError::Disconnected(_)), "got {err:?}");
+    }
+
+    // ===== render-only <visual> parsing =====
+
+    fn visuals_on<'a>(m: &'a Model, link: &str) -> Vec<&'a VisualGeom> {
+        let f = m.frame_id(link).unwrap();
+        m.visuals.iter().filter(|v| v.frame == f).collect()
+    }
+
+    #[test]
+    fn parses_visual_primitives_with_colors() {
+        let m = load("visual_arm.urdf");
+        assert_eq!(m.ndof, 2, "visuals must not change kinematics");
+        assert_eq!(m.visuals.len(), 6, "box + cylinder + sphere + 3 meshes");
+
+        // base: box, inline material rgba, origin z=0.05
+        let base = visuals_on(&m, "base");
+        assert_eq!(base.len(), 1);
+        match &base[0].shape {
+            VisualShape::Box { half } => {
+                assert!((half.x - 0.1).abs() < 1e-12); // size 0.2 → half 0.1
+                assert!((half.z - 0.05).abs() < 1e-12); // size 0.1 → half 0.05
+            }
+            other => panic!("expected box, got {other:?}"),
+        }
+        assert!((base[0].origin.translation()[2] - 0.05).abs() < 1e-12);
+        assert_eq!(base[0].color, Some([0.9, 0.1, 0.1, 1.0]), "inline rgba");
+
+        // l1: cylinder with NAMED top-level material, plus a bare sphere
+        let l1 = visuals_on(&m, "l1");
+        assert_eq!(l1.len(), 2);
+        match &l1[0].shape {
+            VisualShape::Cylinder { radius, length } => {
+                assert!((radius - 0.04).abs() < 1e-12 && (length - 0.3).abs() < 1e-12);
+            }
+            other => panic!("expected cylinder, got {other:?}"),
+        }
+        assert_eq!(
+            l1[0].color,
+            Some([0.2, 0.4, 0.8, 1.0]),
+            "named material `steel` resolved against Robot.materials"
+        );
+        match &l1[1].shape {
+            VisualShape::Sphere { radius } => assert!((radius - 0.05).abs() < 1e-12),
+            other => panic!("expected sphere, got {other:?}"),
+        }
+        assert!((l1[1].origin.translation()[2] - 0.3).abs() < 1e-12);
+        assert_eq!(l1[1].color, None, "no material → no color");
+    }
+
+    #[test]
+    fn visual_mesh_paths_resolve() {
+        let m = load("visual_arm.urdf");
+        let l2 = visuals_on(&m, "l2");
+        assert_eq!(l2.len(), 3, "all three meshes KEPT, resolvable or not");
+
+        // relative path → absolute existing file, with scale
+        match &l2[0].shape {
+            VisualShape::Mesh { path, raw, scale } => {
+                let p = path.as_ref().expect("relative mesh must resolve");
+                assert!(p.is_absolute() && p.is_file(), "resolved: {p:?}");
+                assert!(p.ends_with("visual_hand.stl"));
+                assert_eq!(raw, "visual_hand.stl");
+                assert_eq!(*scale, [2.0, 2.0, 2.0]);
+            }
+            other => panic!("expected mesh, got {other:?}"),
+        }
+        // package://demo_pkg/... → resolved via the urdf-dir ancestor search
+        match &l2[1].shape {
+            VisualShape::Mesh { path, raw, scale } => {
+                let p = path.as_ref().expect("package mesh must resolve");
+                assert!(p.is_absolute() && p.is_file(), "resolved: {p:?}");
+                assert!(p.ends_with("demo_pkg/meshes/part.stl"), "got {p:?}");
+                assert_eq!(raw, "package://demo_pkg/meshes/part.stl");
+                assert_eq!(*scale, [1.0; 3], "default scale");
+            }
+            other => panic!("expected mesh, got {other:?}"),
+        }
+        // unresolvable → KEPT with path None; compile already succeeded above
+        match &l2[2].shape {
+            VisualShape::Mesh { path, raw, .. } => {
+                assert!(path.is_none(), "ghost mesh must not resolve");
+                assert_eq!(raw, "ghost_missing.stl");
+            }
+            other => panic!("expected mesh, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn package_path_env_resolution() {
+        // With NO urdf dir, package:// can only resolve through CALIPER_PACKAGE_PATH.
+        let raw = "package://demo_pkg/meshes/part.stl";
+        // SAFETY: see below — this test is the only writer of this variable.
+        unsafe { std::env::remove_var("CALIPER_PACKAGE_PATH") }; // hermetic start
+        assert_eq!(resolve_mesh_path(raw, None), None, "no dir, no env → None");
+        let fixtures = format!("{}/../../oracle/fixtures", env!("CARGO_MANIFEST_DIR"));
+        // SAFETY: single-threaded mutation scoped to this test; the var is only
+        // a FALLBACK for other tests (their meshes resolve earlier or are
+        // non-package paths), so a concurrent read cannot change their result.
+        unsafe { std::env::set_var("CALIPER_PACKAGE_PATH", &fixtures) };
+        let p = resolve_mesh_path(raw, None);
+        unsafe { std::env::remove_var("CALIPER_PACKAGE_PATH") };
+        let p = p.expect("env root must resolve R/<pkg>/<rest>");
+        assert!(p.is_absolute() && p.is_file(), "resolved: {p:?}");
+        assert!(p.ends_with("demo_pkg/meshes/part.stl"));
+    }
+
+    #[test]
+    fn existing_fixtures_visuals_and_kinematics_unchanged() {
+        // fixtures without <visual> stay empty; kinematics untouched
+        for name in ["toy.urdf", "collide_arm.urdf", "collide_shapes.urdf"] {
+            assert!(load(name).visuals.is_empty(), "{name} has no <visual>");
+        }
+        let toy = load("toy.urdf");
+        assert_eq!(toy.ndof, 2);
+        assert_eq!(toy.joint_names, vec!["j1", "j2"]);
+        // showcase6 carries 7 render-only visuals; ndof/joints unchanged
+        let m = load("showcase6.urdf");
+        assert_eq!(m.ndof, 6);
+        assert_eq!(m.visuals.len(), 7);
+        assert!(m.visuals.iter().all(|v| v.color.is_none()));
+        assert!(m.visuals.iter().all(|v| v.frame < m.frames.len()));
     }
 }

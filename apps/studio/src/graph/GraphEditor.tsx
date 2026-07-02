@@ -1,11 +1,48 @@
 import { useEffect, useState } from "react";
 import { ReactFlow, Background, BackgroundVariant, Controls, MiniMap } from "@xyflow/react";
+import type { ReactFlowInstance } from "@xyflow/react";
+import { open, save } from "@tauri-apps/plugin-dialog";
 import "@xyflow/react/dist/style.css";
 import "./graph.css";
 import { useStore } from "../store";
 import { nodeTypes } from "./nodes";
 import { KIND_ORDER, NODE_SPECS } from "./spec";
 import type { KindName, NodeCategory } from "./spec";
+import type { CNode, CEdge } from "./types";
+
+// The live ReactFlow instance (captured by onInit) — module-scope so the ⌘K
+// palette can drive fitView without a React context, mirroring how Toolbar
+// exposes openUrdf. Cleared when the editor unmounts.
+let flow: ReactFlowInstance<CNode, CEdge> | null = null;
+
+/** Re-frame the canvas around the whole graph (Fit button + palette command). */
+export function fitGraphView(): void {
+  void flow?.fitView({ padding: 0.15, duration: 220 });
+}
+
+/** Native save dialog → write the CURRENT canvas as a .caliper-graph.json. */
+export async function exportGraphToFile(): Promise<void> {
+  const st = useStore.getState();
+  if (!st.robot) return;
+  const stem = st.graphName.trim() || "graph";
+  const path = await save({
+    defaultPath: `${stem}.caliper-graph.json`,
+    filters: [{ name: "Caliper graph", extensions: ["json"] }],
+  });
+  if (typeof path !== "string") return; // dialog cancelled
+  await st.exportGraph(path);
+}
+
+/** Native open dialog → parse + adopt a .caliper-graph.json from disk. */
+export async function importGraphFromFile(): Promise<void> {
+  const picked = await open({
+    multiple: false,
+    directory: false,
+    filters: [{ name: "Caliper graph", extensions: ["json"] }],
+  });
+  if (typeof picked !== "string") return; // dialog cancelled
+  await useStore.getState().importGraph(picked);
+}
 
 const CATEGORY_LABEL: Record<NodeCategory, string> = {
   source: "Sources",
@@ -55,11 +92,36 @@ export function GraphEditor() {
   const refreshGraphList = useStore((s) => s.refreshGraphList);
   const saved = useStore((s) => s.graphSaved);
   const robot = useStore((s) => s.robot);
+  const deleteSelection = useStore((s) => s.deleteGraphSelection);
+  const hasSelection =
+    nodes.some((n) => n.selected) || edges.some((e) => e.selected);
   const [loadSel, setLoadSel] = useState("");
 
   useEffect(() => {
     void refreshGraphList();
   }, [refreshGraphList]);
+
+  // ⌘D duplicate — scoped to Graph mode by MOUNT (this editor only exists while
+  // mode === "graph"), NOT via the global App keymap, so it can never fire in
+  // Jog/Motion/Simulate. Typing in a param/name input is guarded explicitly here;
+  // the Backspace/Delete path relies on xyflow's own isInputDOMNode guard
+  // (useKeyPress ignores key events from input/textarea/select/contenteditable).
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      if (!(e.metaKey || e.ctrlKey) || (e.key !== "d" && e.key !== "D")) return;
+      const t = e.target instanceof HTMLElement ? e.target : null;
+      if (t?.closest("input, textarea, select, [contenteditable]")) return;
+      e.preventDefault(); // the browser's bookmark chord
+      useStore.getState().duplicateGraphSelection();
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+
+  // drop the module-scope instance when the editor unmounts (mode switch)
+  useEffect(() => () => {
+    flow = null;
+  }, []);
 
   return (
     <div className="graph-editor">
@@ -109,6 +171,32 @@ export function GraphEditor() {
         <button title="refresh saved list" onClick={() => void refreshGraphList()}>
           ⟳
         </button>
+        <span className="g-sep" />
+        <button
+          disabled={!robot}
+          title="Export the canvas to a .caliper-graph.json file"
+          onClick={() => void exportGraphToFile()}
+        >
+          Export…
+        </button>
+        <button
+          title="Import a .caliper-graph.json file"
+          onClick={() => void importGraphFromFile()}
+        >
+          Import…
+        </button>
+        <span className="g-sep" />
+        <button title="Fit the view to the graph" onClick={fitGraphView}>
+          Fit
+        </button>
+        <button
+          className="g-danger"
+          disabled={!hasSelection}
+          title="Delete selected nodes/edges (⌫ / ⌦)"
+          onClick={deleteSelection}
+        >
+          ✕ Delete
+        </button>
       </div>
       {banner && <div className="g-banner">{banner}</div>}
       <div className="g-canvas">
@@ -119,8 +207,12 @@ export function GraphEditor() {
           onNodesChange={onNodesChange}
           onEdgesChange={onEdgesChange}
           onConnect={onConnect}
+          onInit={(inst) => {
+            flow = inst;
+          }}
           nodeTypes={nodeTypes}
           colorMode="dark"
+          deleteKeyCode={["Backspace", "Delete"]}
           fitView
           minZoom={0.2}
           maxZoom={2.5}

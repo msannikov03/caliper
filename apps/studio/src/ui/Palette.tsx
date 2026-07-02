@@ -11,6 +11,7 @@ import { useStore } from "../store";
 import { buildCommands, filterCommands } from "../commands";
 import type { Command } from "../commands";
 import { openUrdf, selectRobot } from "./Toolbar";
+import { exportGraphToFile, fitGraphView, importGraphFromFile } from "../graph/GraphEditor";
 import "./palette.css";
 
 export function Palette({ onClose }: { onClose: () => void }) {
@@ -50,6 +51,10 @@ export function Palette({ onClose }: { onClose: () => void }) {
         checkCollision: () => void useStore.getState().checkCollision(null),
         runGraph: () => void useStore.getState().runGraph(),
         validateGraph: () => void useStore.getState().validateGraph(),
+        duplicateSelection: () => useStore.getState().duplicateGraphSelection(),
+        fitGraphView,
+        exportGraph: () => void exportGraphToFile(),
+        importGraph: () => void importGraphFromFile(),
       },
     });
     return filterCommands(query, all);

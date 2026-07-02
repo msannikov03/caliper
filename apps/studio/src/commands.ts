@@ -53,6 +53,10 @@ export interface CommandCtx {
     checkCollision: () => void; // checkCollision(null)
     runGraph: () => void;
     validateGraph: () => void;
+    duplicateSelection: () => void; // duplicateGraphSelection (⌘D in the editor)
+    fitGraphView: () => void; // xyflow fitView via the editor's instance
+    exportGraph: () => void; // native save dialog → save_graph_file
+    importGraph: () => void; // native open dialog → load_graph_file
   };
 }
 
@@ -205,6 +209,38 @@ export function buildCommands(ctx: CommandCtx): Command[] {
     section: "Graph",
     enabled: graphGate === null,
     run: actions.validateGraph,
+  });
+  cmds.push({
+    id: "graph.duplicate",
+    title: "Duplicate selected node",
+    hint: graphGate ?? "⌘D",
+    section: "Graph",
+    enabled: graphGate === null,
+    run: actions.duplicateSelection,
+  });
+  cmds.push({
+    id: "graph.fit",
+    title: "Fit graph view",
+    hint: graphGate ?? undefined,
+    section: "Graph",
+    enabled: graphGate === null,
+    run: actions.fitGraphView,
+  });
+  cmds.push({
+    id: "graph.export",
+    title: "Export graph…",
+    hint: graphGate ?? undefined,
+    section: "Graph",
+    enabled: graphGate === null,
+    run: actions.exportGraph,
+  });
+  cmds.push({
+    id: "graph.import",
+    title: "Import graph…",
+    hint: graphGate ?? undefined,
+    section: "Graph",
+    enabled: graphGate === null,
+    run: actions.importGraph,
   });
 
   return cmds;

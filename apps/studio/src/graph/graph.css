@@ -93,6 +93,13 @@
 .graph-editor .g-toolbar button.g-validate:hover:not(:disabled) {
   border-color: rgba(61, 214, 140, 0.4);
 }
+/* Delete selected — quiet danger cast (keyboard ⌫/⌦ is the primary path) */
+.graph-editor .g-toolbar button.g-danger {
+  color: var(--singular);
+}
+.graph-editor .g-toolbar button.g-danger:hover:not(:disabled) {
+  border-color: rgba(255, 92, 108, 0.4);
+}
 
 .graph-editor .g-sep {
   width: 1px;

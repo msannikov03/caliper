@@ -12,6 +12,9 @@
 //  - handleGraphError: validation branch, node branch, plain-string fallback
 //  - _execGraph (_graphRunId latest-wins): stale run result skipped
 //  - runGraph success: stale traj cleared when result has no trajectory
+//  - duplicateGraphSelection: fresh ids, +24/+24, deep params, edges untouched
+//  - deleteGraphSelection: node removal takes its edges; edge-only removal
+//  - exportGraph / importGraph: save_graph_file/load_graph_file seam + banner
 
 // vi.mock calls are hoisted before imports by Vitest.
 import { vi, describe, it, expect, beforeEach } from "vitest";
@@ -39,6 +42,7 @@ import {
   _resetNodeSeq,
 } from "./store";
 import type { RobotInfo, TrajectoryDto, StudioState } from "./store";
+import { serializeGraph } from "./graph/serialize";
 import { defaultParams } from "./graph/spec";
 import type { KindName } from "./graph/spec";
 import type { CNode, CEdge, Diagnostics, GraphRunResult } from "./graph/types";
@@ -490,6 +494,155 @@ describe("bumpNodeSeq — no duplicate IDs after loadGraph", () => {
       const seq = parseInt(suffix, 36);
       expect(seq).toBeGreaterThan(15); // must be past 'f' (15)
     }
+  });
+});
+
+// ---- duplicate selection (⌘D) ----
+
+describe("duplicateGraphSelection — clone semantics", () => {
+  it("clones only the selected node: new id, +24/+24 offset, deep params, edges untouched", () => {
+    const a = { ...makeNode("planRrt", "planRrt_0"), selected: true };
+    a.data.params = { ...a.data.params, boxes: [[[0, 0, 0], [0.1, 0.1, 0.1]]] };
+    const b = makeNode("moveJ", "moveJ_1");
+    const e: CEdge = { id: "e0", source: "planRrt_0", target: "moveJ_1" };
+    useStore.setState({ graphNodes: [a, b], graphEdges: [e] });
+
+    useStore.getState().duplicateGraphSelection();
+
+    const s = useStore.getState();
+    expect(s.graphNodes).toHaveLength(3);
+    const clone = s.graphNodes[2];
+    expect(clone.id).not.toBe("planRrt_0");
+    expect(clone.data.kind).toBe("planRrt");
+    expect(clone.position).toEqual({ x: 24, y: 24 }); // +24/+24 from (0,0)
+    expect(clone.data.params).toEqual(a.data.params);
+    // params are DEEP-copied: mutating the clone's boxes leaves the original alone
+    (clone.data.params.boxes as number[][][])[0][0][0] = 99;
+    expect((a.data.params.boxes as number[][][])[0][0][0]).toBe(0);
+    // edges are NOT cloned
+    expect(s.graphEdges).toHaveLength(1);
+    // the selection moves to the clone (chained ⌘D duplicates the copies)
+    expect(s.graphNodes[0].selected).toBe(false);
+    expect(clone.selected).toBe(true);
+  });
+
+  it("mints ids past loaded suffixes — never collides with existing ids", () => {
+    const n = { ...makeNode("startConfig", "startConfig_5"), selected: true };
+    bumpNodeSeq([n]); // the loadGraph re-seed path
+    useStore.setState({ graphNodes: [n], graphEdges: [] });
+    useStore.getState().duplicateGraphSelection();
+    useStore.getState().duplicateGraphSelection(); // chained ⌘D → clone-of-clone
+    const ids = useStore.getState().graphNodes.map((x) => x.id);
+    expect(new Set(ids).size).toBe(3); // all unique
+    for (const id of ids.filter((i) => i !== "startConfig_5")) {
+      expect(parseInt(id.slice(id.lastIndexOf("_") + 1), 36)).toBeGreaterThan(5);
+    }
+  });
+
+  it("is a no-op when nothing is selected", () => {
+    useStore.setState({ graphNodes: [makeNode("moveJ", "moveJ_0")], graphEdges: [] });
+    useStore.getState().duplicateGraphSelection();
+    expect(useStore.getState().graphNodes).toHaveLength(1);
+  });
+});
+
+// ---- delete selection (⌫/⌦ toolbar path) ----
+
+describe("deleteGraphSelection — selection removal", () => {
+  it("deleting a selected node drops the edges riding on it", () => {
+    const a = { ...makeNode("startConfig", "s0"), selected: true };
+    const b = makeNode("moveJ", "m0");
+    const c = makeNode("view", "v0");
+    const edges: CEdge[] = [
+      { id: "e0", source: "s0", target: "m0" },
+      { id: "e1", source: "m0", target: "v0" },
+    ];
+    useStore.setState({ graphNodes: [a, b, c], graphEdges: edges });
+    useStore.getState().deleteGraphSelection();
+    const s = useStore.getState();
+    expect(s.graphNodes.map((n) => n.id)).toEqual(["m0", "v0"]);
+    expect(s.graphEdges.map((e) => e.id)).toEqual(["e1"]); // e0 rode on s0
+  });
+
+  it("deletes a selected edge alone, leaving both endpoint nodes intact", () => {
+    const a = makeNode("startConfig", "s0");
+    const b = makeNode("moveJ", "m0");
+    useStore.setState({
+      graphNodes: [a, b],
+      graphEdges: [{ id: "e0", source: "s0", target: "m0", selected: true }],
+    });
+    useStore.getState().deleteGraphSelection();
+    expect(useStore.getState().graphNodes).toHaveLength(2);
+    expect(useStore.getState().graphEdges).toHaveLength(0);
+  });
+
+  it("is a no-op with no selection", () => {
+    const nodes = [makeNode("moveJ", "m0")];
+    useStore.setState({ graphNodes: nodes, graphEdges: [] });
+    useStore.getState().deleteGraphSelection();
+    expect(useStore.getState().graphNodes).toBe(nodes); // untouched reference
+  });
+});
+
+// ---- file export / import (save_graph_file / load_graph_file seam) ----
+
+describe("exportGraph / importGraph — graph file round-trip seam", () => {
+  it("exportGraph writes the CURRENT canvas via save_graph_file", async () => {
+    const node = makeNode("moveJ", "mj0");
+    useStore.setState({
+      robot: MOCK_ROBOT,
+      graphNodes: [node],
+      graphEdges: [],
+      graphName: "wave",
+    });
+    mockInvoke.mockResolvedValueOnce(undefined);
+    await useStore.getState().exportGraph("/tmp/wave.caliper-graph.json");
+    expect(mockInvoke).toHaveBeenCalledWith("save_graph_file", {
+      path: "/tmp/wave.caliper-graph.json",
+      graphJson: serializeGraph([node], [], "wave", "panda"),
+    });
+    expect(useStore.getState().graphBanner).toBeNull();
+  });
+
+  it("surfaces a backend write/validation error in the banner", async () => {
+    useStore.setState({ robot: MOCK_ROBOT });
+    mockInvoke.mockRejectedValueOnce("invalid graph JSON: boom");
+    await useStore.getState().exportGraph("/tmp/x.json");
+    expect(useStore.getState().graphBanner).toContain("invalid graph JSON");
+  });
+
+  it("importGraph adopts the parsed doc and re-seeds node ids", async () => {
+    mockInvoke.mockResolvedValueOnce(
+      JSON.stringify({
+        nodes: [{ id: "startConfig_7", kind: { type: "startConfig", q: [0, 0] } }],
+        edges: [],
+        metadata: { name: "imported" },
+      }),
+    );
+    useStore.setState({ robot: MOCK_ROBOT });
+    await useStore.getState().importGraph("/tmp/imported.caliper-graph.json");
+    const s = useStore.getState();
+    expect(s.graphNodes.map((n) => n.id)).toEqual(["startConfig_7"]);
+    expect(s.graphName).toBe("imported");
+    useStore.getState().addGraphNode("startConfig"); // must not collide with _7
+    const ids = useStore.getState().graphNodes.map((n) => n.id);
+    expect(new Set(ids).size).toBe(2);
+  });
+
+  it("falls back to the file stem when the doc carries no name", async () => {
+    mockInvoke.mockResolvedValueOnce(JSON.stringify({ nodes: [], edges: [] }));
+    useStore.setState({ robot: MOCK_ROBOT });
+    await useStore.getState().importGraph("/data/waves/demo.caliper-graph.json");
+    expect(useStore.getState().graphName).toBe("demo");
+  });
+
+  it("a malformed doc lands in the banner and leaves the canvas untouched", async () => {
+    const before = [makeNode("moveJ", "m0")];
+    mockInvoke.mockResolvedValueOnce("{not json"); // backend let garbage through
+    useStore.setState({ robot: MOCK_ROBOT, graphNodes: before });
+    await useStore.getState().importGraph("/tmp/bad.json");
+    expect(useStore.getState().graphBanner).not.toBeNull();
+    expect(useStore.getState().graphNodes).toBe(before);
   });
 });
 

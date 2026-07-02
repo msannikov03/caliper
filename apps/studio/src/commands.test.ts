@@ -34,6 +34,10 @@ function mkCtx(over: Partial<CommandCtx> = {}): CommandCtx {
       checkCollision: noop,
       runGraph: noop,
       validateGraph: noop,
+      duplicateSelection: noop,
+      fitGraphView: noop,
+      exportGraph: noop,
+      importGraph: noop,
     },
     ...over,
   };
@@ -106,6 +110,35 @@ describe("buildCommands", () => {
     const graph = buildCommands(mkCtx({ mode: "graph" }));
     expect(byId(graph, "graph.run").enabled).toBe(true);
     expect(byId(graph, "graph.validate").enabled).toBe(true);
+  });
+
+  it("gates the graph editor commands (duplicate/fit/export/import) on graph mode", () => {
+    const ids = ["graph.duplicate", "graph.fit", "graph.export", "graph.import"];
+    const jog = buildCommands(mkCtx()); // jog mode → all four gated
+    for (const id of ids) {
+      expect(byId(jog, id).enabled).toBe(false);
+      expect(byId(jog, id).hint).toBe("switch to Graph mode");
+    }
+    const graph = buildCommands(mkCtx({ mode: "graph" }));
+    for (const id of ids) expect(byId(graph, id).enabled).toBe(true);
+    expect(byId(graph, "graph.duplicate").hint).toBe("⌘D"); // shortcut surfaces
+    const bare = buildCommands(mkCtx({ mode: "graph", robotLoaded: false }));
+    for (const id of ids) expect(byId(bare, id).hint).toBe("no robot loaded");
+  });
+
+  it("dispatches the graph editor actions when run", () => {
+    const calls: string[] = [];
+    const ctx = mkCtx({ mode: "graph" });
+    ctx.actions.duplicateSelection = () => calls.push("dup");
+    ctx.actions.fitGraphView = () => calls.push("fit");
+    ctx.actions.exportGraph = () => calls.push("export");
+    ctx.actions.importGraph = () => calls.push("import");
+    const cmds = buildCommands(ctx);
+    byId(cmds, "graph.duplicate").run();
+    byId(cmds, "graph.fit").run();
+    byId(cmds, "graph.export").run();
+    byId(cmds, "graph.import").run();
+    expect(calls).toEqual(["dup", "fit", "export", "import"]);
   });
 
   it("hints ⌘1…⌘4 in ModeTabs order on enabled mode switches", () => {

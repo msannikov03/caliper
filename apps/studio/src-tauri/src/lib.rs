@@ -1963,6 +1963,30 @@ fn delete_graph(app: tauri::AppHandle, name: String) -> Result<(), String> {
     Ok(())
 }
 
+// ----- graph file export/import (paths come from the native save/open dialog) -----
+
+/// Write a GraphDoc JSON to an explicit path picked in the native save dialog.
+/// Same parse guard as `save_graph`, so an exported file always round-trips
+/// through `load_graph_file`/`parseGraph`. This is NOT a generic write surface:
+/// the only caller is the Export… flow and the payload must be a GraphDoc.
+#[tauri::command]
+fn save_graph_file(path: String, graph_json: String) -> Result<(), String> {
+    let _doc: caliper::graph::GraphDoc =
+        serde_json::from_str(&graph_json).map_err(|e| format!("invalid graph JSON: {e}"))?;
+    std::fs::write(&path, graph_json).map_err(|e| format!("could not write `{path}`: {e}"))
+}
+
+/// Read a graph file picked in the native open dialog, validating that it
+/// parses as a GraphDoc BEFORE handing it to the frontend.
+#[tauri::command]
+fn load_graph_file(path: String) -> Result<String, String> {
+    let json =
+        std::fs::read_to_string(&path).map_err(|e| format!("could not read `{path}`: {e}"))?;
+    let _doc: caliper::graph::GraphDoc =
+        serde_json::from_str(&json).map_err(|e| format!("not a caliper graph file: {e}"))?;
+    Ok(json)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Panic hook FIRST — before the Builder ever runs — so even a panic during
@@ -2047,7 +2071,9 @@ pub fn run() {
             save_graph,
             load_graph,
             list_graphs,
-            delete_graph
+            delete_graph,
+            save_graph_file,
+            load_graph_file
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -2437,6 +2463,31 @@ mod tests {
         // a `..` detour to an allowed file still resolves and passes (canonicalized)…
         let dodge = fixture("../robots/visual_hand.stl");
         assert!(allowed_mesh_path(&allow, dodge.to_str().unwrap()).is_ok());
+    }
+
+    /// The file export/import commands enforce the GraphDoc contract on BOTH
+    /// sides of the disk: garbage never lands in a file, a corrupted file never
+    /// reaches the frontend, and a valid doc round-trips bytewise.
+    #[test]
+    fn graph_file_commands_validate_graphdoc() {
+        let dir = std::env::temp_dir().join(format!("caliper-graph-file-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.caliper-graph.json");
+        let p = path.to_string_lossy().to_string();
+        // non-JSON and unknown-kind payloads are rejected before any write
+        let bad_kind = r#"{"nodes":[{"id":"x","kind":{"type":"warpDrive"}}],"edges":[]}"#;
+        assert!(save_graph_file(p.clone(), "{not json".into()).is_err());
+        assert!(save_graph_file(p.clone(), bad_kind.into()).is_err());
+        assert!(!path.exists(), "invalid payloads must never land on disk");
+        // a valid GraphDoc round-trips bytewise
+        let doc =
+            r#"{"nodes":[{"id":"s","kind":{"type":"startConfig","q":[0.0,0.0]}}],"edges":[]}"#;
+        save_graph_file(p.clone(), doc.into()).unwrap();
+        assert_eq!(load_graph_file(p.clone()).unwrap(), doc);
+        // a hand-corrupted file is rejected on read (never handed to the FE)
+        std::fs::write(&path, "{]").unwrap();
+        assert!(load_graph_file(p).is_err());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

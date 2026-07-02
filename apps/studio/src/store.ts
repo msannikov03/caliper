@@ -216,6 +216,10 @@ export interface StudioState {
   onGraphEdgesChange: (changes: EdgeChange<CEdge>[]) => void;
   onGraphConnect: (c: Connection) => void;
   addGraphNode: (kind: KindName) => void;
+  /** Clone the selected node(s): fresh ids, +24/+24 px, edges NOT copied (⌘D). */
+  duplicateGraphSelection: () => void;
+  /** Remove the selected nodes/edges; a removed node takes its edges with it. */
+  deleteGraphSelection: () => void;
   updateNodeParams: (id: string, patch: Record<string, unknown>) => void;
   setGraphName: (s: string) => void;
   runGraph: () => Promise<void>;
@@ -225,6 +229,10 @@ export interface StudioState {
   saveGraph: (name: string) => Promise<void>;
   loadGraph: (name: string) => Promise<void>;
   refreshGraphList: () => Promise<void>;
+  /** Export the CURRENT canvas to a dialog-picked .caliper-graph.json path. */
+  exportGraph: (path: string) => Promise<void>;
+  /** Import + adopt a dialog-picked graph file (parse errors → banner). */
+  importGraph: (path: string) => Promise<void>;
 }
 
 export const useStore = create<StudioState>((set, get) => ({
@@ -679,6 +687,32 @@ export const useStore = create<StudioState>((set, get) => ({
     };
     set({ graphNodes: [...get().graphNodes, node] });
   },
+  duplicateGraphSelection() {
+    const sel = get().graphNodes.filter((n) => n.selected);
+    if (sel.length === 0) return;
+    // re-seed past every id on the canvas first — same invariant loadGraph
+    // enforces — so a minted clone id can never collide with an existing node.
+    bumpNodeSeq(get().graphNodes);
+    const clones = duplicateNodes(sel, nextNodeId);
+    // originals deselect so the fresh clones become the selection (⌘D chains)
+    set({
+      graphNodes: [
+        ...get().graphNodes.map((n) => (n.selected ? { ...n, selected: false } : n)),
+        ...clones,
+      ],
+    });
+  },
+  deleteGraphSelection() {
+    const nodes = get().graphNodes;
+    const edges = get().graphEdges;
+    const dead = new Set(nodes.filter((n) => n.selected).map((n) => n.id));
+    const keptNodes = nodes.filter((n) => !n.selected);
+    const keptEdges = edges.filter(
+      (e) => !e.selected && !dead.has(e.source) && !dead.has(e.target),
+    );
+    if (keptNodes.length === nodes.length && keptEdges.length === edges.length) return;
+    set({ graphNodes: keptNodes, graphEdges: keptEdges });
+  },
   updateNodeParams(id, patch) {
     set({
       graphNodes: get().graphNodes.map((n) =>
@@ -773,26 +807,9 @@ export const useStore = create<StudioState>((set, get) => ({
     }
   },
   async loadGraph(name) {
-    const ndof = get().robot?.ndof ?? 0;
     try {
       const graphJson = await invoke<string>("load_graph", { name });
-      const parsed = parseGraph(graphJson, ndof);
-      // re-color edges by their source out-port type (parseGraph leaves them bare)
-      const colored = parsed.edges.map((e) => {
-        const src = parsed.nodes.find((n) => n.id === e.source);
-        const t = src && e.sourceHandle ? outPortType(src.data.kind, e.sourceHandle) : undefined;
-        const color = t ? PORT_COLORS[t] : "#6c6c7a";
-        return { ...e, data: { color }, style: { stroke: color } };
-      });
-      bumpNodeSeq(parsed.nodes);
-      set({
-        graphNodes: parsed.nodes,
-        graphEdges: colored,
-        graphName: parsed.name || name,
-        graphScopes: [],
-        graphLive: false,
-        graphBanner: null,
-      });
+      adoptGraphJson(graphJson, name, get, set);
     } catch (e) {
       set({ graphBanner: String(e) });
     }
@@ -803,6 +820,27 @@ export const useStore = create<StudioState>((set, get) => ({
       set({ graphSaved: list });
     } catch {
       // the backend command may be absent in some builds; leave the list as-is.
+    }
+  },
+  async exportGraph(path) {
+    const robot = get().robot;
+    if (!robot) return;
+    const graphJson = serializeGraph(get().graphNodes, get().graphEdges, get().graphName, robot.name);
+    try {
+      await invoke("save_graph_file", { path, graphJson });
+      set({ graphBanner: null });
+    } catch (e) {
+      set({ graphBanner: String(e) });
+    }
+  },
+  async importGraph(path) {
+    try {
+      const graphJson = await invoke<string>("load_graph_file", { path });
+      // no name in the doc → fall back to the file stem (sans graph extension)
+      const stem = (path.split(/[\\/]/).pop() ?? "").replace(/(\.caliper-graph)?\.json$/i, "");
+      adoptGraphJson(graphJson, stem, get, set);
+    } catch (e) {
+      set({ graphBanner: String(e) });
     }
   },
 }));
@@ -836,6 +874,54 @@ function canReach(startId: string, goalId: string, edges: CEdge[]): boolean {
 let nodeSeq = 0;
 function nextNodeId(kind: KindName): string {
   return `${kind}_${(nodeSeq++).toString(36)}`;
+}
+
+/// Clone nodes for Duplicate (⌘D): same kind, deep-copied params, freshly-minted
+/// ids via `mint` (the store passes nextNodeId so the bumpNodeSeq uniqueness
+/// invariant holds), +24/+24 px offset, marked selected so a chained ⌘D keeps
+/// duplicating the copies. Edges are deliberately NOT cloned.
+/// Pure; exported for unit testing.
+export function duplicateNodes(sel: CNode[], mint: (kind: KindName) => string): CNode[] {
+  return sel.map((n) => ({
+    id: mint(n.data.kind),
+    type: n.type,
+    position: { x: n.position.x + 24, y: n.position.y + 24 },
+    selected: true,
+    data: {
+      kind: n.data.kind,
+      params: structuredClone(n.data.params),
+      status: "idle" as NodeStatus,
+    },
+  }));
+}
+
+/// Adopt a loaded/imported GraphDoc JSON into the editor: parse (throws on a
+/// malformed doc — callers catch into the banner), re-color edges by their
+/// source out-port type (parseGraph leaves them bare), and re-seed the node-id
+/// counter past the loaded ids. Shared by loadGraph (app-data) + importGraph (file).
+function adoptGraphJson(
+  graphJson: string,
+  fallbackName: string,
+  get: () => StudioState,
+  set: (p: Partial<StudioState>) => void,
+): void {
+  const ndof = get().robot?.ndof ?? 0;
+  const parsed = parseGraph(graphJson, ndof);
+  const colored = parsed.edges.map((e) => {
+    const src = parsed.nodes.find((n) => n.id === e.source);
+    const t = src && e.sourceHandle ? outPortType(src.data.kind, e.sourceHandle) : undefined;
+    const color = t ? PORT_COLORS[t] : "#6c6c7a";
+    return { ...e, data: { color }, style: { stroke: color } };
+  });
+  bumpNodeSeq(parsed.nodes);
+  set({
+    graphNodes: parsed.nodes,
+    graphEdges: colored,
+    graphName: parsed.name || fallbackName,
+    graphScopes: [],
+    graphLive: false,
+    graphBanner: null,
+  });
 }
 /// After a load, advance the id counter past the loaded set to avoid collisions.
 /// Ids are `${kind}_${seq.toString(36)}`; decode the base-36 suffix so we set

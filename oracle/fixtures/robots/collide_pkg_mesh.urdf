@@ -1,0 +1,27 @@
+<?xml version="1.0"?>
+<!-- package:// collision-mesh fixture: l1's collider references
+     package://demo_pkg/meshes/part.stl, which the SHARED resolver finds via the
+     urdf-dir ancestor search (../demo_pkg/... from robots/) — so l1 is COVERED
+     (NOT in dropped_collider_frames). l2's collider references a package that
+     exists nowhere → still DROPPED loudly (safe-by-omission). -->
+<robot name="collide_pkg_mesh">
+  <link name="base"/>
+  <link name="l1">
+    <collision><origin xyz="0 0 0"/>
+      <geometry><mesh filename="package://demo_pkg/meshes/part.stl"/></geometry></collision>
+  </link>
+  <link name="l2">
+    <collision><origin xyz="0 0 0"/>
+      <geometry><mesh filename="package://ghost_pkg/meshes/nope.stl"/></geometry></collision>
+  </link>
+  <joint name="j1" type="revolute">
+    <parent link="base"/><child link="l1"/>
+    <origin xyz="0 0 0.1"/><axis xyz="0 0 1"/>
+    <limit lower="-3.0" upper="3.0" effort="10" velocity="2"/>
+  </joint>
+  <joint name="j2" type="revolute">
+    <parent link="l1"/><child link="l2"/>
+    <origin xyz="0 0 0.2"/><axis xyz="0 1 0"/>
+    <limit lower="-3.0" upper="3.0" effort="10" velocity="2"/>
+  </joint>
+</robot>

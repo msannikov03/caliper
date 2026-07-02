@@ -195,8 +195,10 @@ pub struct Model {
     pub has_inertia: bool,
     /// Parsed `<collision>` geometry — box/sphere/cylinder/capsule primitives plus
     /// mesh colliders loaded as a [`CollisionShape::ConvexHull`] — each attached to
-    /// a link frame. ⚠ A `<mesh>` that could not be loaded
-    /// (missing/`package://`/non-STL file, unparsable, degenerate) is still
+    /// a link frame. Mesh filenames resolve through [`resolve_mesh_path`]
+    /// (relative/absolute/`file://`/`package://`), same as visuals. ⚠ A `<mesh>`
+    /// that could not be loaded (unresolvable, non-STL, unparsable, degenerate)
+    /// is still
     /// SKIPPED: that link carries NO collider for the dropped part and is NOT
     /// collision-checked there. Callers should surface the uncovered count
     /// (`caliper_collision::CollisionModel::uncovered_frames`). Empty when absent.
@@ -482,8 +484,8 @@ fn parse_inertial(inr: &urdf_rs::Inertial) -> Option<SpatialInertia> {
 /// Parse a link's `<collision>` primitives into `(link-local origin, shape)`.
 /// Box/sphere/cylinder/capsule are exact; a `<mesh>` is loaded (STL), scaled, and
 /// reduced to a [`CollisionShape::ConvexHull`]. A mesh that cannot be loaded
-/// (missing file, unsupported/`package://` path, unparsable STL, degenerate hull)
-/// is SKIPPED (no collider; `dropped=true`) — the pre-existing, safe-by-omission
+/// (unresolvable path, non-STL, unparsable STL, degenerate hull) is SKIPPED
+/// (no collider; `dropped=true`) — the pre-existing, safe-by-omission
 /// behavior (see the `Model::collision` note).
 fn parse_collisions(
     link: &urdf_rs::Link,
@@ -590,7 +592,8 @@ fn resolve_visual_color(
 }
 
 /// Resolve a URDF `<mesh filename=...>` to an absolute on-disk path, or `None`.
-/// Reusable for both visual and (future) collision meshes. Search order:
+/// The ONE resolver shared by visual meshes ([`parse_visuals`]) and collision
+/// meshes ([`load_mesh_hull`]). Search order:
 /// - `file://` prefix is stripped first;
 /// - a plain relative path: `urdf_dir/<raw>` if it exists;
 /// - an absolute path: itself, if it exists;
@@ -639,25 +642,15 @@ fn absolutize(p: PathBuf) -> PathBuf {
 
 /// Resolve a `<mesh>` filename, load its STL, apply the URDF per-axis `scale`,
 /// and reduce to a convex hull of vertices. `None` on any failure (the caller
-/// then keeps the mesh dropped). Only plain/relative/`file://` paths are
-/// resolved; `package://` is unsupported here (no package map) → `None`.
+/// then keeps the mesh dropped). Resolution goes through [`resolve_mesh_path`]
+/// — the SAME resolver visuals use — so relative/absolute/`file://` AND
+/// `package://` (urdf-dir ancestor search + `CALIPER_PACKAGE_PATH`) all work.
 fn load_mesh_hull(
     filename: &str,
     scale: Option<&urdf_rs::Vec3>,
     base_dir: Option<&Path>,
 ) -> Option<Vec<Point3<f64>>> {
-    let name = filename.strip_prefix("file://").unwrap_or(filename);
-    if name.starts_with("package://") {
-        return None; // not resolvable without a package map
-    }
-    let path = {
-        let p = Path::new(name);
-        if p.is_absolute() {
-            p.to_path_buf()
-        } else {
-            base_dir?.join(p)
-        }
-    };
+    let path = resolve_mesh_path(filename, base_dir)?;
     // Only STL is supported by the pure-Rust loader.
     let is_stl = path
         .extension()
@@ -1142,6 +1135,50 @@ mod tests {
             m.dropped_collider_frames.len(),
             1,
             "the unloadable mesh frame is still tracked as dropped"
+        );
+    }
+
+    #[test]
+    fn package_collision_mesh_resolves_via_ancestor_search() {
+        // l1's collider is package://demo_pkg/meshes/part.stl — resolvable via
+        // the urdf-dir ancestor search (fixtures/demo_pkg/... sits one level
+        // above robots/). Before collision resolution was unified with
+        // `resolve_mesh_path`, package:// colliders were REJECTED outright and
+        // silently dropped; now the mesh must LOAD as a ConvexHull.
+        let m = load("collide_pkg_mesh.urdf");
+        assert_eq!(m.collision.len(), 1, "the package mesh became one collider");
+        match &m.collision[0].shape {
+            CollisionShape::ConvexHull { points } => {
+                // part.stl is a single triangle (coplanar → full cloud kept)
+                assert_eq!(points.len(), 3, "triangle hull = 3 vertices");
+                for p in points {
+                    assert!(p.z.abs() < 1e-12, "part.stl lies in the z=0 plane");
+                }
+            }
+            other => panic!("expected ConvexHull, got {other:?}"),
+        }
+        let l1 = m.frame_id("l1").unwrap();
+        assert_eq!(m.collision[0].frame, l1);
+        assert!(
+            !m.dropped_collider_frames.contains(&l1),
+            "a RESOLVED package:// collider must no longer be dropped"
+        );
+    }
+
+    #[test]
+    fn unresolvable_package_collision_mesh_stays_dropped() {
+        // l2's collider is package://ghost_pkg/... — no such package anywhere
+        // (ancestors or CALIPER_PACKAGE_PATH) → still DROPPED loudly.
+        let m = load("collide_pkg_mesh.urdf");
+        let l2 = m.frame_id("l2").unwrap();
+        assert_eq!(
+            m.dropped_collider_frames,
+            vec![l2],
+            "exactly the ghost-package frame is dropped"
+        );
+        assert!(
+            m.collision.iter().all(|g| g.frame != l2),
+            "no collider was invented for the unresolvable mesh"
         );
     }
 

@@ -775,6 +775,7 @@ dependencies = [
  "anyhow",
  "caliper",
  "caliper-collision",
+ "caliper-dataset",
  "clap",
  "nalgebra",
  "serde_json",
@@ -789,6 +790,17 @@ dependencies = [
  "caliper-model",
  "criterion",
  "nalgebra",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "caliper-dataset"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "parquet",
+ "serde",
+ "serde_json",
  "thiserror 2.0.18",
 ]
 
@@ -907,6 +919,7 @@ version = "0.1.0"
 dependencies = [
  "caliper",
  "caliper-collision",
+ "caliper-dataset",
  "nalgebra",
  "pyo3",
  "serde_json",

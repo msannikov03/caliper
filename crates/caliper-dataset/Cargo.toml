@@ -1,0 +1,21 @@
+[package]
+name = "caliper-dataset"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+description = "Native LeRobotDataset v3.0 writer/reader (bit-compatible with lerobot 0.4.4)"
+keywords = ["robotics", "dataset", "lerobot", "parquet", "imitation-learning"]
+categories = ["science::robotics"]
+
+[dependencies]
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# Same arrow/parquet versions and feature set as caliper-hal's `dataset` feature —
+# one arrow in the tree, snappy compression like lerobot's own writers.
+arrow = { version = "59", default-features = false }
+parquet = { version = "59", default-features = false, features = ["arrow", "snap"] }

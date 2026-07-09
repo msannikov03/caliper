@@ -179,7 +179,11 @@ impl Trajectory {
         let n = n.max(2);
         (0..n)
             .map(|k| {
-                let t = self.duration * k as f64 / (n - 1) as f64;
+                // duration * (k/(n-1)), NOT (duration*k)/(n-1): the fraction is
+                // exactly 1.0 at the last knot, so the grid lands on `duration`
+                // to the ulp (the other grouping can overshoot by 1 ulp, e.g.
+                // (0.4*24)/24 > 0.4, breaking back-to-back seam monotonicity).
+                let t = self.duration * (k as f64 / (n - 1) as f64);
                 (t, self.sample(t))
             })
             .collect()

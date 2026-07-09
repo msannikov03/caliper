@@ -3,11 +3,34 @@ requires = ["maturin>=1.9,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "caliper"
+# PyPI distribution name. Bare `caliper` is already taken on PyPI (checked
+# 2026-07-09), so the wheel ships as `caliper-robotics` — the import name
+# stays `caliper` (module-name below is what lands in site-packages).
+name = "caliper-robotics"
 version = "0.1.0"
 description = "A modern, open robotics engine — Python bindings"
+# Wheel METADATA long description; read at build time from the repo root.
+readme = "../../README.md"
+license = "Apache-2.0"
+authors = [{ name = "Mikhail Sannikov" }]
 requires-python = ">=3.10"
-classifiers = ["Programming Language :: Rust"]
+keywords = ["robotics", "kinematics", "dynamics", "ik", "motion-planning", "urdf"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Science/Research",
+  "Programming Language :: Rust",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Operating System :: MacOS",
+  "Operating System :: POSIX :: Linux",
+  "Topic :: Scientific/Engineering",
+  "Typing :: Typed",
+]
+
+[project.urls]
+Homepage = "https://github.com/msannikov03/caliper"
+Repository = "https://github.com/msannikov03/caliper"
+Issues = "https://github.com/msannikov03/caliper/issues"
 
 [tool.maturin]
 module-name = "caliper._caliper"

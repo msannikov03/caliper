@@ -2,6 +2,8 @@
 
 **A modern, open robotics engine — kinematics · IK · singularity · dynamics · motion · planning · collision · real-robot control · a Simulink-style dataflow studio. One Rust engine, three faces.**
 
+**Documentation: [msannikov03.github.io/caliper](https://msannikov03.github.io/caliper/)** — the full mdBook (concepts, faces, verification story), published from `docs/book/` on every push to main.
+
 Caliper is a single deterministic Rust engine for serial-arm robotics, exposed
 through three faces that share the exact same code:
 
@@ -121,10 +123,15 @@ branches = robot.analytic_ik(target)  # closed-form 6R IK (when canonical)
 The bindings ship **PEP 561 type stubs** (`.pyi`), so `import caliper` is fully
 typed in your editor.
 
-> ⚠️ The Python Cartesian-pose entry points are not yet unified: `Robot.ik` /
-> `Robot.move_l` take a **4×4 column-major** pose and a frame **name**, while
-> `Planner.plan_to_pose` takes a **flat 12-element row-major** pose and a frame
-> **index**. This is a documented wart; unifying it is future work.
+> The Python Cartesian-pose entry points share ONE convention: every
+> pose-accepting method (`Robot.ik` / `analytic_ik` / `move_l` / `move_c`,
+> `Planner.plan_to_pose`, `ReachChecker.status` / `reachable`,
+> `calibrate_joint_offsets`) takes a **4×4 column-major** pose — nested
+> (`pose[col][row]`) or its flat 16-element equivalent — and every frame
+> argument takes a frame **name** (a raw index still works where one was
+> accepted before). `Planner.plan_to_pose` additionally grandfathers the
+> legacy flat 12-element row-major form for back-compat. (`Robot.fk()`
+> returns **row-major** — transpose to feed it back into `ik()`.)
 
 ### Studio (desktop app)
 

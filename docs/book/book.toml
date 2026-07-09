@@ -6,6 +6,9 @@ language = "en"
 src = "src"
 
 [output.html]
+# Served from GitHub Pages at https://msannikov03.github.io/caliper/ — the
+# leading/trailing slashes matter (mdBook uses this for the 404 page's paths).
+site-url = "/caliper/"
 default-theme = "navy"
 preferred-dark-theme = "navy"
 git-repository-url = "https://github.com/msannikov03/caliper"
@@ -21,4 +24,5 @@ level = 1
 #   cargo install mdbook          # once
 #   mdbook serve docs/book        # live preview at http://localhost:3000
 #   mdbook build docs/book        # static site into docs/book/book/
-# There is deliberately no CI mdbook step — nothing here should fail a build.
+# CI builds it on every push/PR (docs job) and publishes it to GitHub Pages on
+# pushes to main (pages job): https://msannikov03.github.io/caliper/

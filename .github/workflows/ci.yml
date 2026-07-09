@@ -76,3 +76,33 @@ jobs:
       - run: |
           curl -sL https://github.com/rust-lang/mdBook/releases/download/v0.4.52/mdbook-v0.4.52-aarch64-apple-darwin.tar.gz | tar xz
           ./mdbook build docs/book
+
+  # Publish the built book to GitHub Pages (https://msannikov03.github.io/caliper/).
+  # Push-to-main only — PRs get the `docs` build check above, never a deploy.
+  # Rebuilds on ubuntu: actions/upload-pages-artifact needs GNU tar, which the
+  # macOS runners don't ship. Requires Pages enabled with Source = GitHub Actions.
+  pages:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: docs
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    concurrency:
+      group: github-pages
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          curl -sL https://github.com/rust-lang/mdBook/releases/download/v0.4.52/mdbook-v0.4.52-x86_64-unknown-linux-gnu.tar.gz | tar xz
+          ./mdbook build docs/book
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs/book/book
+      - id: deployment
+        uses: actions/deploy-pages@v4

@@ -1,0 +1,348 @@
+/* ============================================================
+   data.css — Data mode (dataset browser) styling.
+   Instrument vocabulary: compact, hairline borders, mono
+   readouts. The split layout (.viewport.data-mode) that docks
+   the persistent GL canvas lives in App.css next to graph-mode.
+   ============================================================ */
+
+.data-root {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  background: var(--base);
+  color: var(--text);
+  font-size: 12px;
+}
+
+/* ---- left: dataset panel ---- */
+.data-side {
+  flex: 0 0 340px;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  border-right: 1px solid var(--border);
+  background: linear-gradient(180deg, var(--surface), var(--base));
+}
+.data-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--hairline);
+}
+.data-actions .btn {
+  font-size: 11.5px;
+  padding: 4px 9px;
+}
+
+.data-banner {
+  flex: 0 0 auto;
+  padding: 6px 12px;
+  background: rgba(255, 92, 108, 0.12);
+  color: var(--singular);
+  border-bottom: 1px solid rgba(255, 92, 108, 0.28);
+  font-family: var(--mono);
+  font-size: 11px;
+  word-break: break-word;
+}
+
+.data-empty {
+  padding: 18px 16px;
+  color: var(--faint);
+  font-size: 11.5px;
+  line-height: 1.6;
+}
+
+/* info header: mono key/value metrics + the canonical path */
+.data-info {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 6px 10px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--hairline);
+}
+.di-metric {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+.di-key {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--faint);
+}
+.di-val {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.di-path {
+  grid-column: 1 / -1;
+  font-family: var(--mono);
+  font-size: 9.5px;
+  color: var(--faint);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  direction: rtl; /* keep the distinguishing tail of the path visible */
+  text-align: left;
+}
+
+/* ---- episode table ---- */
+.data-table-wrap {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+}
+.data-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 11px;
+}
+.data-table th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--surface);
+  font-family: var(--mono);
+  font-size: 9.5px;
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--muted);
+  text-align: left;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border);
+}
+.data-table td {
+  padding: 5px 10px;
+  border-bottom: 1px solid var(--hairline);
+  vertical-align: middle;
+  max-width: 120px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.data-table td.num {
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+}
+.data-table td.tasks {
+  color: var(--muted);
+}
+.data-table tbody tr {
+  cursor: pointer;
+}
+.data-table tbody tr:hover {
+  background: rgba(255, 255, 255, 0.025);
+}
+.data-table tbody tr.sel {
+  background: rgba(124, 130, 255, 0.1);
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+
+/* ---- tag chips (table + editor) ---- */
+.tag-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--muted);
+  background: var(--raised);
+  border: 1px solid var(--border);
+  border-radius: 100px;
+  padding: 1px 8px;
+}
+.tag-chip.sm {
+  font-size: 9px;
+  padding: 0 6px;
+  margin-right: 3px;
+}
+.tag-chip button {
+  background: none;
+  border: none;
+  color: var(--faint);
+  cursor: pointer;
+  font-size: 11px;
+  padding: 0;
+  line-height: 1;
+}
+.tag-chip button:hover {
+  color: var(--singular);
+}
+
+/* ---- right: episode detail ---- */
+.data-detail {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow-y: auto;
+}
+.data-detail-body {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px 14px;
+}
+
+.data-editbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.data-editbar .btn {
+  font-size: 11.5px;
+  padding: 4px 10px;
+}
+.de-meta {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+.de-spacer {
+  flex: 1 1 auto;
+}
+.de-split {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.de-split input {
+  width: 70px;
+  background: var(--base);
+  border: 1px solid var(--border-2);
+  border-radius: var(--r-sm);
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 11px;
+  padding: 3px 6px;
+  outline: none;
+}
+.de-split input:focus {
+  border-color: var(--accent);
+}
+.de-split-range {
+  width: 100%;
+  margin: 0;
+}
+.de-danger {
+  color: var(--singular) !important;
+  border-color: rgba(255, 92, 108, 0.35) !important;
+}
+.de-danger:hover:not(:disabled) {
+  background: rgba(255, 92, 108, 0.12) !important;
+}
+
+/* inline destructive-op confirm strip (never a browser dialog) */
+.data-confirm {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 12px;
+  border: 1px solid rgba(255, 92, 108, 0.35);
+  border-radius: var(--r);
+  background: rgba(255, 92, 108, 0.08);
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text);
+}
+.data-confirm span {
+  flex: 1 1 auto;
+}
+.data-confirm .btn {
+  font-size: 11px;
+  padding: 3px 10px;
+}
+
+.data-tags {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.tag-edit {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 5px;
+  flex: 1 1 auto;
+}
+.tag-edit input {
+  width: 110px;
+  background: var(--base);
+  border: 1px solid var(--border-2);
+  border-radius: var(--r-sm);
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 11px;
+  padding: 3px 7px;
+  outline: none;
+}
+.tag-edit input:focus {
+  border-color: var(--accent);
+}
+
+/* ---- channel chart cards ---- */
+.data-charts {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.data-chart-card {
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  background: var(--surface);
+  padding: 8px 10px 6px;
+}
+.dc-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  margin-bottom: 6px;
+}
+.dc-meta {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--faint);
+  font-variant-numeric: tabular-nums;
+}
+.ep-chart {
+  background: var(--base);
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-sm);
+  padding: 2px;
+  overflow: hidden;
+}
+.dc-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  margin-top: 5px;
+}
+.dc-key {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-family: var(--mono);
+  font-size: 9.5px;
+  color: var(--muted);
+}
+.dc-key i {
+  width: 8px;
+  height: 2px;
+  border-radius: 1px;
+}

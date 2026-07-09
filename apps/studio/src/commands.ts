@@ -7,7 +7,7 @@
 
 import type { StudioMode } from "./store";
 
-export type CommandSection = "Robot" | "Mode" | "Motion" | "Simulate" | "Graph";
+export type CommandSection = "Robot" | "Mode" | "Motion" | "Simulate" | "Graph" | "Data";
 
 /** Section order — build order, header order, and the ranking tiebreak. */
 const SECTION_ORDER: Record<CommandSection, number> = {
@@ -16,6 +16,7 @@ const SECTION_ORDER: Record<CommandSection, number> = {
   Motion: 2,
   Simulate: 3,
   Graph: 4,
+  Data: 5,
 };
 
 export interface Command {
@@ -41,6 +42,8 @@ export interface CommandCtx {
   hasInertia: boolean;
   /** path of the currently-loaded URDF (the Reload target), null before any load */
   urdfPath: string | null;
+  /** a dataset is open in Data mode (gates Refresh dataset) */
+  datasetLoaded: boolean;
   actions: {
     openUrdf: () => void;
     openPath: (path: string, record: boolean) => void;
@@ -57,6 +60,8 @@ export interface CommandCtx {
     fitGraphView: () => void; // xyflow fitView via the editor's instance
     exportGraph: () => void; // native save dialog → save_graph_file
     importGraph: () => void; // native open dialog → load_graph_file
+    openDataset: () => void; // native directory dialog → dataset_open (+ Data mode)
+    refreshDataset: () => void; // re-list the open dataset from disk
   };
 }
 
@@ -65,18 +70,25 @@ export function baseName(p: string): string {
   return p.split(/[\\/]/).pop() || p;
 }
 
-/** ModeTabs order — the source of truth ⌘1…⌘4 (and the tabs) index into. */
+/** ModeTabs order — the source of truth ⌘1…⌘5 (and the tabs) index into. */
 export const MODE_TABS: { id: StudioMode; label: string }[] = [
   { id: "jog", label: "Jog" },
   { id: "motion", label: "Motion" },
   { id: "simulate", label: "Simulate" },
   { id: "graph", label: "Graph" },
+  { id: "data", label: "Data" },
 ];
+
+/** Modes reachable with NO robot loaded (Data browses datasets robot-free). */
+export function modeNeedsRobot(id: StudioMode): boolean {
+  return id !== "data";
+}
 
 /** Assemble the full command list in section order. Gated commands stay
  *  visible but disabled, with the gate spelled out in the hint. */
 export function buildCommands(ctx: CommandCtx): Command[] {
-  const { fixtures, recents, poses, mode, robotLoaded, hasInertia, urdfPath, actions } = ctx;
+  const { fixtures, recents, poses, mode, robotLoaded, hasInertia, urdfPath, datasetLoaded, actions } =
+    ctx;
   const noRobot = robotLoaded ? null : "no robot loaded";
   const cmds: Command[] = [];
 
@@ -120,16 +132,17 @@ export function buildCommands(ctx: CommandCtx): Command[] {
     });
   }
 
-  // ---- Mode (mirrors the ModeTabs gating exactly) ----
+  // ---- Mode (mirrors the ModeTabs gating exactly; Data needs no robot) ----
   MODE_TABS.forEach((t, i) => {
     const active = mode === t.id;
     const needsInertia = t.id === "simulate" && !hasInertia;
+    const robotGate = modeNeedsRobot(t.id) ? noRobot : null;
     cmds.push({
       id: `mode.${t.id}`,
       title: `Switch to ${t.label}`,
-      hint: noRobot ?? (active ? "active" : needsInertia ? "no inertial data" : `⌘${i + 1}`),
+      hint: robotGate ?? (active ? "active" : needsInertia ? "no inertial data" : `⌘${i + 1}`),
       section: "Mode",
-      enabled: robotLoaded && !active && !needsInertia,
+      enabled: robotGate === null && !active && !needsInertia,
       run: () => actions.setMode(t.id),
     });
   });
@@ -241,6 +254,23 @@ export function buildCommands(ctx: CommandCtx): Command[] {
     section: "Graph",
     enabled: graphGate === null,
     run: actions.importGraph,
+  });
+
+  // ---- Data (robot-independent: the browser edits datasets on disk) ----
+  cmds.push({
+    id: "data.open",
+    title: "Open dataset…",
+    section: "Data",
+    enabled: true, // always live, like Open URDF… — it also switches to Data mode
+    run: actions.openDataset,
+  });
+  cmds.push({
+    id: "data.refresh",
+    title: "Refresh dataset",
+    hint: datasetLoaded ? undefined : "no dataset open",
+    section: "Data",
+    enabled: datasetLoaded,
+    run: actions.refreshDataset,
   });
 
   return cmds;

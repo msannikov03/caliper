@@ -137,11 +137,62 @@ export interface CollisionDto {
   numColliders: number;
   uncoveredFrames: number;
 }
-export type StudioMode = "jog" | "motion" | "simulate" | "graph";
+export type StudioMode = "jog" | "motion" | "simulate" | "graph" | "data";
 export interface NamedPoseDto {
   name: string;
   q: number[];
 }
+
+// ---- dataset browser (Data mode) — mirrors the Dataset* DTOs in lib.rs ----
+
+/** One user data feature (flat float32 vector) of the dataset. */
+export interface DatasetFeature {
+  name: string;
+  dim: number;
+  /** per-element names (joint names) when the dataset carries them */
+  names: string[] | null;
+}
+/** One episode row of the dataset table. */
+export interface DatasetEpisodeRow {
+  index: number;
+  length: number;
+  tasks: string[];
+  /** free-form tags from the caliper sidecar (meta/caliper_tags.json) */
+  tags: string[];
+  durationS: number;
+}
+/** Summary DTO for the dataset browser: info fields + the episode table. */
+export interface DatasetSummary {
+  /** canonicalized dataset root — feed this back into the edit commands */
+  path: string;
+  fps: number;
+  robotType: string | null;
+  codebaseVersion: string;
+  totalEpisodes: number;
+  totalFrames: number;
+  totalTasks: number;
+  tasks: string[];
+  features: DatasetFeature[];
+  episodes: DatasetEpisodeRow[];
+}
+/** One plotted feature of one episode: series[dim][point]. */
+export interface DatasetChannel {
+  name: string;
+  series: number[][];
+}
+/** Downsampled per-frame series of one episode, for plotting. */
+export interface DatasetEpisodeSeries {
+  episode: number;
+  /** full (undecimated) frame count of the episode */
+  length: number;
+  /** decimation stride actually applied (1 = every frame) */
+  stride: number;
+  times: number[];
+  channels: DatasetChannel[];
+}
+
+/** Plot budget handed to `dataset_episode` (the backend decimates to <= this). */
+export const SERIES_MAX_POINTS = 1200;
 
 export interface StudioState {
   // robot + configuration
@@ -250,6 +301,30 @@ export interface StudioState {
   exportGraph: (path: string) => Promise<void>;
   /** Import + adopt a dialog-picked graph file (parse errors → banner). */
   importGraph: (path: string) => Promise<void>;
+
+  // data mode — LeRobotDataset browser/editor. Deliberately robot-independent:
+  // a dataset can be inspected with no URDF loaded at all.
+  dataset: DatasetSummary | null;
+  datasetLoading: boolean;
+  datasetError: string | null; // red banner inside the Data panel
+  datasetEpisode: number | null; // selected episode-table row
+  datasetSeries: DatasetEpisodeSeries | null; // plotted series of the selection
+  _datasetSeriesCache: Record<number, DatasetEpisodeSeries>; // per-summary; edits clear it
+  _datasetReqId: number; // monotonic latest-wins guard for series fetches
+  /** Open (or re-open) a dataset directory picked in the native dialog. */
+  openDataset: (path: string) => Promise<void>;
+  /** Re-list the currently-open dataset from disk. */
+  refreshDataset: () => Promise<void>;
+  /** Select an episode row (null clears) and fetch its plot series (cached). */
+  selectDatasetEpisode: (i: number | null) => Promise<void>;
+  /** Delete episodes on disk, then adopt the fresh re-list (selection clears). */
+  deleteDatasetEpisodes: (episodes: number[]) => Promise<void>;
+  /** Split `episode` at `frame` on disk; the first half stays selected. */
+  splitDatasetEpisode: (episode: number, frame: number) => Promise<void>;
+  /** Merge two ADJACENT episodes on disk; the merged row stays selected. */
+  mergeDatasetEpisodes: (first: number, second: number) => Promise<void>;
+  /** Replace one episode's sidecar tags (empty list clears them). */
+  setDatasetTags: (episode: number, tags: string[]) => Promise<void>;
 }
 
 export const useStore = create<StudioState>((set, get) => ({
@@ -284,6 +359,13 @@ export const useStore = create<StudioState>((set, get) => ({
   fixtures: [],
   urdfPath: null,
   recentUrdfs: [],
+  dataset: null,
+  datasetLoading: false,
+  datasetError: null,
+  datasetEpisode: null,
+  datasetSeries: null,
+  _datasetSeriesCache: {},
+  _datasetReqId: 0,
 
   async loadFixtures() {
     try {
@@ -386,7 +468,8 @@ export const useStore = create<StudioState>((set, get) => ({
   },
 
   setJoint(i, v) {
-    if (get().playing || get().mode === "simulate" || get().mode === "graph") return; // sim/playback/graph own the pose
+    const m = get().mode;
+    if (get().playing || m === "simulate" || m === "graph" || m === "data") return; // sim/playback/graph/data own the pose
     const q = get().q.slice();
     q[i] = v;
     // a manual jog invalidates any prior IK status (it described a different pose)
@@ -425,7 +508,8 @@ export const useStore = create<StudioState>((set, get) => ({
 
   async solveIkGoverned(targetColMajor, snap) {
     const { q, robot } = get();
-    if (!robot || get().playing || get().mode === "simulate" || get().mode === "graph") return; // gizmo inert
+    const m = get().mode;
+    if (!robot || get().playing || m === "simulate" || m === "graph" || m === "data") return; // gizmo inert
     const frameName = robot.frames[robot.tip].name;
     const reqId = get()._reqId + 1;
     set({ _reqId: reqId });
@@ -860,11 +944,141 @@ export const useStore = create<StudioState>((set, get) => ({
       set({ graphBanner: String(e) });
     }
   },
+
+  // ---- data mode (dataset browser) ----
+  async openDataset(path) {
+    set({ datasetLoading: true, datasetError: null });
+    try {
+      const summary = await invoke<DatasetSummary>("dataset_open", { path });
+      // a fresh open resets everything (an open failure keeps the old dataset)
+      adoptDatasetSummary(summary, null, get, set);
+    } catch (e) {
+      set({ datasetError: String(e) });
+    } finally {
+      set({ datasetLoading: false });
+    }
+  },
+  async refreshDataset() {
+    const ds = get().dataset;
+    if (!ds || get().datasetLoading) return;
+    const keep = get().datasetEpisode;
+    set({ datasetLoading: true, datasetError: null });
+    try {
+      const summary = await invoke<DatasetSummary>("dataset_open", { path: ds.path });
+      // the disk may have changed under us — series cache is stale by definition
+      adoptDatasetSummary(summary, keep, get, set);
+    } catch (e) {
+      set({ datasetError: String(e) });
+    } finally {
+      set({ datasetLoading: false });
+    }
+  },
+  async selectDatasetEpisode(i) {
+    if (i === null) {
+      set({ datasetEpisode: null, datasetSeries: null });
+      return;
+    }
+    const ds = get().dataset;
+    if (!ds || i < 0 || i >= ds.episodes.length) return;
+    const cached = get()._datasetSeriesCache[i];
+    set({ datasetEpisode: i, datasetSeries: cached ?? null });
+    if (cached) return;
+    const reqId = get()._datasetReqId + 1;
+    set({ _datasetReqId: reqId });
+    try {
+      const series = await invoke<DatasetEpisodeSeries>("dataset_episode", {
+        path: ds.path,
+        episode: i,
+        maxPoints: SERIES_MAX_POINTS,
+      });
+      // latest-wins: a newer select or a structural edit superseded this reply
+      // (edits bump _datasetReqId too, so a stale series can't repopulate the cache)
+      if (get()._datasetReqId !== reqId) return;
+      set({
+        datasetSeries: get().datasetEpisode === i ? series : get().datasetSeries,
+        _datasetSeriesCache: { ...get()._datasetSeriesCache, [i]: series },
+      });
+    } catch (e) {
+      if (get()._datasetReqId === reqId) set({ datasetError: String(e) });
+    }
+  },
+  async deleteDatasetEpisodes(episodes) {
+    await datasetEdit("dataset_delete_episodes", { episodes }, null, get, set);
+  },
+  async splitDatasetEpisode(episode, frame) {
+    await datasetEdit("dataset_split_episode", { episode, frame }, episode, get, set);
+  },
+  async mergeDatasetEpisodes(first, second) {
+    await datasetEdit("dataset_merge_episodes", { first, second }, first, get, set);
+  },
+  async setDatasetTags(episode, tags) {
+    const ds = get().dataset;
+    if (!ds) return;
+    try {
+      const summary = await invoke<DatasetSummary>("dataset_set_tags", {
+        path: ds.path,
+        episode,
+        tags,
+      });
+      // tags never move frames: keep the selection, the series and the cache
+      set({ dataset: summary, datasetError: null });
+    } catch (e) {
+      set({ datasetError: String(e) });
+    }
+  },
 }));
 
 /// The active playback clip: a baked sim rollout takes precedence over a motion traj.
 function activeClip(s: StudioState): TrajectoryDto | null {
   return s.simTraj ?? s.traj;
+}
+
+// ---- dataset helpers (module scope) ----
+
+/// Adopt a fresh DatasetSummary after an open/refresh/edit: episode indices may
+/// have shifted, so the series cache is dropped and in-flight series replies are
+/// invalidated (_datasetReqId bump). `select` re-selects a row when it still
+/// exists (edits pass the surviving half; delete passes null).
+function adoptDatasetSummary(
+  summary: DatasetSummary,
+  select: number | null,
+  get: () => StudioState,
+  set: (p: Partial<StudioState>) => void,
+): void {
+  set({
+    dataset: summary,
+    datasetError: null,
+    datasetEpisode: null,
+    datasetSeries: null,
+    _datasetSeriesCache: {},
+    _datasetReqId: get()._datasetReqId + 1,
+  });
+  if (select !== null && select >= 0 && select < summary.episodes.length) {
+    void get().selectDatasetEpisode(select);
+  }
+}
+
+/// Shared impl of the structural dataset edits (delete/split/merge): every one
+/// takes the open dataset's path, returns the fresh re-list, and re-selects
+/// `select`. Errors land in the panel banner; a missing dataset is a no-op.
+async function datasetEdit(
+  cmd: string,
+  args: Record<string, unknown>,
+  select: number | null,
+  get: () => StudioState,
+  set: (p: Partial<StudioState>) => void,
+): Promise<void> {
+  const ds = get().dataset;
+  if (!ds || get().datasetLoading) return;
+  set({ datasetLoading: true, datasetError: null });
+  try {
+    const summary = await invoke<DatasetSummary>(cmd, { path: ds.path, ...args });
+    adoptDatasetSummary(summary, select, get, set);
+  } catch (e) {
+    set({ datasetError: String(e) });
+  } finally {
+    set({ datasetLoading: false });
+  }
 }
 
 // ---- graph helpers (module scope) ----
@@ -1107,7 +1321,7 @@ export interface Session {
 }
 
 /** Runtime mirror of the StudioMode union (validateSession checks against it). */
-const STUDIO_MODES: readonly StudioMode[] = ["jog", "motion", "simulate", "graph"];
+const STUDIO_MODES: readonly StudioMode[] = ["jog", "motion", "simulate", "graph", "data"];
 
 /// Pure shape-check of a stored session: urdfPath a non-empty string, mode a
 /// real StudioMode, q an array of finite numbers. Anything else → null and the

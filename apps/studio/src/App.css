@@ -948,6 +948,19 @@ input[type="range"] {
   inset: 0 36% 0 0;
 }
 
+/* Data mode docks the SAME persistent canvas the same way (narrower: the
+   dataset browser is the working surface, the robot view is passive). */
+.viewport.data-mode .gl-stage {
+  left: auto;
+  right: 0;
+  width: 28%;
+  border-left: 1px solid var(--border);
+}
+.viewport.data-mode .data-pane {
+  position: absolute;
+  inset: 0 28% 0 0;
+}
+
 .graph-editor {
   position: absolute;
   inset: 0;

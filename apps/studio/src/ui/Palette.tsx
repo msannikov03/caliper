@@ -11,6 +11,7 @@ import { useStore } from "../store";
 import { buildCommands, filterCommands } from "../commands";
 import type { Command } from "../commands";
 import { openUrdf, selectRobot } from "./Toolbar";
+import { openDatasetDialog } from "../data/DataMode";
 import { exportGraphToFile, fitGraphView, importGraphFromFile } from "../graph/GraphEditor";
 import "./palette.css";
 
@@ -27,6 +28,7 @@ export function Palette({ onClose }: { onClose: () => void }) {
   const recents = useStore((s) => s.recentUrdfs);
   const poses = useStore((s) => s.poses);
   const urdfPath = useStore((s) => s.urdfPath);
+  const datasetLoaded = useStore((s) => s.dataset !== null);
 
   const commands = useMemo(() => {
     // every action wraps an existing store/toolbar operation — no new backend calls
@@ -39,6 +41,7 @@ export function Palette({ onClose }: { onClose: () => void }) {
       robotLoaded: robot !== null,
       hasInertia: robot?.hasInertia ?? false,
       urdfPath,
+      datasetLoaded,
       actions: {
         openUrdf: () => void openUrdf(),
         openPath: (path, record) => void selectRobot(path, record),
@@ -55,10 +58,12 @@ export function Palette({ onClose }: { onClose: () => void }) {
         fitGraphView,
         exportGraph: () => void exportGraphToFile(),
         importGraph: () => void importGraphFromFile(),
+        openDataset: () => void openDatasetDialog(),
+        refreshDataset: () => void useStore.getState().refreshDataset(),
       },
     });
     return filterCommands(query, all);
-  }, [query, fixtures, recents, poses, mode, robot, urdfPath]);
+  }, [query, fixtures, recents, poses, mode, robot, urdfPath, datasetLoaded]);
 
   useEffect(() => inputRef.current?.focus(), []);
 

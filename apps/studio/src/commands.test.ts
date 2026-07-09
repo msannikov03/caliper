@@ -22,6 +22,7 @@ function mkCtx(over: Partial<CommandCtx> = {}): CommandCtx {
     robotLoaded: true,
     hasInertia: true,
     urdfPath: "/fx/showcase6.urdf",
+    datasetLoaded: false,
     actions: {
       openUrdf: noop,
       openPath: noop,
@@ -38,6 +39,8 @@ function mkCtx(over: Partial<CommandCtx> = {}): CommandCtx {
       fitGraphView: noop,
       exportGraph: noop,
       importGraph: noop,
+      openDataset: noop,
+      refreshDataset: noop,
     },
     ...over,
   };

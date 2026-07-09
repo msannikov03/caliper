@@ -1,8 +1,9 @@
 # caliper_learn — Phase 7 (Learning) sidecar
 
 A minimal, **pure-torch** behavior-cloning sidecar for Caliper. No lerobot / hydra /
-diffusers — the BC-MLP, ACT-lite transformer, and optional DDPM head are hand-written
-stdlib torch. It builds on the Caliper PyO3 bindings (`caliper.{Robot, Planner,
+diffusers in the core — the BC-MLP, ACT-lite transformer, and optional DDPM head are
+hand-written stdlib torch (only the Hub-deploy loader in `hub.py` lazily imports
+lerobot, when actually loading a Hub checkpoint). It builds on the Caliper PyO3 bindings (`caliper.{Robot, Planner,
 ControlLoop, Recorder, DatasetReader}`).
 
 Pipeline: **collect** (sim demos → LeRobotDataset v2.1) → **data** (torch Dataset,
@@ -24,6 +25,18 @@ env -u CONDA_PREFIX uv pip install --python .venv/bin/python -e learn      # the
 ```sh
 env -u CONDA_PREFIX .venv/bin/python -m pytest learn -v
 ```
+
+## Deploying lerobot Hub checkpoints
+
+`hub.load_lerobot_policy(dir)` loads a lerobot-0.4.4-convention checkpoint (config.json +
+model.safetensors + policy_{pre,post}processor.json) and `runner.run_policy(policy, cl, fps=50, ticks=...)`
+drives it through the safety-monitored `ControlLoop` — ACT, state-only observations this wave
+(image checkpoints raise `NotImplementedError`).
+
+**Security stance:** SAFETENSORS ONLY, in-process, no network. lerobot's own remote-inference
+path (`PolicyServer`) deserializes pickle over an open port (CVE-2026-25874); Caliper instead
+loads weights as pure tensors (`safetensors.torch`, never `torch.load`) and refuses any
+checkpoint directory containing `.bin`/`.pt`/`.pth`/`.ckpt`/`.pkl` files.
 
 ## ⚠️ Deferred: real GPU training
 

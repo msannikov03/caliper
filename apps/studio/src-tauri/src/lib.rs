@@ -2048,6 +2048,291 @@ fn load_graph_file(path: String) -> Result<String, String> {
     Ok(json)
 }
 
+// ----- dataset browser (LeRobotDataset v3.0; path comes from the native open dialog) -----
+
+/// One episode row of the dataset table.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DatasetEpisodeRow {
+    index: usize,
+    length: u64,
+    tasks: Vec<String>,
+    /// Free-form tags from the caliper sidecar (`meta/caliper_tags.json`).
+    tags: Vec<String>,
+    /// Episode duration in seconds (`length / fps`).
+    duration_s: f64,
+}
+
+/// One user data feature (flat float32 vector) of the dataset.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DatasetFeatureDto {
+    name: String,
+    dim: usize,
+    /// Per-element names (joint names) when the dataset carries them.
+    names: Option<Vec<String>>,
+}
+
+/// Summary DTO for the dataset browser: info fields + the episode table.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DatasetSummary {
+    /// Canonicalized dataset root (feed this back into the edit commands).
+    path: String,
+    fps: u32,
+    robot_type: Option<String>,
+    codebase_version: String,
+    total_episodes: u64,
+    total_frames: u64,
+    total_tasks: u64,
+    tasks: Vec<String>,
+    features: Vec<DatasetFeatureDto>,
+    episodes: Vec<DatasetEpisodeRow>,
+}
+
+/// One plotted feature of one episode: `series[dim][point]`.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DatasetChannel {
+    name: String,
+    series: Vec<Vec<f64>>,
+}
+
+/// Downsampled per-frame series of one episode, for plotting.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DatasetEpisodeSeries {
+    episode: usize,
+    /// Full (undecimated) frame count of the episode.
+    length: usize,
+    /// Decimation stride actually applied (1 = every frame).
+    stride: usize,
+    times: Vec<f64>,
+    channels: Vec<DatasetChannel>,
+}
+
+/// Canonicalize + sanity-check a webview-supplied dataset path. Desktop trust
+/// model (same as the graph file dialogs): the path comes from the native
+/// open dialog, so beyond "resolves to a directory" no allowlist is needed.
+fn dataset_dir(path: &str) -> Result<PathBuf, String> {
+    let canon = std::fs::canonicalize(Path::new(path))
+        .map_err(|e| format!("cannot resolve `{path}`: {e}"))?;
+    if !canon.is_dir() {
+        return Err(format!("`{path}` is not a directory"));
+    }
+    Ok(canon)
+}
+
+/// Open the dataset and build the browser summary (shared by every dataset
+/// command so edits always return a fresh re-list).
+fn dataset_summary_impl(root: &Path) -> Result<DatasetSummary, String> {
+    let reader = caliper_dataset::DatasetReader::open(root).map_err(|e| e.to_string())?;
+    let tags = caliper_dataset::edit::read_tags(root).map_err(|e| e.to_string())?;
+    let info = reader.info();
+    let fps = info.fps;
+    let features = info
+        .features
+        .iter()
+        .filter(|(name, f)| {
+            f.dtype == "float32"
+                && f.shape.len() == 1
+                && !matches!(
+                    name.as_str(),
+                    "timestamp" | "frame_index" | "episode_index" | "index" | "task_index"
+                )
+        })
+        .map(|(name, f)| DatasetFeatureDto {
+            name: name.clone(),
+            dim: f.shape.first().copied().unwrap_or(0) as usize,
+            names: f.names.as_array().and_then(|a| {
+                a.iter()
+                    .map(|v| v.as_str().map(String::from))
+                    .collect::<Option<Vec<_>>>()
+            }),
+        })
+        .collect();
+    let episodes = reader
+        .episodes()
+        .iter()
+        .enumerate()
+        .map(|(i, m)| DatasetEpisodeRow {
+            index: i,
+            length: m.length,
+            tasks: m.tasks.clone(),
+            tags: tags.get(&(i as u64)).cloned().unwrap_or_default(),
+            duration_s: m.length as f64 / f64::from(fps.max(1)),
+        })
+        .collect();
+    Ok(DatasetSummary {
+        path: root.display().to_string(),
+        fps,
+        robot_type: info.robot_type.clone(),
+        codebase_version: info.codebase_version.clone(),
+        total_episodes: info.total_episodes,
+        total_frames: info.total_frames,
+        total_tasks: info.total_tasks,
+        tasks: reader.tasks().to_vec(),
+        features,
+        episodes,
+    })
+}
+
+fn dataset_open_impl(path: &str) -> Result<DatasetSummary, String> {
+    let root = dataset_dir(path)?;
+    dataset_summary_impl(&root)
+}
+
+/// Open a LeRobotDataset v3.0 directory → summary + episode table.
+#[tauri::command]
+fn dataset_open(path: String) -> Result<DatasetSummary, String> {
+    logged("dataset_open", dataset_open_impl(&path))
+}
+
+fn dataset_episode_impl(
+    path: &str,
+    episode: usize,
+    max_points: usize,
+) -> Result<DatasetEpisodeSeries, String> {
+    let root = dataset_dir(path)?;
+    let reader = caliper_dataset::DatasetReader::open(&root).map_err(|e| e.to_string())?;
+    let ep = reader.read_episode(episode).map_err(|e| e.to_string())?;
+    let len = ep.len();
+    let stride = len.div_ceil(max_points.max(2)).max(1);
+    let picks: Vec<usize> = (0..len).step_by(stride).collect();
+    let times: Vec<f64> = picks.iter().map(|&i| ep.timestamps[i]).collect();
+    let channels = ep
+        .features
+        .iter()
+        .map(|(name, rows)| {
+            let dim = rows.first().map_or(0, |r| r.len());
+            let series = (0..dim)
+                .map(|d| picks.iter().map(|&i| f64::from(rows[i][d])).collect())
+                .collect();
+            DatasetChannel {
+                name: name.clone(),
+                series,
+            }
+        })
+        .collect();
+    Ok(DatasetEpisodeSeries {
+        episode,
+        length: len,
+        stride,
+        times,
+        channels,
+    })
+}
+
+/// Per-feature per-dim series of one episode, decimated to <= `max_points`
+/// frames for plotting (uniform stride; the tail may fall between strides,
+/// which is fine at plot resolution).
+#[tauri::command]
+fn dataset_episode(
+    path: String,
+    episode: usize,
+    max_points: usize,
+) -> Result<DatasetEpisodeSeries, String> {
+    logged(
+        "dataset_episode",
+        dataset_episode_impl(&path, episode, max_points),
+    )
+}
+
+fn dataset_delete_episodes_impl(path: &str, episodes: &[usize]) -> Result<DatasetSummary, String> {
+    let root = dataset_dir(path)?;
+    caliper_dataset::edit::delete_episodes(&root, episodes).map_err(|e| e.to_string())?;
+    dataset_summary_impl(&root)
+}
+
+/// Delete episodes (offline edit; atomic swap on disk) and re-list.
+#[tauri::command]
+fn dataset_delete_episodes(path: String, episodes: Vec<usize>) -> Result<DatasetSummary, String> {
+    logged(
+        "dataset_delete_episodes",
+        dataset_delete_episodes_impl(&path, &episodes),
+    )
+}
+
+fn dataset_split_episode_impl(
+    path: &str,
+    episode: usize,
+    frame: usize,
+) -> Result<DatasetSummary, String> {
+    let root = dataset_dir(path)?;
+    caliper_dataset::edit::split_episode(&root, episode, frame).map_err(|e| e.to_string())?;
+    dataset_summary_impl(&root)
+}
+
+/// Split an episode in two at `frame` (offline edit) and re-list.
+#[tauri::command]
+fn dataset_split_episode(
+    path: String,
+    episode: usize,
+    frame: usize,
+) -> Result<DatasetSummary, String> {
+    logged(
+        "dataset_split_episode",
+        dataset_split_episode_impl(&path, episode, frame),
+    )
+}
+
+fn dataset_merge_episodes_impl(
+    path: &str,
+    first: usize,
+    second: usize,
+) -> Result<DatasetSummary, String> {
+    let root = dataset_dir(path)?;
+    caliper_dataset::edit::merge_episodes(&root, first, second).map_err(|e| e.to_string())?;
+    dataset_summary_impl(&root)
+}
+
+/// Merge two adjacent episodes (offline edit) and re-list.
+#[tauri::command]
+fn dataset_merge_episodes(
+    path: String,
+    first: usize,
+    second: usize,
+) -> Result<DatasetSummary, String> {
+    logged(
+        "dataset_merge_episodes",
+        dataset_merge_episodes_impl(&path, first, second),
+    )
+}
+
+fn dataset_set_tags_impl(
+    path: &str,
+    episode: usize,
+    tags: Vec<String>,
+) -> Result<DatasetSummary, String> {
+    let root = dataset_dir(path)?;
+    let reader = caliper_dataset::DatasetReader::open(&root).map_err(|e| e.to_string())?;
+    if episode >= reader.total_episodes() {
+        return Err(format!("episode {episode} of {}", reader.total_episodes()));
+    }
+    let mut all = caliper_dataset::edit::read_tags(&root).map_err(|e| e.to_string())?;
+    if tags.is_empty() {
+        all.remove(&(episode as u64));
+    } else {
+        all.insert(episode as u64, tags);
+    }
+    caliper_dataset::edit::write_tags(&root, &all).map_err(|e| e.to_string())?;
+    dataset_summary_impl(&root)
+}
+
+/// Replace one episode's tags in the caliper sidecar and re-list. Tags are a
+/// caliper extension file lerobot ignores; an empty list clears the episode.
+#[tauri::command]
+fn dataset_set_tags(
+    path: String,
+    episode: usize,
+    tags: Vec<String>,
+) -> Result<DatasetSummary, String> {
+    logged(
+        "dataset_set_tags",
+        dataset_set_tags_impl(&path, episode, tags),
+    )
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Panic hook FIRST — before the Builder ever runs — so even a panic during
@@ -2134,7 +2419,13 @@ pub fn run() {
             list_graphs,
             delete_graph,
             save_graph_file,
-            load_graph_file
+            load_graph_file,
+            dataset_open,
+            dataset_episode,
+            dataset_delete_episodes,
+            dataset_split_episode,
+            dataset_merge_episodes,
+            dataset_set_tags
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

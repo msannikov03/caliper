@@ -88,7 +88,11 @@ impl DatasetSpec {
 
 struct EpisodeRecord {
     episode_index: i64,
-    task: String,
+    /// Episode-level task strings (the `tasks` list column of `meta/episodes`).
+    /// Always exactly one for `save_episode`; edit ops may merge episodes with
+    /// different tasks, producing a multi-entry list (lerobot's own converter
+    /// emits a list here too).
+    tasks: Vec<String>,
     length: u64,
     chunk_index: u64,
     file_index: u64,
@@ -249,6 +253,23 @@ impl DatasetWriter {
     /// its row group to the current data file (rolling to a new file first if
     /// the size target would be exceeded).
     pub fn save_episode(&mut self, task: &str) -> Result<(), Error> {
+        let t = task.to_string();
+        let frame_tasks = vec![t.clone(); self.buf_times.len()];
+        self.save_episode_with_tasks(&[t], &frame_tasks)
+    }
+
+    /// Like [`save_episode`](Self::save_episode) but with a per-frame task and
+    /// an explicit episode-level task list — what the offline edit ops need to
+    /// merge episodes with different tasks without collapsing their frames'
+    /// `task_index` values. `frame_tasks` must have one entry per buffered
+    /// frame; `episode_tasks` is stored in the `tasks` column of
+    /// `meta/episodes` and every string (from both lists) is interned into
+    /// `meta/tasks.parquet`.
+    pub(crate) fn save_episode_with_tasks(
+        &mut self,
+        episode_tasks: &[String],
+        frame_tasks: &[String],
+    ) -> Result<(), Error> {
         if self.finalized {
             return Err(Error::State("writer already finalized".into()));
         }
@@ -258,10 +279,23 @@ impl DatasetWriter {
                 "no frames buffered; call add_frame first".into(),
             ));
         }
+        if episode_tasks.is_empty() {
+            return Err(Error::State("episode needs at least one task".into()));
+        }
+        if frame_tasks.len() != len {
+            return Err(Error::State(format!(
+                "{} frame tasks for {} buffered frames",
+                frame_tasks.len(),
+                len
+            )));
+        }
         let episode_index = self.episodes.len() as i64;
-        let task_index = self.intern_task(task);
+        for t in episode_tasks {
+            self.intern_task(t);
+        }
+        let frame_task_idx: Vec<i64> = frame_tasks.iter().map(|t| self.intern_task(t)).collect();
 
-        let batch = self.build_episode_batch(episode_index, task_index)?;
+        let batch = self.build_episode_batch(episode_index, &frame_task_idx)?;
         self.roll_data_file_if_needed(len as u64)?;
         if self.data.is_none() {
             self.open_data_file(batch.schema())?;
@@ -274,10 +308,10 @@ impl DatasetWriter {
         data.frames += len as u64;
         let (chunk_index, file_index) = (data.chunk_index, data.file_index);
 
-        let stats = self.episode_stats(episode_index, task_index);
+        let stats = self.episode_stats(episode_index, &frame_task_idx);
         self.episodes.push(EpisodeRecord {
             episode_index,
-            task: task.to_string(),
+            tasks: episode_tasks.to_vec(),
             length: len as u64,
             chunk_index,
             file_index,
@@ -356,7 +390,7 @@ impl DatasetWriter {
     fn build_episode_batch(
         &self,
         episode_index: i64,
-        task_index: i64,
+        frame_task_idx: &[i64],
     ) -> Result<RecordBatch, Error> {
         let len = self.buf_times.len();
         let mut fields: Vec<Field> = Vec::new();
@@ -380,7 +414,7 @@ impl DatasetWriter {
         let index = Int64Array::from(
             (self.global_index..self.global_index + len as i64).collect::<Vec<_>>(),
         );
-        let task = Int64Array::from(vec![task_index; len]);
+        let task = Int64Array::from(frame_task_idx.to_vec());
         for (name, arr) in [
             ("timestamp", Arc::new(timestamp) as ArrayRef),
             ("frame_index", Arc::new(frame_index) as ArrayRef),
@@ -447,7 +481,11 @@ impl DatasetWriter {
     /// Per-episode stats over the values **as stored** (after the f32 round),
     /// for every feature including the implicit scalar ones — exactly the
     /// entries lerobot's converter flattens into the episodes parquet.
-    fn episode_stats(&self, episode_index: i64, task_index: i64) -> BTreeMap<String, FeatureStats> {
+    fn episode_stats(
+        &self,
+        episode_index: i64,
+        frame_task_idx: &[i64],
+    ) -> BTreeMap<String, FeatureStats> {
         let len = self.buf_times.len();
         let mut stats = BTreeMap::new();
         for (feat, buf) in self.spec.features.iter().zip(&self.buf) {
@@ -486,7 +524,10 @@ impl DatasetWriter {
                     .collect(),
             ),
         );
-        stats.insert("task_index".into(), scalar(vec![task_index as f64; len]));
+        stats.insert(
+            "task_index".into(),
+            scalar(frame_task_idx.iter().map(|&t| t as f64).collect()),
+        );
         stats
     }
 
@@ -544,7 +585,9 @@ impl DatasetWriter {
 
         let mut tasks_b = ListBuilder::new(StringBuilder::new());
         for e in &self.episodes {
-            tasks_b.values().append_value(&e.task);
+            for t in &e.tasks {
+                tasks_b.values().append_value(t);
+            }
             tasks_b.append(true);
         }
         let tasks_arr = tasks_b.finish();

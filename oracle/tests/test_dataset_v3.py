@@ -208,3 +208,71 @@ def test_readerv3_reads_lerobot_written_dataset(tmp_path):
     # The v2.1 original next door is REJECTED (version gate, not a crash).
     with pytest.raises(ValueError, match="v3"):
         caliper.DatasetReaderV3.open(str(ds_root) + "_old")
+
+
+def test_offline_edits_keep_dataset_lerobot_loadable(tmp_path):
+    """Offline edit ops (delete middle episode, then split another) + the tags
+    sidecar must leave a dataset that REAL lerobot still loads with correct
+    lengths, boundaries, values and task strings — and the caliper_tags.json
+    extension file under meta/ must be invisible to lerobot's loader."""
+    edit_ops = ("dataset_delete_episodes", "dataset_split_episode",
+                "dataset_read_tags", "dataset_write_tags")
+    if not all(hasattr(caliper, f) for f in edit_ops):
+        pytest.skip("caliper lacks dataset edit ops — rebuild (maturin develop)")
+
+    repo_id = "caliper/edit_v3"
+    ds_root = tmp_path / repo_id
+    r = caliper.Robot.from_urdf(str(ROBOTS / "showcase6.urdf"))
+    rec = caliper.RecorderV3(r, str(ds_root), FPS)
+    plan = [
+        ("hold zero", [0.0, 0.0, 0.0, 0.0, 0.0, 0.0], 40),
+        ("wiggle", [0.1, -0.1, 0.1, -0.1, 0.1, -0.1], 30),
+        ("reach a pose", [0.2, -0.1, 0.3, 0.0, 0.1, 0.0], 50),
+    ]
+    recorded = []
+    for task, goal, ticks in plan:
+        cl = caliper.ControlLoop(r, dt=1.0 / FPS)
+        times, states, actions = cl.rollout_to(goal, ticks)
+        rec.start_episode(task)
+        for s, a, t in zip(states, actions, times):
+            rec.append(s, a, t)
+        rec.finalize_episode()
+        recorded.append((task, states))
+    rec.close()
+
+    caliper.dataset_write_tags(
+        str(ds_root), {0: ["keep"], 1: ["bad-demo"], 2: ["success"]}
+    )
+    caliper.dataset_delete_episodes(str(ds_root), [1])   # drop "wiggle"
+    caliper.dataset_split_episode(str(ds_root), 1, 20)   # old ep2: 50 → 20 + 30
+
+    # Real lerobot loads the edited dataset (tags sidecar present in meta/).
+    assert (ds_root / "meta/caliper_tags.json").exists()
+    ds = LeRobotDataset(repo_id, root=str(ds_root))
+    assert ds.meta.total_episodes == 3
+    assert len(ds) == 40 + 20 + 30
+
+    # Boundaries + renumbering: episode 1 = first half of the old "reach" ep.
+    item = ds[40]
+    assert item["episode_index"].item() == 1
+    assert item["frame_index"].item() == 0
+    assert item["task"] == "reach a pose"
+    assert np.allclose(item["observation.state"].numpy(), recorded[2][1][0], atol=1e-5)
+    # Episode 2 = second half; timestamps restart per episode after the split.
+    item = ds[60]
+    assert item["episode_index"].item() == 2
+    assert item["frame_index"].item() == 0
+    assert item["task"] == "reach a pose"
+    assert abs(item["timestamp"].item()) < 1e-4
+    assert np.allclose(item["observation.state"].numpy(), recorded[2][1][20], atol=1e-5)
+    last = ds[89]
+    assert last["episode_index"].item() == 2
+    assert np.allclose(last["observation.state"].numpy(), recorded[2][1][49], atol=1e-5)
+
+    # Task remap dropped the deleted-episode-only task; tags were remapped.
+    rd = caliper.DatasetReaderV3.open(str(ds_root))
+    assert rd.total_episodes == 3
+    assert rd.tasks == ["hold zero", "reach a pose"]
+    assert caliper.dataset_read_tags(str(ds_root)) == {
+        0: ["keep"], 1: ["success"], 2: ["success"],
+    }

@@ -111,6 +111,11 @@ impl DatasetReader {
         &self.info
     }
 
+    /// Dataset root directory this reader was opened on.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     pub fn fps(&self) -> u32 {
         self.info.fps
     }

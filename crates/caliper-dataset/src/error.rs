@@ -25,4 +25,9 @@ pub enum Error {
     /// The writer was used out of order (e.g. `save_episode` with no frames).
     #[error("writer state: {0}")]
     State(String),
+    /// An offline edit operation was given invalid arguments (bad episode
+    /// index, non-adjacent merge, out-of-range split frame, …) or found
+    /// leftovers of a crashed previous edit next to the dataset.
+    #[error("edit: {0}")]
+    Edit(String),
 }

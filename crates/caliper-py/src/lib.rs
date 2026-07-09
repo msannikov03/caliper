@@ -2125,6 +2125,54 @@ fn exp6(twist: Vec<f64>) -> PyResult<Vec<Vec<f64>>> {
     ])
 }
 
+// ===== LeRobotDataset v3.0 offline edit ops (module functions) =====
+//
+// Thin wrappers over `caliper_dataset::edit` — every op rewrites the dataset
+// through the native v3.0 writer into a sibling temp dir and swaps atomically,
+// so the result is always lerobot-loadable (the oracle proves it).
+
+/// Delete episodes (by index) from a v3.0 dataset at `root`, renumbering the
+/// survivors densely (episode/global indices, task remap dropping now-unused
+/// tasks, stats recomputed, tags remapped). Refuses to delete every episode.
+#[pyfunction]
+fn dataset_delete_episodes(root: &str, episodes: Vec<usize>) -> PyResult<()> {
+    caliper_dataset::edit::delete_episodes(root, &episodes).map_err(ds_err)
+}
+
+/// Split episode `episode` of the v3.0 dataset at `root` into two adjacent
+/// episodes at local frame `frame` (must satisfy `0 < frame < length`). Both
+/// halves keep the task and tags; the second half's timestamps restart at 0.
+#[pyfunction]
+fn dataset_split_episode(root: &str, episode: usize, frame: usize) -> PyResult<()> {
+    caliper_dataset::edit::split_episode(root, episode, frame).map_err(ds_err)
+}
+
+/// Merge two ADJACENT episodes (`second == first + 1`) of the v3.0 dataset at
+/// `root` into one. Tasks are unioned (each frame keeps its own task_index);
+/// the second episode's timestamps continue 1/fps after the first's.
+#[pyfunction]
+fn dataset_merge_episodes(root: &str, first: usize, second: usize) -> PyResult<()> {
+    caliper_dataset::edit::merge_episodes(root, first, second).map_err(ds_err)
+}
+
+/// Read the caliper tags sidecar (`meta/caliper_tags.json`) of the dataset at
+/// `root` → dict mapping episode index to its tag list. Missing file = {}.
+/// lerobot ignores the sidecar entirely.
+#[pyfunction]
+fn dataset_read_tags(root: &str) -> PyResult<std::collections::BTreeMap<u64, Vec<String>>> {
+    caliper_dataset::edit::read_tags(root).map_err(ds_err)
+}
+
+/// Write the caliper tags sidecar of the dataset at `root` (episodes with an
+/// empty tag list are omitted). Edit ops remap tags automatically.
+#[pyfunction]
+fn dataset_write_tags(
+    root: &str,
+    tags: std::collections::BTreeMap<u64, Vec<String>>,
+) -> PyResult<()> {
+    caliper_dataset::edit::write_tags(root, &tags).map_err(ds_err)
+}
+
 // ===== Kinematic calibration (module function) =====
 
 /// Estimate per-joint zero offsets `δ` so that `FK(qₖ + δ) ≈ Tₖ` for every
@@ -2180,6 +2228,11 @@ fn _caliper(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(log6, m)?)?;
     m.add_function(wrap_pyfunction!(exp6, m)?)?;
     m.add_function(wrap_pyfunction!(calibrate_joint_offsets, m)?)?;
+    m.add_function(wrap_pyfunction!(dataset_delete_episodes, m)?)?;
+    m.add_function(wrap_pyfunction!(dataset_split_episode, m)?)?;
+    m.add_function(wrap_pyfunction!(dataset_merge_episodes, m)?)?;
+    m.add_function(wrap_pyfunction!(dataset_read_tags, m)?)?;
+    m.add_function(wrap_pyfunction!(dataset_write_tags, m)?)?;
     m.add_class::<Robot>()?;
     m.add_class::<Trajectory>()?;
     m.add_class::<MotionLimits>()?;

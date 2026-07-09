@@ -22,12 +22,18 @@
 //! data/chunk-XXX/file-XXX.parquet         # episodes concatenated, size-rolled
 //! ```
 //!
+//! Offline edit operations (delete / split / merge episodes + a tags sidecar
+//! lerobot ignores) live in [`edit`] — they rewrite through the same
+//! writer/reader pair and swap atomically, so every edit yields a valid,
+//! lerobot-loadable dataset.
+//!
 //! The **lerobot footgun** — forgetting `finalize()` and losing the parquet
 //! footer plus all episode metadata — is structurally impossible here: the
 //! writer auto-finalizes on `Drop` (footers flushed, buffered episode
 //! metadata written). An explicit [`DatasetWriter::finalize`] is still the
 //! right way to end a recording because it can report errors.
 
+pub mod edit;
 mod error;
 mod meta;
 mod reader;

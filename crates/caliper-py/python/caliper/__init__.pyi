@@ -79,6 +79,43 @@ def calibrate_joint_offsets(
     """
     ...
 
+def dataset_delete_episodes(root: str, episodes: Sequence[int]) -> None:
+    """Delete episodes from a LeRobotDataset v3.0 at `root` (offline edit).
+
+    Survivors are renumbered densely (episode/global indices, task remap
+    dropping now-unused tasks, stats recomputed, tags remapped); the rewrite
+    swaps in atomically, so the result is always lerobot-loadable. Refuses to
+    delete every episode.
+    """
+    ...
+
+def dataset_split_episode(root: str, episode: int, frame: int) -> None:
+    """Split one episode into two at local `frame` (0 < frame < length).
+
+    Both halves keep the task and tags; the second half's timestamps restart
+    at 0 (per-episode-relative, as v3.0 stores them).
+    """
+    ...
+
+def dataset_merge_episodes(root: str, first: int, second: int) -> None:
+    """Merge two ADJACENT episodes (`second == first + 1`) into one.
+
+    Tasks are unioned (each frame keeps its own task_index); the second
+    episode's timestamps continue 1/fps after the first's.
+    """
+    ...
+
+def dataset_read_tags(root: str) -> dict[int, list[str]]:
+    """Read the caliper tags sidecar (`meta/caliper_tags.json`) → episode → tags.
+
+    Missing sidecar = `{}`. The file is a caliper extension lerobot ignores.
+    """
+    ...
+
+def dataset_write_tags(root: str, tags: dict[int, list[str]]) -> None:
+    """Write the caliper tags sidecar (episodes with empty tag lists omitted)."""
+    ...
+
 # --- Pure-Python interop exporters, re-exported from `caliper/interop.py` —
 # --- NOT from `lib.rs` (the "mirror lib.rs exactly" rule covers Rust only).
 

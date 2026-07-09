@@ -1,0 +1,55 @@
+<?xml version="1.0"?>
+<!-- Exercises the vendored minimal xacro subset: properties (incl. from an
+     include), arithmetic with pi, a macro with a default + a block param,
+     if/unless, and $(find ..). Must compile to the SAME model as
+     xacro_arm_expected.urdf (its hand-expanded plain-URDF twin). -->
+<robot name="xacro_arm" xmlns:xacro="http://www.ros.org/wiki/xacro">
+  <xacro:include filename="xacro_arm_common.xacro"/>
+  <xacro:property name="upper_len" value="0.3"/>
+  <xacro:property name="with_tool" value="true"/>
+
+  <link name="base"/>
+
+  <xacro:macro name="seg" params="name parent zoff len axis_y:=1 *shape">
+    <link name="${name}">
+      <visual>
+        <origin xyz="0 0 ${len/2}" rpy="0 0 0"/>
+        <geometry><xacro:insert_block name="shape"/></geometry>
+      </visual>
+    </link>
+    <joint name="${name}_j" type="revolute">
+      <origin xyz="0 0 ${zoff}" rpy="0 0 0"/>
+      <parent link="${parent}"/>
+      <child link="${name}"/>
+      <axis xyz="0 ${axis_y} 0"/>
+      <limit lower="${-pi/2}" upper="${pi/2}" effort="10" velocity="2"/>
+    </joint>
+  </xacro:macro>
+
+  <xacro:seg name="lower" parent="base" zoff="${base_h}" len="${lower_len}">
+    <cylinder radius="0.02" length="${lower_len}"/>
+  </xacro:seg>
+  <xacro:seg name="upper" parent="lower" zoff="${lower_len}" len="${upper_len}" axis_y="-1">
+    <box size="0.04 0.04 ${upper_len}"/>
+  </xacro:seg>
+
+  <xacro:if value="${with_tool}">
+    <link name="tool">
+      <visual>
+        <geometry><mesh filename="$(find demo_pkg)/meshes/part.stl"/></geometry>
+      </visual>
+    </link>
+    <joint name="tool_j" type="fixed">
+      <origin xyz="0 0 ${upper_len}" rpy="0 0 0"/>
+      <parent link="upper"/>
+      <child link="tool"/>
+    </joint>
+  </xacro:if>
+  <xacro:unless value="${with_tool}">
+    <link name="never_emitted"/>
+    <joint name="never_emitted_j" type="fixed">
+      <parent link="upper"/>
+      <child link="never_emitted"/>
+    </joint>
+  </xacro:unless>
+</robot>

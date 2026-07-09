@@ -1,0 +1,46 @@
+<?xml version="1.0"?>
+<!-- Hand-expanded plain-URDF twin of xacro_arm.xacro. The only intended
+     difference: the tool mesh uses package:// where the xacro used
+     $(find demo_pkg) — both must RESOLVE to the same absolute file. -->
+<robot name="xacro_arm">
+  <link name="base"/>
+
+  <link name="lower">
+    <visual>
+      <origin xyz="0 0 0.125" rpy="0 0 0"/>
+      <geometry><cylinder radius="0.02" length="0.25"/></geometry>
+    </visual>
+  </link>
+  <joint name="lower_j" type="revolute">
+    <origin xyz="0 0 0.1" rpy="0 0 0"/>
+    <parent link="base"/>
+    <child link="lower"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-1.5707963267948966" upper="1.5707963267948966" effort="10" velocity="2"/>
+  </joint>
+
+  <link name="upper">
+    <visual>
+      <origin xyz="0 0 0.15" rpy="0 0 0"/>
+      <geometry><box size="0.04 0.04 0.3"/></geometry>
+    </visual>
+  </link>
+  <joint name="upper_j" type="revolute">
+    <origin xyz="0 0 0.25" rpy="0 0 0"/>
+    <parent link="lower"/>
+    <child link="upper"/>
+    <axis xyz="0 -1 0"/>
+    <limit lower="-1.5707963267948966" upper="1.5707963267948966" effort="10" velocity="2"/>
+  </joint>
+
+  <link name="tool">
+    <visual>
+      <geometry><mesh filename="package://demo_pkg/meshes/part.stl"/></geometry>
+    </visual>
+  </link>
+  <joint name="tool_j" type="fixed">
+    <origin xyz="0 0 0.3" rpy="0 0 0"/>
+    <parent link="upper"/>
+    <child link="tool"/>
+  </joint>
+</robot>

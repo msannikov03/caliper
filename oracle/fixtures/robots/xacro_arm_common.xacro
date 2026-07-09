@@ -1,0 +1,6 @@
+<?xml version="1.0"?>
+<!-- Included by xacro_arm.xacro: shared dimension properties. -->
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro">
+  <xacro:property name="base_h" value="0.1"/>
+  <xacro:property name="lower_len" value="${base_h*2 + 0.05}"/>
+</robot>

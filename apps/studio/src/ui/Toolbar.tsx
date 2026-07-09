@@ -25,7 +25,7 @@ export async function openUrdf(): Promise<void> {
   const picked = await open({
     multiple: false,
     directory: false,
-    filters: [{ name: "URDF", extensions: ["urdf", "xml"] }],
+    filters: [{ name: "URDF / xacro", extensions: ["urdf", "xml", "xacro"] }],
   });
   if (typeof picked !== "string") return; // dialog cancelled
   await selectRobot(picked, true);

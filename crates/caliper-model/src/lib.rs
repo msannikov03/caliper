@@ -1,4 +1,5 @@
-//! Robot model: parse URDF, compile to a frozen struct-of-arrays kinematic model.
+//! Robot model: parse URDF (or a minimal-xacro `.xacro`, expanded in-process —
+//! see [`xacro`]), compile to a frozen struct-of-arrays kinematic model.
 //!
 //! The editable URDF tree is compiled once into a [`Model`]: movable joints in
 //! topological order (parent index < own index), fixed joints folded away, and
@@ -11,6 +12,7 @@ use std::path::{Path, PathBuf};
 
 pub mod hull;
 pub mod stl;
+pub mod xacro;
 
 /// Movable joint type (Phase 1). `Fixed` joints are folded out at compile time;
 /// `Continuous` is treated as `Revolute` without limits.
@@ -46,6 +48,8 @@ pub enum CompileError {
     MimicOfMimic { joint: String, src_joint: String },
     #[error("mimic on joint `{0}` is only supported for revolute/continuous/prismatic joints")]
     MimicUnsupportedJoint(String),
+    #[error("xacro: {0}")]
+    Xacro(#[from] xacro::XacroError),
 }
 
 /// A URDF `<mimic>` constraint on a movable joint: `q_this = multiplier * q[source] + offset`.
@@ -228,6 +232,10 @@ pub struct Model {
 }
 
 impl Model {
+    /// Load from a `.urdf` file — or a xacro one (a `.xacro` extension, or a
+    /// root `<robot xmlns:xacro=..>`), which is first expanded in-process by
+    /// the vendored minimal expander (see [`xacro`] for the exact supported
+    /// subset; unsupported constructs fail loudly as [`CompileError::Xacro`]).
     pub fn from_urdf(path: &Path) -> Result<Self, CompileError> {
         compile(&RobotTree::from_urdf(path)?)
     }
@@ -373,9 +381,21 @@ struct RobotTree {
 
 impl RobotTree {
     fn from_urdf(path: &Path) -> Result<Self, CompileError> {
-        let u = urdf_rs::read_file(path).map_err(|e| CompileError::Parse(e.to_string()))?;
-        // Mesh `<collision filename=...>` is resolved relative to the URDF's directory.
+        let text = std::fs::read_to_string(path).map_err(|e| CompileError::Parse(e.to_string()))?;
+        // A xacro file (`.xacro` extension or root xmlns:xacro) is expanded to
+        // plain URDF first; anything else goes to urdf-rs verbatim (identical
+        // to the previous `read_file` path, which was read_to_string + parse).
         let base_dir = path.parent();
+        let text = if xacro::is_xacro(path, &text) {
+            xacro::expand(&text, base_dir)?
+        } else {
+            text
+        };
+        let u = urdf_rs::read_from_string(&text).map_err(|e| CompileError::Parse(e.to_string()))?;
+        // Mesh `<collision filename=...>` is resolved relative to the URDF's
+        // directory. One hull cache per load: repeated identical meshes (real
+        // robots reuse one servo STL across many links) are hulled once.
+        let mut hulls = HullCache::default();
         let mut t = RobotTree {
             name: u.name.clone(),
             ..Default::default()
@@ -384,7 +404,7 @@ impl RobotTree {
             t.link_index.insert(l.name.clone(), t.links.len());
             t.links.push(l.name.clone());
             t.link_inertia.push(parse_inertial(&l.inertial));
-            let (geoms, dropped) = parse_collisions(l, base_dir);
+            let (geoms, dropped) = parse_collisions(l, base_dir, &mut hulls);
             t.link_collision.push(geoms);
             t.link_dropped.push(dropped);
             t.link_visual.push(parse_visuals(l, &u.materials, base_dir));
@@ -490,6 +510,7 @@ fn parse_inertial(inr: &urdf_rs::Inertial) -> Option<SpatialInertia> {
 fn parse_collisions(
     link: &urdf_rs::Link,
     base_dir: Option<&Path>,
+    cache: &mut HullCache,
 ) -> (Vec<(Se3, CollisionShape)>, bool) {
     let mut out = Vec::new();
     let mut dropped = false;
@@ -512,7 +533,7 @@ fn parse_collisions(
                 length: *length,
             },
             urdf_rs::Geometry::Mesh { filename, scale } => {
-                match load_mesh_hull(filename, scale.as_ref(), base_dir) {
+                match load_mesh_hull(filename, scale.as_ref(), base_dir, cache) {
                     Some(points) => CollisionShape::ConvexHull { points },
                     None => {
                         dropped = true; // unloadable mesh → keep DROPPED (safe)
@@ -597,10 +618,10 @@ fn resolve_visual_color(
 /// - `file://` prefix is stripped first;
 /// - a plain relative path: `urdf_dir/<raw>` if it exists;
 /// - an absolute path: itself, if it exists;
-/// - `package://<pkg>/<rest>`: `urdf_dir/<rest>`; then for `urdf_dir` and each
-///   of its ancestors `A` up to 6 levels: `A/<pkg>/<rest>` and `A/<rest>`; then
-///   for each root `R` in `CALIPER_PACKAGE_PATH` (colon-separated):
-///   `R/<pkg>/<rest>` and `R/<rest>`. First existing file wins.
+/// - `package://<pkg>/<rest>`: `urdf_dir/<rest>`; then for every search root
+///   `A` from [`package_search_dirs`] (the urdf dir + up to 6 ancestor levels,
+///   then each `CALIPER_PACKAGE_PATH` root): `A/<pkg>/<rest>` and `A/<rest>`.
+///   First existing file wins.
 pub(crate) fn resolve_mesh_path(raw: &str, urdf_dir: Option<&Path>) -> Option<PathBuf> {
     let name = raw.strip_prefix("file://").unwrap_or(raw);
     if let Some(pkg_rest) = name.strip_prefix("package://") {
@@ -611,17 +632,10 @@ pub(crate) fn resolve_mesh_path(raw: &str, urdf_dir: Option<&Path>) -> Option<Pa
         let mut candidates: Vec<PathBuf> = Vec::new();
         if let Some(dir) = urdf_dir {
             candidates.push(dir.join(rest));
-            // ancestors() yields `dir` itself first, then up to 6 parent levels.
-            for a in dir.ancestors().take(7) {
-                candidates.push(a.join(pkg).join(rest));
-                candidates.push(a.join(rest));
-            }
         }
-        if let Ok(roots) = std::env::var("CALIPER_PACKAGE_PATH") {
-            for r in roots.split(':').filter(|s| !s.is_empty()) {
-                candidates.push(Path::new(r).join(pkg).join(rest));
-                candidates.push(Path::new(r).join(rest));
-            }
+        for a in package_search_dirs(urdf_dir) {
+            candidates.push(a.join(pkg).join(rest));
+            candidates.push(a.join(rest));
         }
         return candidates.into_iter().find(|c| c.is_file()).map(absolutize);
     }
@@ -634,18 +648,83 @@ pub(crate) fn resolve_mesh_path(raw: &str, urdf_dir: Option<&Path>) -> Option<Pa
     cand.is_file().then(|| absolutize(cand))
 }
 
+/// The `package://` / `$(find ..)` search roots, in resolution order: the URDF
+/// dir's ancestors (itself first, then up to 6 parent levels), then every root
+/// in `CALIPER_PACKAGE_PATH` (colon-separated). The ONE list shared by
+/// [`resolve_mesh_path`] and the xacro expander's `$(find <pkg>)`, so both
+/// resolve packages identically.
+pub(crate) fn package_search_dirs(urdf_dir: Option<&Path>) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Some(dir) = urdf_dir {
+        // ancestors() yields `dir` itself first, then up to 6 parent levels.
+        dirs.extend(dir.ancestors().take(7).map(Path::to_path_buf));
+    }
+    if let Ok(roots) = std::env::var("CALIPER_PACKAGE_PATH") {
+        dirs.extend(
+            roots
+                .split(':')
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from),
+        );
+    }
+    dirs
+}
+
 /// Best-effort absolute form of an existing path (canonicalize, falling back to
 /// the path itself — it was just checked to exist, so this normally succeeds).
-fn absolutize(p: PathBuf) -> PathBuf {
+pub(crate) fn absolutize(p: PathBuf) -> PathBuf {
     std::fs::canonicalize(&p).unwrap_or(p)
 }
 
+/// Per-load cache of collision-mesh hull results, keyed by the RAW `<mesh
+/// filename>` attribute + scale bits (one load has ONE base dir, so an equal
+/// raw string resolves identically every time). Real descriptions reuse a
+/// single mesh across many links — so101 carries the sts3215 servo STL on 5
+/// links — and each unique `(filename, scale)` now pays the resolve + read +
+/// STL parse + convex hull exactly once per `Model::from_urdf`. `None`
+/// (unloadable) results are cached too, so a repeated bad mesh is not
+/// re-searched. Purely an intra-load memoization: outputs are bit-identical
+/// to the uncached path.
+/// Cache key: raw mesh filename + per-axis scale bits (scale participates so
+/// a rescaled reuse of the same file is a distinct entry).
+type HullKey = (String, [u64; 3]);
+/// Cached outcome: the hull point set, or `None` for an unloadable mesh.
+type HullEntry = Option<Vec<Point3<f64>>>;
+
+#[derive(Default)]
+struct HullCache {
+    map: HashMap<HullKey, HullEntry>,
+    /// Uncached (expensive) runs — read in tests to prove hits happen.
+    #[cfg_attr(not(test), allow(dead_code))]
+    misses: usize,
+}
+
 /// Resolve a `<mesh>` filename, load its STL, apply the URDF per-axis `scale`,
-/// and reduce to a convex hull of vertices. `None` on any failure (the caller
-/// then keeps the mesh dropped). Resolution goes through [`resolve_mesh_path`]
-/// — the SAME resolver visuals use — so relative/absolute/`file://` AND
-/// `package://` (urdf-dir ancestor search + `CALIPER_PACKAGE_PATH`) all work.
+/// and reduce to a convex hull of vertices — memoized through `cache` (see
+/// [`HullCache`]). `None` on any failure (the caller then keeps the mesh
+/// dropped).
 fn load_mesh_hull(
+    filename: &str,
+    scale: Option<&urdf_rs::Vec3>,
+    base_dir: Option<&Path>,
+    cache: &mut HullCache,
+) -> Option<Vec<Point3<f64>>> {
+    let scale_bits = scale.map(|s| s.0).unwrap_or([1.0; 3]).map(f64::to_bits);
+    let key = (filename.to_string(), scale_bits);
+    if let Some(hit) = cache.map.get(&key) {
+        return hit.clone();
+    }
+    cache.misses += 1;
+    let hull = load_mesh_hull_uncached(filename, scale, base_dir);
+    cache.map.insert(key, hull.clone());
+    hull
+}
+
+/// The uncached body of [`load_mesh_hull`]. Resolution goes through
+/// [`resolve_mesh_path`] — the SAME resolver visuals use — so
+/// relative/absolute/`file://` AND `package://` (urdf-dir ancestor search +
+/// `CALIPER_PACKAGE_PATH`) all work.
+fn load_mesh_hull_uncached(
     filename: &str,
     scale: Option<&urdf_rs::Vec3>,
     base_dir: Option<&Path>,
@@ -1471,5 +1550,174 @@ mod tests {
         assert_eq!(m.visuals.len(), 7);
         assert!(m.visuals.iter().all(|v| v.color.is_none()));
         assert!(m.visuals.iter().all(|v| v.frame < m.frames.len()));
+    }
+
+    // ===== xacro expansion =====
+
+    fn assert_se3_close(a: &Se3, b: &Se3, what: &str) {
+        let d = a.0.inverse() * b.0;
+        assert!(
+            d.translation.vector.norm() < 1e-9 && d.rotation.angle() < 1e-9,
+            "{what}: {a:?} vs {b:?}"
+        );
+    }
+
+    /// The xacro fixture (properties, include, macro/block param, if/unless,
+    /// and `$(find ..)`) and its hand-expanded URDF twin must compile to the
+    /// SAME model. Every array FK consumes (topology, joint placements, axes,
+    /// frame offsets) is compared, so equality here ⇒ identical FK for every
+    /// frame at every q.
+    #[test]
+    fn xacro_fixture_matches_plain_urdf_twin() {
+        let x = load("xacro_arm.xacro");
+        let u = load("xacro_arm_expected.urdf");
+        assert_eq!(x.name, u.name);
+        assert_eq!(x.ndof, u.ndof);
+        assert_eq!(x.joint_names, u.joint_names);
+        assert_eq!(x.kind, u.kind);
+        assert_eq!(x.parent, u.parent);
+        for i in 0..x.ndof {
+            assert_se3_close(
+                &x.parent_to_joint[i],
+                &u.parent_to_joint[i],
+                &x.joint_names[i],
+            );
+            assert!((x.axis[i] - u.axis[i]).norm() < 1e-12, "axis {i}");
+            match (x.limits[i], u.limits[i]) {
+                (Some((a, b)), Some((c, d))) => {
+                    assert!((a - c).abs() < 1e-12 && (b - d).abs() < 1e-12, "limits {i}");
+                }
+                (a, b) => assert_eq!(a, b, "limits {i}"),
+            }
+            assert_eq!(x.vel_limit[i], u.vel_limit[i]);
+            assert_eq!(x.effort_limit[i], u.effort_limit[i]);
+        }
+        // frames line up too (incl. the fixed-folded tool; the <xacro:unless>
+        // arm must NOT have emitted its never_emitted link)
+        assert_eq!(x.frames.len(), u.frames.len());
+        assert!(x.frame_id("never_emitted").is_none());
+        for (fx, fu) in x.frames.iter().zip(&u.frames) {
+            assert_eq!(fx.name, fu.name);
+            assert_eq!(fx.anchor, fu.anchor);
+            assert_se3_close(&fx.offset, &fu.offset, &fx.name);
+        }
+        // visuals: same count; the $(find demo_pkg) mesh resolved to the SAME
+        // absolute file as the twin's package:// form
+        assert_eq!(x.visuals.len(), u.visuals.len());
+        let (xt, ut) = (visuals_on(&x, "tool"), visuals_on(&u, "tool"));
+        match (&xt[0].shape, &ut[0].shape) {
+            (
+                VisualShape::Mesh { path: Some(p1), .. },
+                VisualShape::Mesh { path: Some(p2), .. },
+            ) => assert_eq!(p1, p2, "$(find ..) and package:// must agree"),
+            other => panic!("expected two resolved meshes, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn xacro_detected_by_root_xmlns_in_a_urdf_file() {
+        // no .xacro extension — the root xmlns:xacro alone must trigger expansion
+        let m = compile_str(
+            "xacroroot",
+            r#"<robot name="x" xmlns:xacro="http://www.ros.org/wiki/xacro">
+                 <xacro:property name="l" value="0.2"/>
+                 <link name="a"/><link name="b"/>
+                 <joint name="j" type="revolute">
+                   <origin xyz="0 0 ${l}"/><parent link="a"/><child link="b"/><axis xyz="0 0 1"/>
+                   <limit lower="-1" upper="1" effort="1" velocity="1"/>
+                 </joint>
+               </robot>"#,
+        )
+        .unwrap();
+        assert_eq!(m.ndof, 1);
+        assert!((m.parent_to_joint[0].translation()[2] - 0.2).abs() < 1e-15);
+    }
+
+    #[test]
+    fn unsupported_xacro_construct_is_a_clear_compile_error() {
+        let err = compile_str(
+            "xacroarg",
+            r#"<robot name="x" xmlns:xacro="http://www.ros.org/wiki/xacro">
+                 <link name="a"/>
+                 <xacro:arg name="v" default="1"/>
+               </robot>"#,
+        )
+        .unwrap_err();
+        assert!(matches!(err, CompileError::Xacro(_)), "got {err:?}");
+        assert!(
+            err.to_string().contains("xacro:arg"),
+            "the error must NAME the construct: {err}"
+        );
+    }
+
+    // ===== per-load mesh-hull cache =====
+
+    #[test]
+    fn repeated_mesh_hulls_hit_the_cache() {
+        let urdf = r#"<robot name="r">
+            <link name="a">
+              <collision><geometry><mesh filename="unit_cube.stl"/></geometry></collision>
+              <collision><geometry><mesh filename="unit_cube.stl"/></geometry></collision>
+            </link>
+            <link name="b">
+              <collision><geometry><mesh filename="unit_cube.stl" scale="2 2 2"/></geometry></collision>
+            </link>
+          </robot>"#;
+        let u = urdf_rs::read_from_string(urdf).unwrap();
+        let dir = fixture("");
+        let dir = Path::new(&dir);
+        let mut cache = HullCache::default();
+        let (ga, _) = parse_collisions(&u.links[0], Some(dir), &mut cache);
+        assert_eq!(ga.len(), 2, "both colliders parsed");
+        assert_eq!(ga[0].1, ga[1].1, "cached hull identical to the fresh one");
+        assert_eq!(
+            cache.misses, 1,
+            "the second identical mesh must be a cache HIT (no re-parse/re-hull)"
+        );
+        let (gb, _) = parse_collisions(&u.links[1], Some(dir), &mut cache);
+        assert_eq!(cache.misses, 2, "a different scale is a different entry");
+        match &gb[0].1 {
+            CollisionShape::ConvexHull { points } => {
+                // scale 2 applied on the cache MISS path: corners at ±1.0
+                assert!(
+                    points
+                        .iter()
+                        .all(|p| p.coords.iter().all(|c| (c.abs() - 1.0).abs() < 1e-9))
+                );
+            }
+            other => panic!("expected ConvexHull, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn repeated_mesh_urdf_loads_every_collider() {
+        // The same mesh on three links → three identical hulls out of one load:
+        // the cache is an invisible memoization, never a behavior change.
+        let cube = fixture("unit_cube.stl");
+        let body: String = (1..=3)
+            .map(|i| {
+                format!(
+                    r#"<link name="l{i}"><collision><geometry><mesh filename="{cube}"/></geometry></collision></link>
+                       <joint name="f{i}" type="fixed"><parent link="base"/><child link="l{i}"/></joint>"#
+                )
+            })
+            .collect();
+        let m = compile_str(
+            "repmesh",
+            &format!(r#"<robot name="r"><link name="base"/>{body}</robot>"#),
+        )
+        .unwrap();
+        assert_eq!(m.collision.len(), 3);
+        let hulls: Vec<_> = m
+            .collision
+            .iter()
+            .map(|g| match &g.shape {
+                CollisionShape::ConvexHull { points } => points.clone(),
+                other => panic!("expected ConvexHull, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(hulls[0].len(), 8, "unit cube hull = 8 corners");
+        assert_eq!(hulls[0], hulls[1]);
+        assert_eq!(hulls[1], hulls[2]);
     }
 }

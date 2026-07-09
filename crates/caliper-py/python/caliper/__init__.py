@@ -21,6 +21,10 @@ from ._caliper import (
     validate_graph,
     version,
 )
+from .interop import (
+    export_lerobot_calibration,
+    export_robomimic_hdf5,
+)
 
 __all__ = [
     "Robot",
@@ -38,6 +42,8 @@ __all__ = [
     "log6",
     "exp6",
     "calibrate_joint_offsets",
+    "export_lerobot_calibration",
+    "export_robomimic_hdf5",
     "run_graph",
     "validate_graph",
     "version",

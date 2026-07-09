@@ -147,15 +147,17 @@ impl Robot {
     }
 
     /// Inverse kinematics. `target` is a 4×4 COLUMN-MAJOR homogeneous matrix
-    /// (outer Vec = 4 columns, each length 4; `target[col][row]`). NOTE fk()
-    /// returns ROW-MAJOR — to feed fk() into ik() you must transpose. Returns a
-    /// dict {success, q, residual, iters, restarts_used}. residual is the SE(3)
-    /// log6 norm (mixed linear+angular), not metres.
+    /// (outer Vec = 4 columns, each length 4; `target[col][row]`) or the flat
+    /// 16-element column-major equivalent — the ONE pose convention shared by
+    /// every pose-accepting method. NOTE fk() returns ROW-MAJOR — to feed fk()
+    /// into ik() you must transpose. Returns a dict {success, q, residual,
+    /// iters, restarts_used}. residual is the SE(3) log6 norm (mixed
+    /// linear+angular), not metres.
     #[pyo3(signature = (target, seed, frame=None))]
     fn ik(
         &self,
         py: Python<'_>,
-        target: Vec<Vec<f64>>,
+        target: PoseInput,
         seed: Vec<f64>,
         frame: Option<&str>,
     ) -> PyResult<Py<PyDict>> {
@@ -167,33 +169,9 @@ impl Robot {
                 model.ndof
             )));
         }
-        if target.len() != 4 || target.iter().any(|c| c.len() != 4) {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                "target must be a 4x4 column-major matrix (4 columns of length 4)",
-            ));
-        }
         finite_or_err("seed", &seed)?;
-        for col in &target {
-            finite_or_err("target", col)?;
-        }
+        let target_se3 = se3_from_pose("target", &target)?;
         let f = resolve_frame(model, frame)?;
-        // column-major: target[col][row]
-        let rot = Matrix3::new(
-            target[0][0],
-            target[1][0],
-            target[2][0],
-            target[0][1],
-            target[1][1],
-            target[2][1],
-            target[0][2],
-            target[1][2],
-            target[2][2],
-        );
-        let trans = Vector3::new(target[3][0], target[3][1], target[3][2]);
-        // from_matrix projects onto SO(3) (the caller-supplied basis may be slightly
-        // non-orthonormal), matching the Studio se3_from_col_major path.
-        let quat = UnitQuaternion::from_matrix(&rot);
-        let target_se3 = Se3::from_parts(trans, quat);
         let res = ik(model, f, &target_se3, &seed, &IkOpts::default());
         let d = PyDict::new(py);
         d.set_item("success", res.success)?;
@@ -205,8 +183,9 @@ impl Robot {
     }
 
     /// Closed-form (analytic) inverse kinematics for a canonical spherical-wrist
-    /// 6R arm. `target` is a 4×4 COLUMN-MAJOR homogeneous matrix (same convention
-    /// as `ik()`: `target[col][row]`; the rotation block is projected onto SO(3)).
+    /// 6R arm. `target` is a 4×4 COLUMN-MAJOR homogeneous matrix or flat-16
+    /// (same convention as `ik()`: `target[col][row]`; the rotation block is
+    /// projected onto SO(3)).
     /// `seed` (optional, length ndof) places the branch nearest the seed first.
     /// Returns `None` when the model is NOT a recognised spherical-wrist 6R (fall
     /// back to the numeric `ik()`); otherwise the list of branch configs (each
@@ -214,19 +193,12 @@ impl Robot {
     #[pyo3(signature = (target, seed=None, frame=None))]
     fn analytic_ik(
         &self,
-        target: Vec<Vec<f64>>,
+        target: PoseInput,
         seed: Option<Vec<f64>>,
         frame: Option<&str>,
     ) -> PyResult<Option<Vec<Vec<f64>>>> {
         let model = &self.inner.model;
-        if target.len() != 4 || target.iter().any(|c| c.len() != 4) {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                "target must be a 4x4 column-major matrix (4 columns of length 4)",
-            ));
-        }
-        for col in &target {
-            finite_or_err("target", col)?;
-        }
+        let target_se3 = se3_from_pose("target", &target)?;
         if let Some(s) = &seed {
             if s.len() != model.ndof {
                 return Err(pyo3::exceptions::PyValueError::new_err(format!(
@@ -238,22 +210,6 @@ impl Robot {
             finite_or_err("seed", s)?;
         }
         let f = resolve_frame(model, frame)?;
-        // column-major: target[col][row]
-        let rot = Matrix3::new(
-            target[0][0],
-            target[1][0],
-            target[2][0],
-            target[0][1],
-            target[1][1],
-            target[2][1],
-            target[0][2],
-            target[1][2],
-            target[2][2],
-        );
-        let trans = Vector3::new(target[3][0], target[3][1], target[3][2]);
-        // from_matrix projects onto SO(3), matching the ik()/Studio path.
-        let quat = UnitQuaternion::from_matrix(&rot);
-        let target_se3 = Se3::from_parts(trans, quat);
         Ok(caliper::ik::analytic_ik_6r(
             model,
             f,
@@ -366,13 +322,13 @@ impl Robot {
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
     }
 
-    /// Cartesian straight line (MOVE_L) from q_start to a 4×4 COLUMN-MAJOR target
-    /// (same convention as ik(): target[col][row]).
+    /// Cartesian straight line (MOVE_L) from q_start to a 4×4 COLUMN-MAJOR
+    /// target (same convention as ik(): target[col][row], or flat-16).
     #[pyo3(signature = (q_start, target, frame=None, limits=None))]
     fn move_l(
         &self,
         q_start: Vec<f64>,
-        target: Vec<Vec<f64>>,
+        target: PoseInput,
         frame: Option<&str>,
         limits: Option<MotionLimits>,
     ) -> PyResult<Trajectory> {
@@ -383,29 +339,9 @@ impl Robot {
                 model.ndof
             )));
         }
-        if target.len() != 4 || target.iter().any(|c| c.len() != 4) {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                "target must be 4x4 column-major",
-            ));
-        }
         finite_or_err("q_start", &q_start)?;
-        for col in &target {
-            finite_or_err("target", col)?;
-        }
+        let goal = se3_from_pose("target", &target)?;
         let f = resolve_frame(model, frame)?;
-        let rot = Matrix3::new(
-            target[0][0],
-            target[1][0],
-            target[2][0],
-            target[0][1],
-            target[1][1],
-            target[2][1],
-            target[0][2],
-            target[1][2],
-            target[2][2],
-        );
-        let trans = Vector3::new(target[3][0], target[3][1], target[3][2]);
-        let goal = Se3::from_parts(trans, UnitQuaternion::from_matrix(&rot));
         let lim = motion_limits(model, limits)?;
         let opts = CartesianMoveOpts::defaults(lim);
         move_l(model, f, &q_start, &goal, &opts)
@@ -415,15 +351,15 @@ impl Robot {
 
     /// Cartesian circular arc (MOVE_C) from q_start THROUGH the `via` point
     /// ([x, y, z], meters) to a 4×4 COLUMN-MAJOR end pose (same convention as
-    /// move_l()). The arc is the unique circle through the start/via/end tip
-    /// positions, swept the short way so it passes the via en route to the end;
-    /// orientation slerps start→end.
+    /// move_l(): target[col][row], or flat-16). The arc is the unique circle
+    /// through the start/via/end tip positions, swept the short way so it
+    /// passes the via en route to the end; orientation slerps start→end.
     #[pyo3(signature = (q_start, via, target, frame=None, limits=None))]
     fn move_c(
         &self,
         q_start: Vec<f64>,
         via: Vec<f64>,
-        target: Vec<Vec<f64>>,
+        target: PoseInput,
         frame: Option<&str>,
         limits: Option<MotionLimits>,
     ) -> PyResult<Trajectory> {
@@ -439,30 +375,10 @@ impl Robot {
                 "via must be [x, y, z]",
             ));
         }
-        if target.len() != 4 || target.iter().any(|c| c.len() != 4) {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                "target must be 4x4 column-major",
-            ));
-        }
         finite_or_err("q_start", &q_start)?;
         finite_or_err("via", &via)?;
-        for col in &target {
-            finite_or_err("target", col)?;
-        }
+        let goal = se3_from_pose("target", &target)?;
         let f = resolve_frame(model, frame)?;
-        let rot = Matrix3::new(
-            target[0][0],
-            target[1][0],
-            target[2][0],
-            target[0][1],
-            target[1][1],
-            target[2][1],
-            target[0][2],
-            target[1][2],
-            target[2][2],
-        );
-        let trans = Vector3::new(target[3][0], target[3][1], target[3][2]);
-        let goal = Se3::from_parts(trans, UnitQuaternion::from_matrix(&rot));
         let lim = motion_limits(model, limits)?;
         let opts = CartesianMoveOpts::defaults(lim);
         move_c(
@@ -912,6 +828,32 @@ fn resolve_frame(model: &caliper::model::Model, frame: Option<&str>) -> PyResult
     }
 }
 
+/// A frame argument at the FFI boundary: a frame NAME (the unified
+/// convention), or a raw frame index where an integer was already accepted
+/// pre-unification (`Planner.plan_to_pose`, `ReachChecker`) — back-compat.
+#[derive(FromPyObject)]
+enum FrameArg {
+    Index(usize),
+    Name(String),
+}
+
+/// Resolve an optional [`FrameArg`] to a frame index, defaulting to the tip.
+fn resolve_frame_arg(model: &caliper::model::Model, frame: Option<&FrameArg>) -> PyResult<usize> {
+    match frame {
+        None => Ok(model.tip_frame()),
+        Some(FrameArg::Name(name)) => resolve_frame(model, Some(name.as_str())),
+        Some(FrameArg::Index(i)) => {
+            if *i >= model.frames.len() {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "frame index {i} out of range ({} frames)",
+                    model.frames.len()
+                )));
+            }
+            Ok(*i)
+        }
+    }
+}
+
 /// Lowercase kind tag for the Python dict (idiomatic snake on the Python side).
 fn kind_str(k: SingularityKind) -> &'static str {
     match k {
@@ -948,7 +890,75 @@ fn world_scene(ground: Option<f64>, boxes: Option<Vec<([f64; 3], [f64; 3])>>) ->
     }
     s
 }
-/// 12 numbers (9 row-major rotation, then tx,ty,tz) → `Se3`.
+/// A Cartesian pose argument at the FFI boundary. Every pose-accepting entry
+/// point takes the SAME two forms: a 4×4 COLUMN-MAJOR nested list (outer =
+/// 4 columns, each length 4; `pose[col][row]` — the convention `ik()` always
+/// used) or its flat 16-element column-major equivalent.
+/// (`Planner.plan_to_pose` additionally grandfathers the legacy flat
+/// 12-element row-major form — see [`se3_from_pose_or_legacy12`].)
+#[derive(FromPyObject)]
+enum PoseInput {
+    /// 4×4 nested, column-major: `pose[col][row]`.
+    Nested(Vec<Vec<f64>>),
+    /// Flat column-major: 16 values (column 0 rows 0..4, column 1, …).
+    Flat(Vec<f64>),
+}
+
+/// The ONE pose extractor behind every pose-accepting method: [`PoseInput`]
+/// → `Se3`. The rotation block is projected onto SO(3) by `from_matrix` (the
+/// caller-supplied basis may be slightly non-orthonormal), matching the
+/// historical ik()/Studio se3_from_col_major path.
+fn se3_from_pose(label: &str, pose: &PoseInput) -> PyResult<Se3> {
+    let shape_err = || {
+        pyo3::exceptions::PyValueError::new_err(format!(
+            "{label} must be a 4x4 column-major matrix (4 columns of length 4) \
+             or a flat 16-element column-major list"
+        ))
+    };
+    // Normalize both forms to flat column-major, then read `at(col, row)`.
+    let flat: Vec<f64> = match pose {
+        PoseInput::Nested(cols) => {
+            if cols.len() != 4 || cols.iter().any(|c| c.len() != 4) {
+                return Err(shape_err());
+            }
+            cols.iter().flatten().copied().collect()
+        }
+        PoseInput::Flat(v) => {
+            if v.len() != 16 {
+                return Err(shape_err());
+            }
+            v.clone()
+        }
+    };
+    finite_or_err(label, &flat)?;
+    let at = |col: usize, row: usize| flat[4 * col + row];
+    let rot = Matrix3::new(
+        at(0, 0),
+        at(1, 0),
+        at(2, 0),
+        at(0, 1),
+        at(1, 1),
+        at(2, 1),
+        at(0, 2),
+        at(1, 2),
+        at(2, 2),
+    );
+    let trans = Vector3::new(at(3, 0), at(3, 1), at(3, 2));
+    Ok(Se3::from_parts(trans, UnitQuaternion::from_matrix(&rot)))
+}
+
+/// `Planner.plan_to_pose`'s pose extractor: the unified forms of
+/// [`se3_from_pose`], plus the LEGACY pre-unification flat 12-element
+/// ROW-MAJOR form (kept for back-compat; new code should pass column-major).
+fn se3_from_pose_or_legacy12(label: &str, pose: &PoseInput) -> PyResult<Se3> {
+    match pose {
+        PoseInput::Flat(v) if v.len() == 12 => se3_from_12(v),
+        _ => se3_from_pose(label, pose),
+    }
+}
+
+/// LEGACY: 12 numbers (9 row-major rotation, then tx,ty,tz) → `Se3`. Only
+/// `plan_to_pose` still accepts this form (via [`se3_from_pose_or_legacy12`]).
 fn se3_from_12(t: &[f64]) -> PyResult<Se3> {
     if t.len() != 12 || !t.iter().all(|x| x.is_finite()) {
         return Err(pyo3::exceptions::PyValueError::new_err(
@@ -1637,17 +1647,21 @@ impl Planner {
             .plan_prm(&start, &goal, samples, k)
             .map_err(plan_err)
     }
-    /// Plan to a Cartesian goal pose (12 numbers); `frame` index defaults to tip.
+    /// Plan to a Cartesian goal pose — a 4×4 COLUMN-MAJOR matrix (nested
+    /// `target[col][row]` or flat-16, the same convention as `Robot.ik()`).
+    /// The LEGACY flat 12-element row-major form (9 R then tx,ty,tz) is still
+    /// accepted for back-compat. `frame` is a frame name (or a raw index,
+    /// back-compat), defaulting to the tip.
     #[pyo3(signature = (start, target, frame=None))]
     fn plan_to_pose(
         &self,
         start: Vec<f64>,
-        target: Vec<f64>,
-        frame: Option<usize>,
+        target: PoseInput,
+        frame: Option<FrameArg>,
     ) -> PyResult<Vec<Vec<f64>>> {
         finite_or_err("start", &start)?;
-        let se3 = se3_from_12(&target)?;
-        let f = frame.unwrap_or_else(|| self.model.tip_frame());
+        let se3 = se3_from_pose_or_legacy12("target", &target)?;
+        let f = resolve_frame_arg(&self.model, frame.as_ref())?;
         self.inner
             .plan_to_pose(&start, &se3, f, &start)
             .map_err(plan_err)
@@ -1707,15 +1721,20 @@ struct ReachChecker {
 
 #[pymethods]
 impl ReachChecker {
+    /// `frame` is a frame name (or a raw index, back-compat); default = tip.
     #[new]
     #[pyo3(signature = (robot, ground=None, boxes=None, frame=None, seeds=8))]
     fn new(
         robot: &Robot,
         ground: Option<f64>,
         boxes: Option<Vec<([f64; 3], [f64; 3])>>,
-        frame: Option<usize>,
+        frame: Option<FrameArg>,
         seeds: usize,
     ) -> PyResult<Self> {
+        let frame = match &frame {
+            None => None,
+            Some(arg) => Some(resolve_frame_arg(&robot.inner.model, Some(arg))?),
+        };
         let model = Arc::new(robot.inner.model.clone());
         let scene = world_scene(ground, boxes);
         let cfg = ReachConfig {
@@ -1727,10 +1746,11 @@ impl ReachChecker {
             inner: EngineReach::new(model, scene, cfg),
         })
     }
-    /// Reachability of a Cartesian pose (12 numbers) →
+    /// Reachability of a Cartesian pose — a 4×4 COLUMN-MAJOR matrix (nested
+    /// `target[col][row]` or flat-16, the same convention as `Robot.ik()`) →
     /// dict(status: "reachable"|"blocked"|"unreachable", residual, q).
-    fn status(&self, py: Python<'_>, target: Vec<f64>) -> PyResult<Py<PyDict>> {
-        let se3 = se3_from_12(&target)?;
+    fn status(&self, py: Python<'_>, target: PoseInput) -> PyResult<Py<PyDict>> {
+        let se3 = se3_from_pose("target", &target)?;
         let v = self.inner.status(&se3);
         let d = PyDict::new(py);
         d.set_item(
@@ -1748,8 +1768,9 @@ impl ReachChecker {
         }
         Ok(d.into())
     }
-    fn reachable(&self, target: Vec<f64>) -> PyResult<bool> {
-        Ok(self.inner.reachable(&se3_from_12(&target)?))
+    /// True iff the pose (same convention as `status()`) is reachable.
+    fn reachable(&self, target: PoseInput) -> PyResult<bool> {
+        Ok(self.inner.reachable(&se3_from_pose("target", &target)?))
     }
 }
 
@@ -1919,8 +1940,8 @@ fn exp6(twist: Vec<f64>) -> PyResult<Vec<Vec<f64>>> {
 /// observation, by damped Gauss–Newton. `observations` is a list of
 /// `(q, pose)` pairs, where `q` is a length-ndof configuration and `pose` is a
 /// 4×4 COLUMN-MAJOR homogeneous matrix (same convention as `Robot.ik()`:
-/// `pose[col][row]`; rotation projected onto SO(3)). `frame` is the measured
-/// frame name (default = tip frame). Returns a dict
+/// `pose[col][row]`, or flat-16; rotation projected onto SO(3)). `frame` is
+/// the measured frame name (default = tip frame). Returns a dict
 /// `{offsets, rms_residual, iters, converged}`.
 #[pyfunction]
 #[pyo3(signature = (robot, observations, frame=None, max_iters=50, lambda=1e-9, tol_step=1e-12, tol_residual=1e-12))]
@@ -1928,7 +1949,7 @@ fn exp6(twist: Vec<f64>) -> PyResult<Vec<Vec<f64>>> {
 fn calibrate_joint_offsets(
     py: Python<'_>,
     robot: &Robot,
-    observations: Vec<(Vec<f64>, Vec<Vec<f64>>)>,
+    observations: Vec<(Vec<f64>, PoseInput)>,
     frame: Option<&str>,
     max_iters: usize,
     lambda: f64,
@@ -1940,21 +1961,7 @@ fn calibrate_joint_offsets(
     let mut obs: Vec<(Vec<f64>, Se3)> = Vec::with_capacity(observations.len());
     for (i, (q, pose)) in observations.into_iter().enumerate() {
         finite_or_err("observation q", &q)?;
-        if pose.len() != 4 || pose.iter().any(|c| c.len() != 4) {
-            return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "observation {i}: pose must be a 4x4 column-major matrix (4 columns of length 4)"
-            )));
-        }
-        for col in &pose {
-            finite_or_err("observation pose", col)?;
-        }
-        // column-major: pose[col][row]
-        let rot = Matrix3::new(
-            pose[0][0], pose[1][0], pose[2][0], pose[0][1], pose[1][1], pose[2][1], pose[0][2],
-            pose[1][2], pose[2][2],
-        );
-        let trans = Vector3::new(pose[3][0], pose[3][1], pose[3][2]);
-        let se3 = Se3::from_parts(trans, UnitQuaternion::from_matrix(&rot));
+        let se3 = se3_from_pose(&format!("observation {i} pose"), &pose)?;
         obs.push((q, se3));
     }
     let opts = caliper::calib::CalibOptions {

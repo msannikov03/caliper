@@ -79,10 +79,17 @@ def test_plan_to_pose_via_pinocchio_target():
     pin = pytest.importorskip("pinocchio", reason="pinocchio not installed")
     q = [0.3, -0.3, 0.3]
     target = _pin_fk_target(pin, "collide_arm", q, "l3")
+    # UNIFIED form: 4x4 column-major nested pose + frame NAME (same convention
+    # as Robot.ik / move_l).
     p = caliper.Planner(_arm(), seed=0xCA11)
-    path = p.plan_to_pose([0.0, 0.0, 0.0], target)
+    path = p.plan_to_pose([0.0, 0.0, 0.0], _col_major(target), frame="l3")
     assert len(path) >= 2
     assert p.verify(path), "planned path to the pose must be collision-free"
+    # BACK-COMPAT regression: the legacy flat-12 row-major form (9 R then t)
+    # must still be accepted and, same seed, plan the identical path.
+    p_legacy = caliper.Planner(_arm(), seed=0xCA11)
+    legacy = p_legacy.plan_to_pose([0.0, 0.0, 0.0], target)
+    assert legacy == path, "legacy flat-12 form must plan the identical path"
 
 
 def test_plan_trajectory_endpoints():
@@ -100,21 +107,38 @@ def test_plan_trajectory_endpoints():
 
 def test_reach_unreachable_far():
     rc = caliper.ReachChecker(_arm())
-    v = rc.status([1, 0, 0, 0, 1, 0, 0, 0, 1, 10.0, 0.0, 0.0])
+    pose = _col_major([1, 0, 0, 0, 1, 0, 0, 0, 1, 10.0, 0.0, 0.0])
+    v = rc.status(pose)
     assert v["status"] == "unreachable"
+    # flat-16 column-major is the same unified convention
+    flat16 = [x for col in pose for x in col]
+    assert rc.reachable(flat16) is False
 
 
 def test_reach_reachable_then_blocked():
     pin = pytest.importorskip("pinocchio", reason="pinocchio not installed")
     q = [0.3, -0.3, 0.3]
     target = _pin_fk_target(pin, "collide_arm", q, "l3")
-    # free space → reachable
-    assert caliper.ReachChecker(_arm()).status(target)["status"] == "reachable"
+    pose = _col_major(target)
+    # free space → reachable (frame passed by NAME — the unified convention)
+    assert caliper.ReachChecker(_arm(), frame="l3").status(pose)["status"] == "reachable"
     # a big box enveloping that pose → every IK solution collides → blocked
     c = target[9:12]
     boxes = [((c[0], c[1], c[2]), (1.0, 1.0, 1.0))]
-    v = caliper.ReachChecker(_arm(), boxes=boxes).status(target)
+    v = caliper.ReachChecker(_arm(), boxes=boxes).status(pose)
     assert v["status"] == "blocked", v
+
+
+def _col_major(t12):
+    """Flat-12 (9 row-major R, then tx,ty,tz) → the UNIFIED pose form: a 4x4
+    COLUMN-MAJOR nested matrix (`pose[col][row]`, as Robot.ik always took)."""
+    r, t = t12[:9], t12[9:]
+    return [
+        [r[0], r[3], r[6], 0.0],
+        [r[1], r[4], r[7], 0.0],
+        [r[2], r[5], r[8], 0.0],
+        [t[0], t[1], t[2], 1.0],
+    ]
 
 
 def _pin_fk_target(pin, name, q, frame):

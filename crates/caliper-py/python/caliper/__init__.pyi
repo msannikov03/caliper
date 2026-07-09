@@ -6,13 +6,19 @@ signature and return type. Do not add methods that are not in `lib.rs`.
 
 Conventions carried over from the Rust side:
   * FK poses are returned as 4x4 ROW-MAJOR homogeneous matrices.
-  * `ik()` / `analytic_ik()` / `move_l()` / `calibrate_joint_offsets()` take
-    4x4 COLUMN-MAJOR targets (`target[col][row]`).
-  * `Planner.plan_to_pose()` / `ReachChecker` targets are 12 flat numbers
-    (9 row-major rotation, then tx, ty, tz).
+  * EVERY pose-accepting method (`ik()` / `analytic_ik()` / `move_l()` /
+    `move_c()` / `Planner.plan_to_pose()` / `ReachChecker.status()` /
+    `reachable()` / `calibrate_joint_offsets()`) takes the SAME `_Pose`:
+    a 4x4 COLUMN-MAJOR nested matrix (`pose[col][row]`) or its flat
+    16-element column-major equivalent.
+  * `Planner.plan_to_pose()` additionally grandfathers the LEGACY flat
+    12-element row-major form (9 row-major R, then tx, ty, tz).
+  * Frame arguments take a frame NAME; `Planner.plan_to_pose()` and
+    `ReachChecker` also still accept a raw frame index (back-compat).
 """
 
-from typing import Any, Callable, Optional, Sequence
+import os
+from typing import Any, Callable, Optional, Sequence, Union
 
 __version__: str
 
@@ -22,6 +28,11 @@ _Vec = Sequence[float]
 _Vec3 = Sequence[float]
 # World-scene axis-aligned boxes: (center, half_extents) pairs.
 _Boxes = Sequence[tuple[_Vec3, _Vec3]]
+# A Cartesian pose: 4x4 COLUMN-MAJOR nested (`pose[col][row]`) or flat-16
+# column-major — the ONE convention shared by every pose-accepting method.
+_Pose = Union[Sequence[Sequence[float]], Sequence[float]]
+# A frame argument: a NAME (unified), or a raw index where back-compat allows.
+_Frame = Union[str, int]
 
 def version() -> str:
     """Engine version string."""
@@ -53,7 +64,7 @@ def exp6(twist: _Vec) -> list[list[float]]:
 
 def calibrate_joint_offsets(
     robot: "Robot",
-    observations: Sequence[tuple[_Vec, Sequence[Sequence[float]]]],
+    observations: Sequence[tuple[_Vec, _Pose]],
     frame: Optional[str] = ...,
     max_iters: int = ...,
     lambda_: float = ...,  # exposed to Python as the positional arg `lambda`
@@ -63,8 +74,39 @@ def calibrate_joint_offsets(
     """Estimate per-joint zero offsets so that `FK(q_k + delta) ~= T_k`.
 
     `observations` is a list of `(q, pose)` pairs; `pose` is a 4x4
-    COLUMN-MAJOR homogeneous matrix (`pose[col][row]`). Returns
+    COLUMN-MAJOR homogeneous matrix (`pose[col][row]`, or flat-16). Returns
     `{offsets, rms_residual, iters, converged}`.
+    """
+    ...
+
+# --- Pure-Python interop exporters, re-exported from `caliper/interop.py` —
+# --- NOT from `lib.rs` (the "mirror lib.rs exactly" rule covers Rust only).
+
+def export_lerobot_calibration(
+    offsets: Sequence[float],
+    motor_names: Sequence[str],
+    path: Optional[Union[str, os.PathLike[str]]] = ...,
+    *,
+    resolution: int = ...,
+    bus: str = ...,
+) -> dict[str, dict[str, int]]:
+    """caliper-calib joint offsets → lerobot's per-robot-id calibration JSON.
+
+    Returns `{motor_name: {id, drive_mode, homing_offset, range_min,
+    range_max}}` (lerobot `MotorCalibration` fields, all ints); also written
+    to `path` as indent-4 JSON when given.
+    """
+    ...
+
+def export_robomimic_hdf5(
+    dataset_root: Union[str, os.PathLike[str]],
+    out_path: Union[str, os.PathLike[str]],
+) -> dict[str, Any]:
+    """Caliper-recorded LeRobotDataset v2.1 root → robomimic HDF5.
+
+    Writes `data/demo_N/{obs/...,actions,rewards,dones}` + `total`/`env_args`
+    attrs. Needs `h5py` (not a caliper dependency). Returns
+    `{out_path, demos, total}`.
     """
     ...
 
@@ -114,11 +156,11 @@ class Robot:
 
     def ik(
         self,
-        target: Sequence[Sequence[float]],
+        target: _Pose,
         seed: _Vec,
         frame: Optional[str] = ...,
     ) -> dict[str, Any]:
-        """Numeric IK against a 4x4 COLUMN-MAJOR target.
+        """Numeric IK against a 4x4 COLUMN-MAJOR target (nested or flat-16).
 
         Returns `{success, q, residual, iters, restarts_used}`.
         """
@@ -126,7 +168,7 @@ class Robot:
 
     def analytic_ik(
         self,
-        target: Sequence[Sequence[float]],
+        target: _Pose,
         seed: Optional[_Vec] = ...,
         frame: Optional[str] = ...,
     ) -> Optional[list[list[float]]]:
@@ -169,24 +211,25 @@ class Robot:
     def move_l(
         self,
         q_start: _Vec,
-        target: Sequence[Sequence[float]],
+        target: _Pose,
         frame: Optional[str] = ...,
         limits: Optional["MotionLimits"] = ...,
     ) -> "Trajectory":
-        """Cartesian straight line (MOVE_L) to a 4x4 COLUMN-MAJOR target."""
+        """Cartesian straight line (MOVE_L) to a 4x4 COLUMN-MAJOR target
+        (nested or flat-16)."""
         ...
 
     def move_c(
         self,
         q_start: _Vec,
         via: _Vec,
-        target: Sequence[Sequence[float]],
+        target: _Pose,
         frame: Optional[str] = ...,
         limits: Optional["MotionLimits"] = ...,
     ) -> "Trajectory":
         """Cartesian circular arc (MOVE_C) THROUGH `via` ([x, y, z], meters)
-        to a 4x4 COLUMN-MAJOR end pose; the short sweep passes the via en
-        route to the end."""
+        to a 4x4 COLUMN-MAJOR end pose (nested or flat-16); the short sweep
+        passes the via en route to the end."""
         ...
 
     def retime_time_optimal(
@@ -532,9 +575,15 @@ class Planner:
         ...
 
     def plan_to_pose(
-        self, start: _Vec, target: _Vec, frame: Optional[int] = ...
+        self, start: _Vec, target: _Pose, frame: Optional[_Frame] = ...
     ) -> list[list[float]]:
-        """Plan to a Cartesian goal pose (12 numbers); `frame` index defaults to tip."""
+        """Plan to a Cartesian goal pose — a 4x4 COLUMN-MAJOR matrix (nested
+        `target[col][row]` or flat-16, the same convention as `Robot.ik()`).
+
+        The LEGACY flat 12-element row-major form (9 R then tx, ty, tz) is
+        still accepted for back-compat. `frame` is a frame name (or a raw
+        index, back-compat), defaulting to the tip.
+        """
         ...
 
     def plan_trajectory(
@@ -548,20 +597,27 @@ class Planner:
         ...
 
 class ReachChecker:
-    """Collision-aware reachability checker."""
+    """Collision-aware reachability checker.
+
+    `frame` is a frame name (or a raw index, back-compat); default = tip.
+    """
 
     def __init__(
         self,
         robot: "Robot",
         ground: Optional[float] = ...,
         boxes: Optional[_Boxes] = ...,
-        frame: Optional[int] = ...,
+        frame: Optional[_Frame] = ...,
         seeds: int = ...,
     ) -> None: ...
 
-    def status(self, target: _Vec) -> dict[str, Any]:
-        """Reachability of a Cartesian pose (12 numbers) →
+    def status(self, target: _Pose) -> dict[str, Any]:
+        """Reachability of a Cartesian pose — a 4x4 COLUMN-MAJOR matrix
+        (nested `target[col][row]` or flat-16, the same convention as
+        `Robot.ik()`) →
         dict(status: "reachable"|"blocked"|"unreachable", residual, q)."""
         ...
 
-    def reachable(self, target: _Vec) -> bool: ...
+    def reachable(self, target: _Pose) -> bool:
+        """True iff the pose (same convention as `status()`) is reachable."""
+        ...

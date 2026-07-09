@@ -33,15 +33,15 @@ Beyond `Robot`, the bindings expose `Planner`, `ControlLoop` (with
 `run_graph` entry point for the dataflow graph — this is the surface the
 [learning sidecar](../capabilities/learning.md) builds on.
 
-## Known wart: pose conventions are not yet unified
+## Pose convention: unified
 
-The Cartesian-pose entry points are **not** uniform, and this is documented
-honestly rather than hidden:
+Every pose-accepting entry point (`Robot.ik` / `analytic_ik` / `move_l` /
+`move_c`, `Planner.plan_to_pose`, `ReachChecker.status` / `reachable`,
+`calibrate_joint_offsets`) takes the **same** input: a **4×4 column-major**
+nested list (or an equivalent flat 16-element column-major list), and frame
+arguments accept a **name** everywhere (an integer index is still accepted
+where it historically was, now bounds-checked).
 
-- `Robot.ik` / `Robot.move_l` take a **4×4 column-major** pose and a frame
-  **name**.
-- `Planner.plan_to_pose` takes a **flat 12-element row-major** pose and a frame
-  **index**.
-
-Unifying these signatures is future work; until then, mind which entry point you
-are calling.
+One legacy form is grandfathered for back-compat: `Planner.plan_to_pose` also
+accepts its original flat 12-element row-major pose (9 rotation entries then
+`tx, ty, tz`). New code should use the 4×4 form.

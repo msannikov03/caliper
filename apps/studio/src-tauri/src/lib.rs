@@ -16,8 +16,8 @@ use caliper::dynamics::{Simulator, GRAVITY_EARTH};
 use caliper::hal::{ControlLoop, Gains, HoldSetpoint, PhysicsSimBackend, RobotBackend};
 use caliper::ik::{ik, IkOpts};
 use caliper::kinematics::{
-    fk_frame, fk_joints, frame_pose, jacobian, JacFrame, Jacobian, SingularityGovernor,
-    SingularityKind, SingularityParams,
+    fk_frame, fk_joints, frame_pose, jacobian, path_report, JacFrame, Jacobian, PathRows,
+    SingularityGovernor, SingularityKind, SingularityParams,
 };
 use caliper::model::{JointKind, Model, VisualShape};
 use caliper::motion::{
@@ -807,6 +807,29 @@ struct TrajectoryDto {
     /// path fraction realized (1.0 = full).
     reached: f64,
     max_jerk_ratio: f64,
+    /// compact cycle-time / conditioning / utilization readout for the panel.
+    /// `None` for clips without motion-limit context (graph terminal clips).
+    report: Option<TrajReportDto>,
+}
+
+/// Compact path-quality report riding on every planned trajectory (OLP table
+/// stakes): cycle time, worst conditioning, worst limit utilization. Folded
+/// from the engine's `path_report` over the same samples the DTO ships.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TrajReportDto {
+    cycle_time: f64,
+    min_sigma_min: f64,
+    min_manipulability: f64,
+    /// worst per-joint max|q̇|/vmax over the path (1.0 = at the limit).
+    vel_util: f64,
+    /// joint index of `vel_util`; -1 for a 0-DOF model.
+    vel_util_joint: i64,
+    acc_util: f64,
+    acc_util_joint: i64,
+    /// tightest distance to a position limit (rad|m); None = all unbounded.
+    limit_margin: Option<f64>,
+    limit_margin_joint: i64,
 }
 
 #[derive(Serialize)]
@@ -861,11 +884,11 @@ fn sample_to_dto(
     let mut times = vec![];
     let mut q = vec![];
     let mut qd = vec![];
+    let mut qdd: Vec<Vec<f64>> = vec![];
     let mut tip_path = vec![];
     let mut frames = vec![];
     let mut max_jerk_ratio = 0.0f64;
     let lim = traj.limits();
-    let mut prev_qdd: Option<Vec<f64>> = None;
     for k in 0..n {
         let t = (k as f64 * dt).min(dur);
         let s = traj.sample(t);
@@ -873,16 +896,46 @@ fn sample_to_dto(
         frames.push(frames_at(model, &s.q));
         let tp = fk_frame(model, &s.q, tip).translation();
         tip_path.push([tp[0], tp[1], tp[2]]);
-        if let Some(p) = &prev_qdd {
+        if let Some(p) = qdd.last() {
             for (i, (&cur, &prev)) in s.qdd.iter().zip(p.iter()).enumerate() {
                 let jerk = (cur - prev) / dt;
                 max_jerk_ratio = max_jerk_ratio.max(jerk.abs() / lim.jmax[i]);
             }
         }
-        prev_qdd = Some(s.qdd.clone());
         q.push(s.q);
         qd.push(s.qd);
+        qdd.push(s.qdd);
     }
+    // fold the SAME sampled rows into the compact path report (engine math)
+    let rep = path_report(
+        model,
+        tip,
+        &PathRows {
+            times: &times,
+            q: &q,
+            qd: &qd,
+            qdd: &qdd,
+        },
+        &lim.vmax,
+        &lim.amax,
+    );
+    let (vel_util_joint, vel_util) = rep.worst_vel_utilization().map_or((-1, 0.0), pair_i64);
+    let (acc_util_joint, acc_util) = rep.worst_acc_utilization().map_or((-1, 0.0), pair_i64);
+    let (limit_margin_joint, limit_margin) = match rep.min_limit_margin() {
+        Some((j, m)) => (j as i64, Some(m)),
+        None => (-1, None),
+    };
+    let report = TrajReportDto {
+        cycle_time: rep.cycle_time,
+        min_sigma_min: rep.min_sigma_min,
+        min_manipulability: rep.min_manipulability,
+        vel_util,
+        vel_util_joint,
+        acc_util,
+        acc_util_joint,
+        limit_margin,
+        limit_margin_joint,
+    };
     TrajectoryDto {
         kind: kind.into(),
         duration: dur,
@@ -896,7 +949,13 @@ fn sample_to_dto(
         ok: traj.completed,
         reached: traj.reached,
         max_jerk_ratio,
+        report: Some(report),
     }
+}
+
+/// `(joint, value)` → `(joint as i64, value)` for the DTO's -1 sentinel scheme.
+fn pair_i64((j, v): (usize, f64)) -> (i64, f64) {
+    (j as i64, v)
 }
 
 fn default_limits(model: &Model) -> Result<MotionLimits, String> {
@@ -1781,6 +1840,8 @@ fn clip_to_trajectory(model: &Model, clip: &caliper::graph::ClipData) -> Traject
         ok: true,
         reached: 1.0,
         max_jerk_ratio: 0.0,
+        // a graph clip carries no motion-limit context to report against
+        report: None,
     }
 }
 
@@ -2330,6 +2391,34 @@ mod tests {
         );
         assert!(traj.duration > 0.0);
         assert_eq!(traj.kind, "graph");
+        // graph clips carry no motion-limit context → no report to show
+        assert!(traj.report.is_none());
+    }
+
+    /// Every planned trajectory ships the compact path report: cycle time =
+    /// clip duration, finite conditioning, and utilization within the very
+    /// limits the plan was built from.
+    #[test]
+    fn planned_trajectory_carries_report() {
+        let m = load("showcase6.urdf");
+        let limits = MotionLimits::from_model(&m, &MotionLimitsConfig::default()).unwrap();
+        // start OFF the all-zeros home: showcase6's wrist is exactly singular
+        // there (sigma_min = 0), and this test asserts strict positivity.
+        let start = vec![0.1, -0.3, 0.4, 0.2, -0.5, 0.1];
+        let goal = vec![0.4, -0.6, 0.5, 0.3, -0.4, 0.2];
+        let traj = move_j(&m, &start, &goal, &limits).unwrap();
+        let dto = sample_to_dto(&m, &traj, 0.02, m.tip_frame(), "moveJ");
+        let rep = dto.report.expect("planned moves carry a report");
+        assert!((rep.cycle_time - dto.duration).abs() < 1e-9);
+        assert!(rep.min_sigma_min > 0.0 && rep.min_sigma_min.is_finite());
+        assert!(rep.min_manipulability > 0.0);
+        // the S-curve respects its own limits (small sampling slack)
+        assert!(rep.vel_util <= 1.001 && rep.acc_util <= 1.001);
+        assert!((0..m.ndof as i64).contains(&rep.vel_util_joint));
+        // showcase6 bounds every joint, and this path stays inside the limits
+        let (j, margin) = (rep.limit_margin_joint, rep.limit_margin.unwrap());
+        assert!((0..m.ndof as i64).contains(&j));
+        assert!(margin > 0.0);
     }
 
     /// A failing run returns a STRUCTURED error string (serde JSON of GraphError).

@@ -84,3 +84,27 @@
 .transport button svg {
   display: block;
 }
+
+/* --- pose panel: compact plan report readout (cycle time / σ_min / util) --- */
+.pose-panel .report {
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border-2);
+}
+.pose-panel .rp-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--muted);
+  line-height: 1.7;
+}
+.pose-panel .rp-row b {
+  color: var(--text);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+.pose-panel .rp-row b.bad {
+  color: var(--singular);
+}

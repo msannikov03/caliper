@@ -518,6 +518,160 @@ impl SingularityGovernor {
     }
 }
 
+// ===== path-level report (OLP cycle-time / conditioning / limit metrics) =====
+
+/// Pre-sampled trajectory rows for [`path_report`]: parallel per-sample arrays.
+/// caliper-kinematics has no trajectory type, so callers (CLI / Studio) sample
+/// their `Trajectory` onto rows and pass them in — the report math stays pure.
+#[derive(Clone, Copy, Debug)]
+pub struct PathRows<'a> {
+    /// Sample times (s), non-decreasing.
+    pub times: &'a [f64],
+    /// Joint positions per sample (`times.len()` rows of `ndof`).
+    pub q: &'a [Vec<f64>],
+    /// Joint velocities per sample.
+    pub qd: &'a [Vec<f64>],
+    /// Joint accelerations per sample.
+    pub qdd: &'a [Vec<f64>],
+}
+
+/// Aggregate path-quality metrics along a sampled trajectory — the numbers an
+/// OLP "cycle-time + reach" report is made of. Produced by [`path_report`].
+#[derive(Clone, Debug)]
+pub struct PathReport {
+    /// Total cycle time (s): last sample time − first.
+    pub cycle_time: f64,
+    /// Number of samples analyzed.
+    pub samples: usize,
+    /// Smallest Yoshikawa manipulability over the path.
+    pub min_manipulability: f64,
+    /// Mean Yoshikawa manipulability over the path.
+    pub mean_manipulability: f64,
+    /// Worst conditioning: the smallest σ_min over the path.
+    pub min_sigma_min: f64,
+    /// Time (s) of the worst-σ_min sample.
+    pub t_min_sigma: f64,
+    /// Per joint: min distance to the nearer position limit over the path
+    /// (rad | m). `f64::INFINITY` for an unbounded joint; negative = violated.
+    pub limit_margin: Vec<f64>,
+    /// Per joint: max |q̇| / vmax over the path (1.0 = at the limit).
+    pub vel_utilization: Vec<f64>,
+    /// Per joint: max |q̈| / amax over the path.
+    pub acc_utilization: Vec<f64>,
+}
+
+impl PathReport {
+    /// `(joint, value)` of the largest per-joint entry; `None` for 0 DOF.
+    fn worst(v: &[f64]) -> Option<(usize, f64)> {
+        v.iter()
+            .copied()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(&b.1))
+    }
+    /// Worst joint velocity utilization as `(joint, max|q̇|/vmax)`.
+    pub fn worst_vel_utilization(&self) -> Option<(usize, f64)> {
+        Self::worst(&self.vel_utilization)
+    }
+    /// Worst joint acceleration utilization as `(joint, max|q̈|/amax)`.
+    pub fn worst_acc_utilization(&self) -> Option<(usize, f64)> {
+        Self::worst(&self.acc_utilization)
+    }
+    /// Tightest limit margin as `(joint, margin)`; `None` when every joint is
+    /// unbounded (or 0 DOF) — infinity is "no limit", not a margin.
+    pub fn min_limit_margin(&self) -> Option<(usize, f64)> {
+        self.limit_margin
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(_, m)| m.is_finite())
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+    }
+}
+
+/// Compute a [`PathReport`] for `frame` over pre-sampled rows: cycle time,
+/// min/mean manipulability + min σ_min (one Jacobian SVD per sample, the same
+/// math as [`Jacobian::analyze`]), per-joint position-limit margins against
+/// `model.limits`, and per-joint velocity/acceleration utilization against
+/// `vmax`/`amax` (the caller's `MotionLimits` arrays).
+///
+/// Pure and total: empty rows yield a zeroed report; a non-positive `vmax[i]` /
+/// `amax[i]` reports `INFINITY` utilization for any motion on that joint.
+pub fn path_report(
+    model: &Model,
+    frame: usize,
+    rows: &PathRows,
+    vmax: &[f64],
+    amax: &[f64],
+) -> PathReport {
+    let n = model.ndof;
+    debug_assert_eq!(rows.q.len(), rows.times.len());
+    debug_assert_eq!(rows.qd.len(), rows.times.len());
+    debug_assert_eq!(rows.qdd.len(), rows.times.len());
+    debug_assert_eq!(vmax.len(), n);
+    debug_assert_eq!(amax.len(), n);
+
+    let mut report = PathReport {
+        cycle_time: 0.0,
+        samples: rows.times.len(),
+        min_manipulability: 0.0,
+        mean_manipulability: 0.0,
+        min_sigma_min: 0.0,
+        t_min_sigma: 0.0,
+        limit_margin: vec![f64::INFINITY; n],
+        vel_utilization: vec![0.0; n],
+        acc_utilization: vec![0.0; n],
+    };
+    let (Some(&t0), Some(&t1)) = (rows.times.first(), rows.times.last()) else {
+        return report;
+    };
+    report.cycle_time = t1 - t0;
+    report.min_manipulability = f64::INFINITY;
+    report.min_sigma_min = f64::INFINITY;
+
+    // `ratio` is total: a degenerate limit turns any motion into INFINITY
+    // utilization instead of a NaN that would poison the max-fold.
+    let ratio = |x: f64, lim: f64| -> f64 {
+        if lim > 0.0 {
+            x.abs() / lim
+        } else if x == 0.0 {
+            0.0
+        } else {
+            f64::INFINITY
+        }
+    };
+
+    let mut manip_sum = 0.0;
+    for (k, t) in rows.times.iter().enumerate() {
+        let (_, j) = jacobian(model, &rows.q[k], frame, JacFrame::World);
+        // one SVD per sample (Jacobian::analyze's underlying decomposition);
+        // empty == 0-DOF / non-finite → the degenerate 0-manipulability sample.
+        let sv = Jacobian(j).singular_values();
+        let (manip, sigma_min) = if sv.is_empty() {
+            (0.0, 0.0) // empty product would be 1.0 — the footgun manipulability() guards
+        } else {
+            (sv.iter().product(), sv[sv.len() - 1])
+        };
+        manip_sum += manip;
+        report.min_manipulability = report.min_manipulability.min(manip);
+        if sigma_min < report.min_sigma_min {
+            report.min_sigma_min = sigma_min;
+            report.t_min_sigma = *t;
+        }
+        for i in 0..n {
+            if let Some((lo, hi)) = model.limits[i] {
+                let margin = (rows.q[k][i] - lo).min(hi - rows.q[k][i]);
+                report.limit_margin[i] = report.limit_margin[i].min(margin);
+            }
+            report.vel_utilization[i] =
+                report.vel_utilization[i].max(ratio(rows.qd[k][i], vmax[i]));
+            report.acc_utilization[i] =
+                report.acc_utilization[i].max(ratio(rows.qdd[k][i], amax[i]));
+        }
+    }
+    report.mean_manipulability = manip_sum / report.samples as f64;
+    report
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -893,6 +1047,114 @@ mod tests {
         assert_eq!(rep.manipulability, 0.0);
         assert_eq!(jac.manipulability(), 0.0);
         assert_eq!(jac.singular_values().len(), 0);
+    }
+
+    // ===== path_report =====
+
+    /// (times, q, qd, qdd) rows for the fixture below.
+    type Rows = (Vec<f64>, Vec<Vec<f64>>, Vec<Vec<f64>>, Vec<Vec<f64>>);
+
+    /// Deterministic 3-sample fixture on toy.urdf (limits ±3.14 on both joints).
+    fn toy_rows() -> Rows {
+        let times = vec![0.0, 0.5, 1.25];
+        let q = vec![vec![0.0, 0.0], vec![0.3, -0.4], vec![0.6, 3.0]];
+        let qd = vec![vec![0.0, 0.0], vec![1.5, -0.8], vec![0.0, 0.0]];
+        let qdd = vec![vec![0.0, 0.0], vec![-2.0, 4.5], vec![0.0, 0.0]];
+        (times, q, qd, qdd)
+    }
+
+    #[test]
+    fn path_report_hand_checked_metrics() {
+        let m = toy();
+        let (times, q, qd, qdd) = toy_rows();
+        let rows = PathRows {
+            times: &times,
+            q: &q,
+            qd: &qd,
+            qdd: &qdd,
+        };
+        let rep = path_report(&m, m.tip_frame(), &rows, &[3.0, 3.0], &[10.0, 10.0]);
+        assert_eq!(rep.samples, 3);
+        assert!((rep.cycle_time - 1.25).abs() < 1e-12);
+        // limit margins: joint 0 tightest at q=0.6 → min(0.6+3.14, 3.14-0.6)=2.54;
+        // joint 1 tightest at q=3.0 → 3.14-3.0 = 0.14.
+        assert!((rep.limit_margin[0] - 2.54).abs() < 1e-12);
+        assert!((rep.limit_margin[1] - 0.14).abs() < 1e-12);
+        let (j, margin) = rep.min_limit_margin().unwrap();
+        assert_eq!(j, 1);
+        assert!((margin - 0.14).abs() < 1e-12);
+        // utilization: max|qd| = [1.5, 0.8] / 3.0; max|qdd| = [2.0, 4.5] / 10.0.
+        assert!((rep.vel_utilization[0] - 0.5).abs() < 1e-12);
+        assert!((rep.vel_utilization[1] - 0.8 / 3.0).abs() < 1e-12);
+        assert_eq!(rep.worst_vel_utilization().unwrap(), (0, 0.5));
+        assert!((rep.acc_utilization[0] - 0.2).abs() < 1e-12);
+        assert!((rep.acc_utilization[1] - 0.45).abs() < 1e-12);
+        assert_eq!(rep.worst_acc_utilization().unwrap().0, 1);
+    }
+
+    #[test]
+    fn path_report_matches_per_sample_analyze() {
+        // min/mean manipulability and min σ_min must agree with running the full
+        // Jacobian::analyze at every sample — the report is the same SVD, folded.
+        let m = toy();
+        let (times, q, qd, qdd) = toy_rows();
+        let rows = PathRows {
+            times: &times,
+            q: &q,
+            qd: &qd,
+            qdd: &qdd,
+        };
+        let rep = path_report(&m, m.tip_frame(), &rows, &[3.0, 3.0], &[10.0, 10.0]);
+        let mut min_manip = f64::INFINITY;
+        let mut sum = 0.0;
+        let mut min_sigma = f64::INFINITY;
+        let mut t_min = 0.0;
+        for (k, t) in times.iter().enumerate() {
+            let a = analyze(&m, &q[k], m.tip_frame(), &SingularityParams::default());
+            min_manip = min_manip.min(a.manipulability);
+            sum += a.manipulability;
+            if a.sigma_min < min_sigma {
+                min_sigma = a.sigma_min;
+                t_min = *t;
+            }
+        }
+        assert!((rep.min_manipulability - min_manip).abs() < 1e-12);
+        assert!((rep.mean_manipulability - sum / 3.0).abs() < 1e-12);
+        assert!((rep.min_sigma_min - min_sigma).abs() < 1e-12);
+        assert_eq!(rep.t_min_sigma, t_min);
+        // determinism: same rows → identical report
+        let rep2 = path_report(&m, m.tip_frame(), &rows, &[3.0, 3.0], &[10.0, 10.0]);
+        assert_eq!(rep.min_sigma_min, rep2.min_sigma_min);
+        assert_eq!(rep.mean_manipulability, rep2.mean_manipulability);
+    }
+
+    #[test]
+    fn path_report_empty_and_degenerate_limits() {
+        let m = toy();
+        let rows = PathRows {
+            times: &[],
+            q: &[],
+            qd: &[],
+            qdd: &[],
+        };
+        let rep = path_report(&m, m.tip_frame(), &rows, &[3.0, 3.0], &[10.0, 10.0]);
+        assert_eq!(rep.samples, 0);
+        assert_eq!(rep.cycle_time, 0.0);
+        assert_eq!(rep.min_manipulability, 0.0);
+        assert_eq!(rep.min_sigma_min, 0.0);
+        assert!(rep.limit_margin.iter().all(|mg| mg.is_infinite()));
+        assert!(rep.min_limit_margin().is_none()); // infinity = "no limit", not a margin
+        // a zero vmax must flag moving joints as INFINITY, not NaN
+        let (times, q, qd, qdd) = toy_rows();
+        let rows = PathRows {
+            times: &times,
+            q: &q,
+            qd: &qd,
+            qdd: &qdd,
+        };
+        let rep = path_report(&m, m.tip_frame(), &rows, &[0.0, 3.0], &[10.0, 10.0]);
+        assert!(rep.vel_utilization[0].is_infinite());
+        assert!(rep.vel_utilization[1].is_finite());
     }
 }
 

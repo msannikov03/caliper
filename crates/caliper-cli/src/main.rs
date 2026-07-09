@@ -21,6 +21,8 @@ use nalgebra::{Matrix3, Matrix4, UnitQuaternion, Vector3};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+mod report;
+
 #[derive(Parser)]
 #[command(
     name = "caliper",
@@ -291,6 +293,30 @@ enum Cmd {
         obstacle: Option<Vec<f64>>,
         #[arg(long)]
         frame: Option<String>,
+    },
+    /// Cycle-time + path-quality report for a jerk-limited MOVE_J (OLP table
+    /// stakes): total/per-segment time, min/mean manipulability + min σ_min
+    /// along the path, per-joint limit margins, and vel/acc utilization.
+    Report {
+        urdf: PathBuf,
+        /// MOVE_J goal config (comma-separated, length = ndof). Repeat --goal
+        /// for waypoints: each occurrence is one segment endpoint, timed per
+        /// segment. (One string per occurrence, parsed by hand — clap cannot
+        /// infer a parser for a Vec inside a Vec.)
+        #[arg(long, allow_hyphen_values = true, required = true)]
+        goal: Vec<String>,
+        /// Start config (length = ndof). Defaults to all-zeros (home).
+        #[arg(long, value_delimiter = ',', allow_hyphen_values = true)]
+        start: Option<Vec<f64>>,
+        /// Samples per segment for the path metrics.
+        #[arg(long, default_value_t = 100)]
+        samples: usize,
+        /// Optional frame name; defaults to the tip frame.
+        #[arg(long)]
+        frame: Option<String>,
+        /// Machine-readable JSON instead of the table.
+        #[arg(long)]
+        json: bool,
     },
     /// Run or validate a Caliper node graph (.caliper-graph.json) (Phase 8).
     Graph {
@@ -1164,6 +1190,66 @@ fn main() -> anyhow::Result<()> {
             println!("  residual : {:.3e}", v.residual);
             if let Some(q) = v.q {
                 println!("  config   : [{}]", fmt_vec(&q));
+            }
+        }
+        Cmd::Report {
+            urdf,
+            goal,
+            start,
+            samples,
+            frame,
+            json,
+        } => {
+            let robot = caliper::model::Robot::from_urdf(&urdf)?;
+            let m = &robot.model;
+            let f = resolve_frame(m, &frame)?;
+            anyhow::ensure!(samples >= 2, "--samples must be >= 2");
+            let start = start.unwrap_or_else(|| vec![0.0; m.ndof]);
+            anyhow::ensure!(start.len() == m.ndof, "--start needs {} values", m.ndof);
+            anyhow::ensure!(
+                start.iter().all(|x| x.is_finite()),
+                "--start contains a non-finite value"
+            );
+            let goal: Vec<Vec<f64>> = goal
+                .iter()
+                .enumerate()
+                .map(|(k, s)| {
+                    s.split(',')
+                        .map(|t| t.trim().parse::<f64>())
+                        .collect::<Result<Vec<f64>, _>>()
+                        .map_err(|e| anyhow::anyhow!("--goal [{k}]: {e}"))
+                })
+                .collect::<anyhow::Result<_>>()?;
+            for (k, g) in goal.iter().enumerate() {
+                anyhow::ensure!(
+                    g.len() == m.ndof && g.iter().all(|x| x.is_finite()),
+                    "--goal [{k}] needs {} finite values",
+                    m.ndof
+                );
+            }
+            let limits = MotionLimits::from_model(m, &MotionLimitsConfig::default())?;
+            // plan the legs back-to-back, exactly like `move --goal` per segment
+            let mut segments = Vec::with_capacity(goal.len());
+            let mut from = start;
+            for g in goal {
+                segments.push(move_j(m, &from, &g, &limits)?);
+                from = g;
+            }
+            let seg_durations: Vec<f64> = segments.iter().map(|t| t.duration()).collect();
+            let rep = report::report_segments(m, f, &segments, samples, &limits);
+            if json {
+                let mut v = report::to_json(m, &rep, &seg_durations);
+                v["robot"] = serde_json::json!(robot.name);
+                v["frame"] = serde_json::json!(m.frame_name(f));
+                println!("{}", serde_json::to_string_pretty(&v)?);
+            } else {
+                println!(
+                    "REPORT '{}' -> frame '{}'  (MOVE_J, {} segment(s))",
+                    robot.name,
+                    m.frame_name(f),
+                    segments.len()
+                );
+                report::print_table(m, &rep, &seg_durations);
             }
         }
         Cmd::Graph { action } => match action {

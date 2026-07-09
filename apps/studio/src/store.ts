@@ -91,6 +91,21 @@ export interface SingularityReport {
   ellipsoidRadii: [number, number, number];
 }
 
+/** Compact path-quality report riding on planned trajectories (mirrors
+ *  `TrajReportDto`): cycle time, worst conditioning, worst limit utilization.
+ *  Joint indices are -1 when the model has 0 DOF / no position limits. */
+export interface TrajReport {
+  cycleTime: number;
+  minSigmaMin: number;
+  minManipulability: number;
+  velUtil: number; // worst max|q̇|/vmax over the path (1.0 = at the limit)
+  velUtilJoint: number;
+  accUtil: number;
+  accUtilJoint: number;
+  limitMargin: number | null; // tightest distance to a limit; null = unbounded
+  limitMarginJoint: number;
+}
+
 export interface TrajectoryDto {
   kind: string;
   duration: number;
@@ -104,6 +119,8 @@ export interface TrajectoryDto {
   ok: boolean;
   reached: number;
   maxJerkRatio: number;
+  /** absent on sim rollouts; null on graph clips (no motion-limit context). */
+  report?: TrajReport | null;
 }
 export interface SimTrajectoryDto extends TrajectoryDto {
   energy: number[];

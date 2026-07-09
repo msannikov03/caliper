@@ -18,6 +18,7 @@ path = "src/main.rs"
 [dependencies]
 caliper = { workspace = true, features = ["dataset"] }
 caliper-collision.workspace = true
+caliper-dataset.workspace = true
 clap.workspace = true
 anyhow.workspace = true
 nalgebra.workspace = true

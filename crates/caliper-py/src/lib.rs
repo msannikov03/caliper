@@ -16,10 +16,14 @@ use caliper::planning::reach::{ReachChecker as EngineReach, ReachConfig, ReachSt
 use caliper::planning::{PlanError, Planner as EnginePlanner, PlannerConfig};
 use caliper::spatial::{Se3, Twist};
 use caliper_collision::{CollisionError, CollisionModel as EngineCollision, WorldScene};
+use caliper_dataset::{
+    DatasetReader as EngineReaderV3, DatasetSpec as DatasetSpecV3, DatasetWriter as EngineWriterV3,
+    FeatureSpec,
+};
 use nalgebra::{DMatrix, Matrix3, UnitQuaternion, Vector3};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// Engine version string.
 #[pyfunction]
@@ -877,6 +881,9 @@ fn hal_err(e: caliper::hal::Error) -> PyErr {
 fn col_err(e: CollisionError) -> PyErr {
     pyo3::exceptions::PyValueError::new_err(e.to_string())
 }
+fn ds_err(e: caliper_dataset::Error) -> PyErr {
+    pyo3::exceptions::PyValueError::new_err(e.to_string())
+}
 fn plan_err(e: PlanError) -> PyErr {
     pyo3::exceptions::PyValueError::new_err(e.to_string())
 }
@@ -1406,6 +1413,190 @@ impl DatasetReader {
     fn read_episode(&self, episode: usize) -> PyResult<(Vec<Vec<f64>>, Vec<Vec<f64>>, Vec<f64>)> {
         let e = self.inner.read_episode(episode).map_err(hal_err)?;
         Ok((e.states, e.actions, e.timestamps))
+    }
+}
+
+/// Shared spec for the v3.0 recording faces: `observation.state` + `action`,
+/// one element per joint, named after the model's joints.
+fn dataset_spec_v3(model: &Model, fps: u32) -> DatasetSpecV3 {
+    let names = Some(model.joint_names.clone());
+    DatasetSpecV3::new(
+        fps,
+        model.name.clone(),
+        vec![
+            FeatureSpec::vector("observation.state", model.ndof, names.clone()),
+            FeatureSpec::vector("action", model.ndof, names),
+        ],
+    )
+}
+
+/// Writes a LeRobotDataset **v3.0** to disk — the native layout of lerobot
+/// >= 0.4, loadable by `LeRobotDataset` directly (no converter). Same episode
+/// lifecycle as the legacy v2.1 `Recorder`.
+#[pyclass]
+struct RecorderV3 {
+    // Mutex only to satisfy pyo3 0.29's static Send+Sync pyclass bound (the
+    // streaming parquet writer is not Sync); pymethods' &mut self already
+    // serializes access, so the lock is never contended.
+    inner: Mutex<Option<EngineWriterV3>>,
+    task: Option<String>,
+}
+
+#[pymethods]
+impl RecorderV3 {
+    #[new]
+    #[pyo3(signature = (robot, out, fps=30))]
+    fn new(robot: &Robot, out: &str, fps: u32) -> PyResult<Self> {
+        let inner = EngineWriterV3::create(out, dataset_spec_v3(&robot.inner.model, fps))
+            .map_err(ds_err)?;
+        Ok(RecorderV3 {
+            inner: Mutex::new(Some(inner)),
+            task: None,
+        })
+    }
+    fn start_episode(&mut self, task: &str) -> PyResult<()> {
+        self.check_open()?;
+        if self.task.is_some() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "episode already open",
+            ));
+        }
+        self.task = Some(task.to_string());
+        Ok(())
+    }
+    fn append(&mut self, state: Vec<f64>, action: Vec<f64>, t: f64) -> PyResult<()> {
+        finite_or_err("state", &state)?;
+        finite_or_err("action", &action)?;
+        if self.task.is_none() {
+            return Err(pyo3::exceptions::PyValueError::new_err("no open episode"));
+        }
+        self.with_writer(|w| {
+            w.add_frame_at(
+                &[
+                    ("observation.state", state.as_slice()),
+                    ("action", action.as_slice()),
+                ],
+                t,
+            )
+        })
+    }
+    fn finalize_episode(&mut self) -> PyResult<()> {
+        let task = self
+            .task
+            .take()
+            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("no open episode"))?;
+        self.with_writer(|w| w.save_episode(&task))
+    }
+    /// Finalize the dataset (writes meta/) and return its path. Consumes the recorder.
+    fn close(&mut self) -> PyResult<String> {
+        if self.task.is_some() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "episode still open; call finalize_episode() before close()",
+            ));
+        }
+        let rec = self
+            .inner
+            .get_mut()
+            .map_err(|_| pyo3::exceptions::PyValueError::new_err("recorder lock poisoned"))?
+            .take()
+            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("recorder already closed"))?;
+        rec.finalize()
+            .map(|p| p.display().to_string())
+            .map_err(ds_err)
+    }
+}
+
+impl RecorderV3 {
+    fn check_open(&mut self) -> PyResult<()> {
+        self.with_writer(|_| Ok(()))
+    }
+    /// Run `f` on the live writer; errors if closed. The lock is uncontended
+    /// (pyo3 serializes &mut self); it exists for the static Sync bound only.
+    fn with_writer<T>(
+        &mut self,
+        f: impl FnOnce(&mut EngineWriterV3) -> Result<T, caliper_dataset::Error>,
+    ) -> PyResult<T> {
+        let guard = self
+            .inner
+            .get_mut()
+            .map_err(|_| pyo3::exceptions::PyValueError::new_err("recorder lock poisoned"))?;
+        let w = guard
+            .as_mut()
+            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("recorder is closed"))?;
+        f(w).map_err(ds_err)
+    }
+}
+
+/// Reads a LeRobotDataset **v3.0** from disk (this engine's writer OR
+/// lerobot's own tooling, e.g. the official v2.1->v3.0 converter output).
+#[pyclass]
+struct DatasetReaderV3 {
+    inner: EngineReaderV3,
+}
+
+#[pymethods]
+impl DatasetReaderV3 {
+    #[staticmethod]
+    fn open(path: &str) -> PyResult<Self> {
+        EngineReaderV3::open(path)
+            .map(|inner| DatasetReaderV3 { inner })
+            .map_err(ds_err)
+    }
+    #[getter]
+    fn total_episodes(&self) -> usize {
+        self.inner.total_episodes()
+    }
+    #[getter]
+    fn ndof(&self) -> usize {
+        ["action", "observation.state"]
+            .iter()
+            .find_map(|k| self.inner.info().features.get(*k))
+            .and_then(|f| f.shape.first().copied())
+            .unwrap_or(0) as usize
+    }
+    #[getter]
+    fn fps(&self) -> u32 {
+        self.inner.fps()
+    }
+    /// Task strings ordered by task_index.
+    #[getter]
+    fn tasks(&self) -> Vec<String> {
+        self.inner.tasks().to_vec()
+    }
+    /// Task strings of one episode.
+    fn episode_tasks(&self, episode: usize) -> PyResult<Vec<String>> {
+        self.inner
+            .episodes()
+            .get(episode)
+            .map(|e| e.tasks.clone())
+            .ok_or_else(|| {
+                pyo3::exceptions::PyValueError::new_err(format!(
+                    "episode {episode} of {}",
+                    self.inner.total_episodes()
+                ))
+            })
+    }
+    /// Read an episode → (states, actions, timestamps). Requires the dataset
+    /// to carry `observation.state` and `action` features (both Caliper faces
+    /// and lerobot's converter output do).
+    #[allow(clippy::type_complexity)]
+    fn read_episode(&self, episode: usize) -> PyResult<(Vec<Vec<f64>>, Vec<Vec<f64>>, Vec<f64>)> {
+        let e = self.inner.read_episode(episode).map_err(ds_err)?;
+        let take = |name: &str| -> PyResult<Vec<Vec<f64>>> {
+            let rows = e.features.get(name).ok_or_else(|| {
+                pyo3::exceptions::PyValueError::new_err(format!(
+                    "dataset has no '{name}' feature (found: {:?})",
+                    e.features.keys().collect::<Vec<_>>()
+                ))
+            })?;
+            Ok(rows
+                .iter()
+                .map(|r| r.iter().map(|&x| f64::from(x)).collect())
+                .collect())
+        };
+        let states = take("observation.state")?;
+        let actions = take("action")?;
+        Ok((states, actions, e.timestamps))
     }
 }
 
@@ -1996,6 +2187,8 @@ fn _caliper(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<ControlLoop>()?;
     m.add_class::<Recorder>()?;
     m.add_class::<DatasetReader>()?;
+    m.add_class::<RecorderV3>()?;
+    m.add_class::<DatasetReaderV3>()?;
     m.add_class::<CollisionModel>()?;
     m.add_class::<SafetyMonitor>()?;
     m.add_class::<LeaderFollower>()?;

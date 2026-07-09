@@ -2,8 +2,8 @@
 use caliper::calib::{CalibOptions, calibrate_joint_offsets};
 use caliper::dynamics::{self, GRAVITY_EARTH, Simulator};
 use caliper::hal::{
-    ControlLoop, DatasetReader, DatasetSpec, Gains, HoldSetpoint, JointMap, LeaderFollowerSource,
-    PhysicsSimBackend, Recorder, RobotBackend, SimBackend, replay_frame,
+    ControlLoop, DatasetReader, DatasetSpec, Episode, Gains, HoldSetpoint, JointMap,
+    LeaderFollowerSource, PhysicsSimBackend, Recorder, RobotBackend, SimBackend, replay_frame,
 };
 use caliper::ik::{IkOpts, analytic_ik_6r, ik};
 use caliper::kinematics::{JacFrame, Jacobian, SingularityParams, fk_frame, jacobian};
@@ -16,7 +16,10 @@ use caliper::planning::reach::{ReachChecker, ReachConfig, ReachStatus};
 use caliper::planning::{Planner, PlannerConfig};
 use caliper::spatial::Se3;
 use caliper_collision::{CollisionModel, WorldScene};
-use clap::{Parser, Subcommand};
+use caliper_dataset::{
+    DatasetReader as DatasetReaderV3, DatasetSpec as DatasetSpecV3, DatasetWriter, FeatureSpec,
+};
+use clap::{Parser, Subcommand, ValueEnum};
 use nalgebra::{Matrix3, Matrix4, UnitQuaternion, Vector3};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -166,7 +169,10 @@ enum Cmd {
         #[arg(long, default_value_t = 1e-3)]
         dt: f64,
     },
-    /// Run a control loop and record a LeRobotDataset v2.1 episode (Phase 5).
+    /// Run a control loop and record a LeRobotDataset episode (v3.0 by default).
+    ///
+    /// NOTE: the default format changed from v2.1 to v3.0 (what lerobot >= 0.4
+    /// loads natively); pass `--format v21` to get the old layout.
     Record {
         urdf: PathBuf,
         /// Output dataset directory.
@@ -182,8 +188,14 @@ enum Cmd {
         fps: u32,
         #[arg(long, default_value = "caliper demo")]
         task: String,
+        /// Dataset format. DEFAULT CHANGED to v3 (LeRobotDataset v3.0, the
+        /// only layout lerobot >= 0.4 loads natively); pass --format v21 for
+        /// the legacy v2.1 layout previous releases wrote.
+        #[arg(long, value_enum, default_value_t = DatasetFormat::V3)]
+        format: DatasetFormat,
     },
-    /// Replay a recorded LeRobotDataset episode through a sim backend (Phase 5).
+    /// Replay a recorded LeRobotDataset episode through a sim backend
+    /// (v3.0 or legacy v2.1, auto-detected from meta/info.json).
     Replay {
         urdf: PathBuf,
         #[arg(long)]
@@ -344,6 +356,30 @@ enum GraphCmd {
         /// Path to a .caliper-graph.json document.
         graph: PathBuf,
     },
+}
+
+/// `caliper record --format`: which LeRobotDataset layout to write.
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum DatasetFormat {
+    /// LeRobotDataset v3.0 — native lerobot >= 0.4 layout (the default).
+    V3,
+    /// Legacy LeRobotDataset v2.1 (needs lerobot's v2.1→v3.0 converter for
+    /// lerobot >= 0.4).
+    V21,
+}
+
+/// The feature layout both recording faces write: `observation.state` +
+/// `action`, one element per joint, named after the model's joints.
+fn dataset_spec_v3(m: &caliper::model::Model, fps: u32) -> DatasetSpecV3 {
+    let names = Some(m.joint_names.clone());
+    DatasetSpecV3::new(
+        fps,
+        m.name.clone(),
+        vec![
+            FeatureSpec::vector("observation.state", m.ndof, names.clone()),
+            FeatureSpec::vector("action", m.ndof, names),
+        ],
+    )
 }
 
 fn resolve_frame(model: &caliper::model::Model, frame: &Option<String>) -> anyhow::Result<usize> {
@@ -872,6 +908,7 @@ fn main() -> anyhow::Result<()> {
             ticks,
             fps,
             task,
+            format,
         } => {
             let robot = caliper::model::Robot::from_urdf(&urdf)?;
             let m = &robot.model;
@@ -891,16 +928,41 @@ fn main() -> anyhow::Result<()> {
             let mut loopy = ControlLoop::new(backend, model, dt)?;
             let mut sp = HoldSetpoint::new(goal.clone());
             let frames = loopy.run_record(&mut sp, ticks)?;
-            let mut rec = Recorder::create(&out, DatasetSpec::from_model(m, fps))?;
-            rec.start_episode(&task)?;
-            for f in &frames {
-                rec.append_control_frame(f)?;
-            }
-            rec.finalize_episode()?;
-            let root = rec.close()?;
+            let root = match format {
+                DatasetFormat::V3 => {
+                    let mut w = DatasetWriter::create(&out, dataset_spec_v3(m, fps))?;
+                    for f in &frames {
+                        w.add_frame_at(
+                            &[
+                                ("observation.state", f.measured.as_slice()),
+                                ("action", f.command.as_slice()),
+                            ],
+                            f.t,
+                        )?;
+                    }
+                    w.save_episode(&task)?;
+                    w.finalize()?
+                }
+                DatasetFormat::V21 => {
+                    let mut rec = Recorder::create(&out, DatasetSpec::from_model(m, fps))?;
+                    rec.start_episode(&task)?;
+                    for f in &frames {
+                        rec.append_control_frame(f)?;
+                    }
+                    rec.finalize_episode()?;
+                    rec.close()?
+                }
+            };
             println!("RECORD '{}'  ->  {}", robot.name, root.display());
             println!("  episode 0: {ticks} frames @ {fps} fps, task = '{task}'");
-            println!("  data/chunk-000/episode_000000.parquet  (LeRobotDataset v2.1)");
+            match format {
+                DatasetFormat::V3 => {
+                    println!("  data/chunk-000/file-000.parquet  (LeRobotDataset v3.0 — native)")
+                }
+                DatasetFormat::V21 => println!(
+                    "  data/chunk-000/episode_000000.parquet  (LeRobotDataset v2.1 — legacy)"
+                ),
+            }
         }
         Cmd::Replay {
             urdf,
@@ -909,21 +971,53 @@ fn main() -> anyhow::Result<()> {
         } => {
             let robot = caliper::model::Robot::from_urdf(&urdf)?;
             let m = &robot.model;
-            let rd = DatasetReader::open(&dataset)?;
+            // Auto-detect the on-disk layout: v3.0 (native) vs legacy v2.1.
+            let info_path = dataset.join("meta/info.json");
+            let info: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&info_path).map_err(|e| {
+                    anyhow::anyhow!(
+                        "not a LeRobotDataset: cannot read {}: {e}",
+                        info_path.display()
+                    )
+                })?)?;
+            let version = info["codebase_version"].as_str().unwrap_or("");
+            let (ep, fps, label) = if version.starts_with("v3") {
+                let rd = DatasetReaderV3::open(&dataset)?;
+                let e = rd.read_episode(episode)?;
+                let feat = |name: &str| -> anyhow::Result<Vec<Vec<f64>>> {
+                    let rows = e
+                        .features
+                        .get(name)
+                        .ok_or_else(|| anyhow::anyhow!("dataset has no '{name}' feature"))?;
+                    Ok(rows
+                        .iter()
+                        .map(|r| r.iter().map(|&x| f64::from(x)).collect())
+                        .collect())
+                };
+                let ep = Episode {
+                    index: episode as u64,
+                    states: feat("observation.state")?,
+                    actions: feat("action")?,
+                    timestamps: e.timestamps.clone(),
+                };
+                (ep, rd.fps(), "v3.0")
+            } else {
+                let rd = DatasetReader::open(&dataset)?;
+                (rd.read_episode(episode)?, rd.fps, "v2.1")
+            };
+            anyhow::ensure!(!ep.is_empty(), "episode {episode} is empty");
+            let ndof = ep.actions[0].len();
             anyhow::ensure!(
-                rd.ndof == m.ndof,
+                ndof == m.ndof,
                 "dataset ndof {} != robot ndof {}",
-                rd.ndof,
+                ndof,
                 m.ndof
             );
-            let ep = rd.read_episode(episode)?;
-            anyhow::ensure!(!ep.is_empty(), "episode {episode} is empty");
             let mut b = SimBackend::new(m.ndof);
             println!(
-                "REPLAY '{}'  episode {episode}: {} frames @ {} fps",
+                "REPLAY '{}'  episode {episode}: {} frames @ {fps} fps  ({label})",
                 robot.name,
                 ep.len(),
-                rd.fps
             );
             for i in 0..ep.len() {
                 replay_frame(&mut b, &ep, i)?;

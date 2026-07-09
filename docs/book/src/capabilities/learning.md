@@ -16,7 +16,9 @@ collect  →  data  →  policy  →  train  →  checkpoint  →  deploy
 ```
 
 - **collect** — generate sim demonstrations into a LeRobotDataset v2.1 (one-step
-  lookahead + a terminal frame).
+  lookahead + a terminal frame). (The engine's dataset faces also write the
+  **v3.0 native** layout — see [Control & safety](control-safety.md); the
+  sidecar's own collector still emits v2.1.)
 - **data** — a goal-conditioned torch `Dataset` with **train-only** normalization
   statistics.
 - **policy** — `build_policy` for `bc_mlp`, `act_lite`, or the diffusion head;

@@ -22,6 +22,7 @@ doctest = false
 [dependencies]
 caliper = { workspace = true, features = ["dataset"] }
 caliper-collision.workspace = true
+caliper-dataset.workspace = true
 pyo3.workspace = true
 nalgebra.workspace = true
 serde_json.workspace = true

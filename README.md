@@ -42,7 +42,7 @@ for the honest trust map.
 | **2 IK & singularity** | Damped-least-squares / Levenberg–Marquardt CLIK with manipulability-gated damping, step clamping, joint limits, multi-restart; **analytic 6R IK**; singular-value / manipulability / condition-number analysis |
 | **3 Motion** | Jerk-limited 7-segment S-curve trajectories; time-synchronized **MOVE_J**, Cartesian **MOVE_L / MOVE_C** (arc through a via point); **time-optimal (TOPP) retiming**; waypoint retiming; O(1) closed-form `sample(t)` |
 | **4 Dynamics** | Inverse dynamics (**RNEA**), joint-space mass matrix (**CRBA**), forward dynamics, centroidal quantities (COM / total mass), semi-implicit-Euler `Simulator` with gravity |
-| **5 Real robots** | Real `RobotBackend` contract; computed-torque `ControlLoop` (+ streaming `run_stream`); `SafetyMonitor`; teleop (leader–follower); LeRobotDataset v2.1 record/replay; feature-gated CAN / Dynamixel hardware skeletons |
+| **5 Real robots** | Real `RobotBackend` contract; computed-torque `ControlLoop` (+ streaming `run_stream`); `SafetyMonitor`; teleop (leader–follower); LeRobotDataset **v3.0 native** record/replay (+ legacy v2.1) — loads directly in `lerobot` >= 0.4, no converter; feature-gated CAN / Dynamixel hardware skeletons |
 | **6 Planning** | **RRT-Connect** + **RRT\*** + **PRM** (deterministic, seeded), shortcut smoothing, **CHOMP-style trajectory optimization** (`caliper-trajopt`), collision-aware reachability |
 | **7 Learning** | `learn/caliper_learn` — pure-PyTorch behavior-cloning sidecar (BC-MLP / ACT-lite / optional DDPM), goal-conditioned, zero `lerobot` runtime dependency |
 | **8 Studio graph** | `caliper-graph` serde dataflow IR + deterministic executor (11 node kinds) + a Simulink-style node editor face (run on all three faces) |

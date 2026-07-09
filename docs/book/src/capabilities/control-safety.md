@@ -38,9 +38,22 @@ just another deterministic setpoint stream.
 
 ## Dataset record / replay
 
-With the `dataset` feature, `caliper-hal` records and replays a **LeRobotDataset
-v2.1** — the standard schema used for imitation-learning data — which the
-Phase-7 learning sidecar consumes.
+Caliper records and replays the **LeRobotDataset** format — the standard schema
+used for imitation-learning data — in two versions:
+
+- **v3.0 native** (`caliper-dataset`, the default): the layout `lerobot` >= 0.4
+  loads directly — no converter. The writer auto-finalizes on drop, so lerobot's
+  "forgot to `finalize()`" footgun can't truncate a recording. Faces:
+  `caliper record` (CLI, `--format v3` default), `RecorderV3` / `DatasetReaderV3`
+  (Python).
+- **legacy v2.1** (`caliper-hal`, feature `dataset`): kept for older toolchains
+  (`--format v21`, `Recorder` / `DatasetReader`); lerobot >= 0.4 needs its
+  official v2.1→v3.0 converter to load these. The Phase-7 learning sidecar's
+  collector still emits this layout.
+
+Both directions are oracle-verified against real `lerobot`: natively-written
+v3.0 loads through `LeRobotDataset` (windowing, padding, a real SGD step), and
+converter-written v3.0 reads back through Caliper's reader.
 
 ## Hardware skeletons
 

@@ -480,6 +480,46 @@ class DatasetReader:
         """Read an episode → (states, actions, timestamps)."""
         ...
 
+class RecorderV3:
+    """Writes a LeRobotDataset v3.0 to disk (native lerobot >= 0.4 layout,
+    loadable by ``LeRobotDataset`` directly — no converter)."""
+
+    def __init__(self, robot: "Robot", out: str, fps: int = ...) -> None: ...
+
+    def start_episode(self, task: str) -> None: ...
+    def append(self, state: _Vec, action: _Vec, t: float) -> None: ...
+    def finalize_episode(self) -> None: ...
+    def close(self) -> str:
+        """Finalize the dataset (writes meta/) and return its path."""
+        ...
+
+class DatasetReaderV3:
+    """Reads a LeRobotDataset v3.0 from disk (Caliper-written or lerobot-written)."""
+
+    @staticmethod
+    def open(path: str) -> "DatasetReaderV3": ...
+
+    @property
+    def total_episodes(self) -> int: ...
+    @property
+    def ndof(self) -> int: ...
+    @property
+    def fps(self) -> int: ...
+    @property
+    def tasks(self) -> list[str]:
+        """Task strings ordered by task_index."""
+        ...
+
+    def episode_tasks(self, episode: int) -> list[str]:
+        """Task strings of one episode."""
+        ...
+
+    def read_episode(
+        self, episode: int
+    ) -> tuple[list[list[float]], list[list[float]], list[float]]:
+        """Read an episode → (states, actions, timestamps)."""
+        ...
+
 class CollisionModel:
     """Configuration-space collision checker (self + world)."""
 

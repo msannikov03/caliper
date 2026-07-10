@@ -16,6 +16,10 @@ default = []
 # Opt-in LeRobotDataset record/replay (forwards to caliper-hal). OFF by default,
 # so the lean facade tree stays free of arrow/parquet.
 dataset = ["caliper-hal/dataset"]
+# Opt-in MuJoCo contact simulation (forwards to caliper-sim-mujoco/mujoco).
+# OFF by default: enabling it LINKS a shared libmujoco 3.9.0 — see
+# crates/caliper-sim-mujoco/Cargo.toml for the MUJOCO_DYNAMIC_LINK_DIR setup.
+mujoco = ["dep:caliper-sim-mujoco", "caliper-sim-mujoco/mujoco"]
 
 [dependencies]
 caliper-spatial.workspace = true
@@ -30,3 +34,4 @@ caliper-trajopt.workspace = true
 caliper-collision.workspace = true
 caliper-graph.workspace = true
 caliper-calib.workspace = true
+caliper-sim-mujoco = { workspace = true, optional = true }

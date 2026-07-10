@@ -753,6 +753,7 @@ dependencies = [
  "caliper-model",
  "caliper-motion",
  "caliper-planning",
+ "caliper-sim-mujoco",
  "caliper-spatial",
  "caliper-trajopt",
 ]
@@ -923,6 +924,20 @@ dependencies = [
  "nalgebra",
  "pyo3",
  "serde_json",
+]
+
+[[package]]
+name = "caliper-sim-mujoco"
+version = "0.1.0"
+dependencies = [
+ "approx",
+ "caliper-dynamics",
+ "caliper-hal",
+ "caliper-model",
+ "caliper-spatial",
+ "mujoco-rs",
+ "nalgebra",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -2898,6 +2913,17 @@ dependencies = [
  "serde",
  "thiserror 2.0.18",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "mujoco-rs"
+version = "5.0.0+mj-3.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "41caa96c0b5f41a695230a9f54a28a4196b03c4ae90990b3d653a35f729f8c40"
+dependencies = [
+ "bytemuck",
+ "paste",
+ "pkg-config",
 ]
 
 [[package]]

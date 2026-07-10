@@ -17,6 +17,11 @@ pub use caliper_planning as planning;
 pub use caliper_spatial as spatial;
 pub use caliper_trajopt as trajopt;
 
+/// MuJoCo contact simulation (feature `mujoco` — links a shared libmujoco
+/// 3.9.0; see the `caliper-sim-mujoco` crate docs for linking/runtime setup).
+#[cfg(feature = "mujoco")]
+pub use caliper_sim_mujoco as sim_mujoco;
+
 /// Engine version (from Cargo).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 

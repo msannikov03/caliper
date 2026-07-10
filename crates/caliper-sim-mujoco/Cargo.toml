@@ -1,0 +1,44 @@
+# MuJoCo contact-simulation backend, behind the caliper-hal `RobotBackend` seam.
+#
+# ⚠ LINKING: the `mujoco` feature pulls `mujoco-rs`, which links a SHARED
+# libmujoco it never builds itself. Building/testing WITH `--features mujoco`
+# requires the official MuJoCo 3.9.0 shared library on the machine and
+#   MUJOCO_DYNAMIC_LINK_DIR=<dir containing libmujoco.dylib/.so>
+# at build time, plus DYLD_LIBRARY_PATH (macOS) / LD_LIBRARY_PATH (Linux) at
+# run time. `scripts/fetch_mujoco.sh` downloads the pinned release artifact.
+# WITHOUT the feature (the default) this crate compiles standalone: the MJCF
+# generator and its tests need no MuJoCo at all, so the workspace stays green
+# on machines (and CI runners) that have no MuJoCo installed.
+[package]
+name = "caliper-sim-mujoco"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+description = "MuJoCo contact simulation behind the caliper HAL backend seam"
+keywords = ["robotics", "mujoco", "simulation", "contact", "physics"]
+categories = ["science::robotics", "simulation"]
+
+[features]
+default = []
+# Everything that actually touches libmujoco: MujocoSim, MujocoBackend, and the
+# integration tests. Pinned EXACTLY to mujoco-rs 5.0.0 (+mj-3.9.0 build metadata
+# = tracks MuJoCo 3.9.0 exactly; single-maintainer crate with a fast release
+# cadence, so no ranged requirement). Default features stay off — the viewer /
+# renderer features are broken on macOS and headless physics is all we need.
+mujoco = ["dep:mujoco-rs"]
+
+[dependencies]
+thiserror.workspace = true
+nalgebra.workspace = true
+caliper-spatial.workspace = true
+caliper-model.workspace = true
+caliper-hal.workspace = true
+mujoco-rs = { version = "=5.0.0", default-features = false, optional = true }
+
+[dev-dependencies]
+approx.workspace = true
+caliper-dynamics.workspace = true

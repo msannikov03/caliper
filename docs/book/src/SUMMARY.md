@@ -8,6 +8,7 @@
   - [Kinematics & IK](./capabilities/kinematics.md)
   - [Motion](./capabilities/motion.md)
   - [Dynamics & simulation](./capabilities/dynamics.md)
+  - [Contact simulation (MuJoCo)](./capabilities/contact-sim.md)
   - [Planning](./capabilities/planning.md)
   - [Collision](./capabilities/collision.md)
   - [Control & safety](./capabilities/control-safety.md)

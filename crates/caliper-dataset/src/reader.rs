@@ -8,8 +8,8 @@
 use crate::meta::{Info, format_chunk_file_path};
 use crate::{CODEBASE_VERSION, Error};
 use arrow::array::{
-    Array, FixedSizeListArray, Float32Array, Float64Array, Int64Array, LargeListArray,
-    LargeStringArray, ListArray, StringArray,
+    Array, BinaryArray, FixedSizeListArray, Float32Array, Float64Array, Int64Array,
+    LargeBinaryArray, LargeListArray, LargeStringArray, ListArray, StringArray, StructArray,
 };
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -44,6 +44,11 @@ pub struct EpisodeData {
     /// `float32` vector features (e.g. `observation.state`, `action`), one
     /// `Vec<f32>` per frame, keyed by feature name.
     pub features: BTreeMap<String, Vec<Vec<f32>>>,
+    /// `dtype: "image"` features: the encoded image file bytes (PNG for
+    /// lerobot-written and Caliper-written datasets) of each frame, verbatim
+    /// from the parquet `struct<bytes, path>` column, keyed by feature name.
+    /// Empty map for image-less datasets.
+    pub images: BTreeMap<String, Vec<Vec<u8>>>,
 }
 
 impl EpisodeData {
@@ -178,6 +183,7 @@ impl DatasetReader {
             global_indices: Vec::new(),
             task_indices: Vec::new(),
             features: BTreeMap::new(),
+            images: BTreeMap::new(),
         };
         let vector_features: Vec<&String> = self
             .info
@@ -189,6 +195,16 @@ impl DatasetReader {
         for name in &vector_features {
             out.features.insert((*name).clone(), Vec::new());
         }
+        let image_features: Vec<&String> = self
+            .info
+            .features
+            .iter()
+            .filter(|(_, f)| f.dtype == "image")
+            .map(|(name, _)| name)
+            .collect();
+        for name in &image_features {
+            out.images.insert((*name).clone(), Vec::new());
+        }
 
         let mut row_offset = 0usize;
         for batch in reader {
@@ -198,7 +214,7 @@ impl DatasetReader {
             let hi = end.min(row_offset + rows);
             if lo < hi {
                 let slice = batch.slice(lo - row_offset, hi - lo);
-                self.extract_rows(&slice, &vector_features, &mut out)?;
+                self.extract_rows(&slice, &vector_features, &image_features, &mut out)?;
             }
             row_offset += rows;
             if row_offset >= end {
@@ -220,6 +236,7 @@ impl DatasetReader {
         &self,
         batch: &RecordBatch,
         vector_features: &[&String],
+        image_features: &[&String],
         out: &mut EpisodeData,
     ) -> Result<(), Error> {
         extract_f64_scalars(column(batch, "timestamp")?, &mut out.timestamps)?;
@@ -248,6 +265,11 @@ impl DatasetReader {
             let arr = column(batch, name.as_str())?;
             let dst = out.features.get_mut(*name).expect("pre-inserted");
             extract_f32_rows(arr, name, dst)?;
+        }
+        for name in image_features {
+            let arr = column(batch, name.as_str())?;
+            let dst = out.images.get_mut(*name).expect("pre-inserted");
+            extract_image_rows(arr, name, dst)?;
         }
         Ok(())
     }
@@ -294,6 +316,38 @@ fn extract_f32_rows(arr: &dyn Array, name: &str, out: &mut Vec<Vec<f32>>) -> Res
         return Err(Error::Format(format!(
             "column '{name}': expected a float32 list column, got {:?}",
             arr.data_type()
+        )));
+    }
+    Ok(())
+}
+
+/// `dtype: "image"` column: `struct<bytes: binary, path: string>` (the HF
+/// `datasets.Image` storage) → the raw encoded bytes of each row. `path` is
+/// ignored — lerobot embeds only a basename there.
+fn extract_image_rows(arr: &dyn Array, name: &str, out: &mut Vec<Vec<u8>>) -> Result<(), Error> {
+    let s = arr.as_any().downcast_ref::<StructArray>().ok_or_else(|| {
+        Error::Format(format!(
+            "column '{name}': expected a struct<bytes, path> image column, got {:?}",
+            arr.data_type()
+        ))
+    })?;
+    let bytes_col = s.column_by_name("bytes").ok_or_else(|| {
+        Error::Format(format!(
+            "column '{name}': image struct has no 'bytes' field"
+        ))
+    })?;
+    if let Some(b) = bytes_col.as_any().downcast_ref::<BinaryArray>() {
+        for i in 0..b.len() {
+            out.push(b.value(i).to_vec());
+        }
+    } else if let Some(b) = bytes_col.as_any().downcast_ref::<LargeBinaryArray>() {
+        for i in 0..b.len() {
+            out.push(b.value(i).to_vec());
+        }
+    } else {
+        return Err(Error::Format(format!(
+            "column '{name}': image 'bytes' field is {:?}, expected binary",
+            bytes_col.data_type()
         )));
     }
     Ok(())

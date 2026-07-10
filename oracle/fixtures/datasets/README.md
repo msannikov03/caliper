@@ -31,3 +31,32 @@ cp -R /tmp/refgen/caliper/ref oracle/fixtures/datasets/ref_v30
 Regenerating changes the float payload (control-loop rollouts), so only do it
 deliberately and re-check the Rust fixture test's structural assertions
 (episode lengths, tasks, offsets) still match.
+
+## `img_v30/` — LeRobotDataset v3.0 with an image feature (lerobot-written)
+
+A tiny (~70 KB) LeRobotDataset **v3.0** carrying a `dtype: "image"` camera
+feature (`observation.images.cam`, 32×32×3), produced by lerobot 0.4.4's OWN
+v3.0 writer (`LeRobotDataset.create` → `add_frame` → `save_episode` →
+`finalize`, `use_videos=False`) — NOT by Caliper's writer. It is the hermetic
+ground truth for the image-column contract: the data parquet embeds PNG bytes
+as an Arrow `struct<bytes: binary, path: string>` column (HF `datasets.Image`
+storage), which `crates/caliper-dataset/tests/lerobot_v30_images.rs` proves
+[`DatasetReader`] decodes without Python at test time.
+
+Contents: 2 episodes × 3 frames, task "demo", 2-dof states/actions at 30 fps,
+deterministic 32×32 RGB gradient frames (no RNG); single data file with one
+row group per episode; `meta/stats.json` carries the `(3, 1, 1)`-nested image
+stats lerobot writes.
+
+### Provenance / regeneration
+
+```bash
+cd <repo root>
+.venv/bin/python oracle/fixtures/datasets/gen_img_v30.py /tmp/imggen
+rm -rf oracle/fixtures/datasets/img_v30
+cp -R /tmp/imggen/img_v30 oracle/fixtures/datasets/img_v30
+```
+
+The pixel content is deterministic, but the embedded PNG byte streams depend
+on PIL's encoder version — re-check the byte-length pins in
+`lerobot_v30_images.rs` after regenerating.

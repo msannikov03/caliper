@@ -51,6 +51,15 @@ pub struct MjcfOptions {
     /// only collides from above).
     pub ground_plane: Option<f64>,
     pub actuation: Actuation,
+    /// Raw MJCF elements injected VERBATIM inside `<worldbody>` (after the
+    /// ground plane / world geoms, before the robot bodies) — the hook for
+    /// `<camera>` / `<geom>` / `<light>` elements the generator does not
+    /// model. The string is trusted XML: it is not escaped or validated
+    /// beyond a well-formedness smoke check by MuJoCo at load time, and it
+    /// adds no dof, so `qpos`/`qvel` ordering guarantees are untouched.
+    /// Determinism: the string is emitted byte-for-byte, so a fixed options
+    /// struct still produces a fixed document.
+    pub extra_worldbody_xml: Option<String>,
 }
 
 impl Default for MjcfOptions {
@@ -61,6 +70,7 @@ impl Default for MjcfOptions {
             joint_damping: 0.0,
             ground_plane: None,
             actuation: Actuation::TorqueDirect,
+            extra_worldbody_xml: None,
         }
     }
 }
@@ -154,6 +164,11 @@ pub fn mjcf_from_model(m: &Model, opt: &MjcfOptions) -> Result<MjcfDocument, Muj
     }
     for g in &world_geoms {
         let _ = writeln!(xml, "    {g}");
+    }
+    if let Some(extra) = &opt.extra_worldbody_xml {
+        for line in extra.lines() {
+            let _ = writeln!(xml, "    {}", line.trim_end());
+        }
     }
     for &r in &roots {
         emit_body(&mut xml, m, opt, r, &kids, &body_geoms, 2)?;
@@ -435,6 +450,30 @@ mod tests {
         let doc = mjcf_from_model(&m, &MjcfOptions::default()).unwrap();
         assert_eq!(doc.xml.matches("type=\"hinge\"").count(), 6);
         assert_eq!(doc.xml.matches("<inertial ").count(), 6);
+    }
+
+    #[test]
+    fn extra_worldbody_xml_injected_verbatim() {
+        let m = model("dyn_pendulum2.urdf");
+        let cam =
+            "<camera name=\"ots\" pos=\"1.1 -1.1 0.9\" xyaxes=\"0.707 0.707 0 -0.4 0.4 0.825\"/>";
+        let opt = MjcfOptions {
+            ground_plane: Some(0.0),
+            extra_worldbody_xml: Some(cam.to_string()),
+            ..Default::default()
+        };
+        let doc = mjcf_from_model(&m, &opt).unwrap();
+        let x = &doc.xml;
+        assert!(x.contains(cam), "camera line missing:\n{x}");
+        // inside <worldbody>, after the ground plane, before the first body
+        let wb = x.find("<worldbody>").unwrap();
+        let plane = x.find("type=\"plane\"").unwrap();
+        let cam_at = x.find("<camera").unwrap();
+        let body = x.find("<body").unwrap();
+        assert!(wb < plane && plane < cam_at && cam_at < body);
+        // determinism: same options, same document
+        let doc2 = mjcf_from_model(&m, &opt).unwrap();
+        assert_eq!(doc.xml, doc2.xml);
     }
 
     #[test]

@@ -8,6 +8,14 @@
 //! roll by the same predictive size rule lerobot uses, and episode metadata is
 //! buffered and written to `meta/episodes/` on finalize. Dropping the writer
 //! auto-finalizes, so a forgotten `finalize()` can never truncate the dataset.
+//!
+//! Camera data: declare [`FeatureKind::Image`] features and record through
+//! [`add_frame_with_images`](DatasetWriter::add_frame_with_images) with one
+//! pre-encoded PNG per image feature per frame — encoding stays on the
+//! producer side; the writer validates each frame by decoding (shape/8-bit),
+//! stores the bytes verbatim in the `struct<bytes, path>` layout lerobot's
+//! own writer embeds, and computes the per-channel `(c, 1, 1)` stats lerobot
+//! expects in `meta/stats.json`.
 
 use crate::meta::{
     DEFAULT_CHUNK_SIZE, DEFAULT_DATA_FILE_SIZE_IN_MB, DEFAULT_DATA_PATH, DEFAULT_EPISODES_PATH,
@@ -16,10 +24,11 @@ use crate::meta::{
 use crate::stats::{FeatureStats, aggregate_stats};
 use crate::{CODEBASE_VERSION, Error};
 use arrow::array::{
-    Array, ArrayRef, FixedSizeListBuilder, Float32Array, Float32Builder, Float64Builder,
-    Int64Array, Int64Builder, LargeStringArray, ListBuilder, StringBuilder,
+    Array, ArrayRef, BinaryBuilder, FixedSizeListBuilder, Float32Array, Float32Builder,
+    Float64Builder, Int64Array, Int64Builder, LargeStringArray, ListBuilder, StringBuilder,
+    StructArray,
 };
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow::datatypes::{DataType, Field, Fields, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
@@ -40,23 +49,60 @@ pub const RESERVED_FEATURES: [&str; 5] = [
     "task_index",
 ];
 
-/// One user data feature: a fixed-width `float32` vector per frame
-/// (e.g. `observation.state` with one element per joint).
+/// What one user data feature holds per frame.
+#[derive(Clone, Debug)]
+pub enum FeatureKind {
+    /// A fixed-width `float32` vector (e.g. `observation.state`, one element
+    /// per joint).
+    Vector {
+        dim: usize,
+        /// Optional per-element names (joint names); `names: null` when absent.
+        names: Option<Vec<String>>,
+    },
+    /// A camera frame stored as lerobot's `dtype: "image"`: the data parquet
+    /// carries an Arrow `struct<bytes: binary, path: string>` column whose
+    /// `bytes` is one complete PNG file per frame (HF `datasets.Image`
+    /// storage). The writer takes PRE-ENCODED PNG bytes — encoding stays on
+    /// the producer side — and validates each frame's decoded
+    /// height/width/channels against this spec.
+    Image {
+        height: usize,
+        width: usize,
+        channels: usize,
+    },
+}
+
+/// One user data feature. See [`FeatureKind`] for the per-frame payloads.
 #[derive(Clone, Debug)]
 pub struct FeatureSpec {
     pub name: String,
-    pub dim: usize,
-    /// Optional per-element names (joint names); `names: null` when absent.
-    pub names: Option<Vec<String>>,
+    pub kind: FeatureKind,
 }
 
 impl FeatureSpec {
     pub fn vector(name: impl Into<String>, dim: usize, names: Option<Vec<String>>) -> Self {
         Self {
             name: name.into(),
-            dim,
-            names,
+            kind: FeatureKind::Vector { dim, names },
         }
+    }
+
+    /// An image feature of `height` × `width` pixels with `channels` samples
+    /// per pixel (3 = RGB, 1 = grayscale, 4 = RGBA — must match what the PNG
+    /// frames decode to).
+    pub fn image(name: impl Into<String>, height: usize, width: usize, channels: usize) -> Self {
+        Self {
+            name: name.into(),
+            kind: FeatureKind::Image {
+                height,
+                width,
+                channels,
+            },
+        }
+    }
+
+    pub fn is_image(&self) -> bool {
+        matches!(self.kind, FeatureKind::Image { .. })
     }
 }
 
@@ -108,12 +154,40 @@ struct OpenDataFile {
     frames: u64,
 }
 
+/// Per-channel pixel statistics of ONE decoded frame, in lerobot's normalized
+/// [0, 1] scale (`pixel / 255`). Folded per episode in `episode_stats`.
+struct PixelStats {
+    min: Vec<f64>,
+    max: Vec<f64>,
+    sum: Vec<f64>,
+    sumsq: Vec<f64>,
+    /// Pixels per frame (`height * width`) — constant per feature by
+    /// construction, so folding across frames stays exact.
+    pixels: u64,
+}
+
+/// One buffered image frame: the caller's PNG bytes verbatim + the channel
+/// stats computed from the validating decode at `add_frame` time.
+struct ImageFrame {
+    png: Vec<u8>,
+    stats: PixelStats,
+}
+
+/// Per-feature episode buffer, matching the [`FeatureKind`] of its spec.
+enum FeatureBuf {
+    /// Flattened `f32` rows (`dim` values per frame).
+    Vector(Vec<f32>),
+    /// One pre-encoded PNG per frame.
+    Image(Vec<ImageFrame>),
+}
+
 /// Streaming LeRobotDataset v3.0 writer. See the [module docs](self).
 pub struct DatasetWriter {
     root: PathBuf,
     spec: DatasetSpec,
-    /// Per-feature flattened `f32` buffer for the episode being recorded.
-    buf: Vec<Vec<f32>>,
+    /// Per-feature buffer for the episode being recorded (parallel to
+    /// `spec.features`).
+    buf: Vec<FeatureBuf>,
     buf_times: Vec<f64>,
     tasks: Vec<String>,
     episodes: Vec<EpisodeRecord>,
@@ -155,21 +229,46 @@ impl DatasetWriter {
                     f.name
                 )));
             }
-            if f.dim == 0 {
-                return Err(Error::State(format!(
-                    "feature '{}' must have dim >= 1",
-                    f.name
-                )));
-            }
-            if let Some(names) = &f.names
-                && names.len() != f.dim
-            {
-                return Err(Error::State(format!(
-                    "feature '{}': {} names for dim {}",
-                    f.name,
-                    names.len(),
-                    f.dim
-                )));
+            match &f.kind {
+                FeatureKind::Vector { dim, names } => {
+                    if *dim == 0 {
+                        return Err(Error::State(format!(
+                            "feature '{}' must have dim >= 1",
+                            f.name
+                        )));
+                    }
+                    if let Some(names) = names
+                        && names.len() != *dim
+                    {
+                        return Err(Error::State(format!(
+                            "feature '{}': {} names for dim {}",
+                            f.name,
+                            names.len(),
+                            dim
+                        )));
+                    }
+                }
+                FeatureKind::Image {
+                    height,
+                    width,
+                    channels,
+                } => {
+                    if *height == 0 || *width == 0 {
+                        return Err(Error::State(format!(
+                            "image feature '{}': height and width must be >= 1, got {height}x{width}",
+                            f.name
+                        )));
+                    }
+                    // PNG carries 1 (gray), 2 (gray+alpha), 3 (RGB) or 4
+                    // (RGBA) samples per pixel; anything else can never match
+                    // a decoded frame.
+                    if !(1..=4).contains(channels) {
+                        return Err(Error::State(format!(
+                            "image feature '{}': channels must be 1..=4, got {channels}",
+                            f.name
+                        )));
+                    }
+                }
             }
             if seen.contains(&f.name.as_str()) {
                 return Err(Error::State(format!("duplicate feature '{}'", f.name)));
@@ -185,11 +284,18 @@ impl DatasetWriter {
         }
         fs::create_dir_all(root.join("meta"))?;
         fs::create_dir_all(root.join("data"))?;
-        let n_features = spec.features.len();
+        let buf = spec
+            .features
+            .iter()
+            .map(|f| match f.kind {
+                FeatureKind::Vector { .. } => FeatureBuf::Vector(Vec::new()),
+                FeatureKind::Image { .. } => FeatureBuf::Image(Vec::new()),
+            })
+            .collect();
         Ok(Self {
             root,
             spec,
-            buf: vec![Vec::new(); n_features],
+            buf,
             buf_times: Vec::new(),
             tasks: Vec::new(),
             episodes: Vec::new(),
@@ -202,48 +308,142 @@ impl DatasetWriter {
     }
 
     /// Append one frame with an auto timestamp of `frame_index / fps` seconds.
-    /// `values` must name every declared feature exactly once.
+    /// `values` must name every declared vector feature exactly once; datasets
+    /// with image features must use
+    /// [`add_frame_with_images`](Self::add_frame_with_images).
     pub fn add_frame(&mut self, values: &[(&str, &[f64])]) -> Result<(), Error> {
         let t = self.buf_times.len() as f64 / f64::from(self.spec.fps);
-        self.add_frame_at(values, t)
+        self.add_frame_at_with_images(values, &[], t)
     }
 
-    /// Append one frame with an explicit timestamp (seconds).
+    /// Append one frame with an explicit timestamp (seconds). Vector-feature
+    /// datasets only — see [`add_frame`](Self::add_frame).
     pub fn add_frame_at(&mut self, values: &[(&str, &[f64])], timestamp: f64) -> Result<(), Error> {
+        self.add_frame_at_with_images(values, &[], timestamp)
+    }
+
+    /// Append one frame carrying camera data, with an auto timestamp of
+    /// `frame_index / fps` seconds. `values` must name every declared vector
+    /// feature exactly once and `images` every declared image feature exactly
+    /// once; each image is one complete pre-encoded PNG file, validated by
+    /// decoding (8-bit, height/width/channels must match the spec) — the
+    /// bytes are stored verbatim.
+    pub fn add_frame_with_images(
+        &mut self,
+        values: &[(&str, &[f64])],
+        images: &[(&str, &[u8])],
+    ) -> Result<(), Error> {
+        let t = self.buf_times.len() as f64 / f64::from(self.spec.fps);
+        self.add_frame_at_with_images(values, images, t)
+    }
+
+    /// [`add_frame_with_images`](Self::add_frame_with_images) with an explicit
+    /// timestamp (seconds).
+    pub fn add_frame_at_with_images(
+        &mut self,
+        values: &[(&str, &[f64])],
+        images: &[(&str, &[u8])],
+        timestamp: f64,
+    ) -> Result<(), Error> {
         if self.finalized {
             return Err(Error::State("writer already finalized".into()));
         }
-        if values.len() != self.spec.features.len() {
+        let n_vec = self.spec.features.iter().filter(|f| !f.is_image()).count();
+        let n_img = self.spec.features.len() - n_vec;
+        if values.len() != n_vec {
             return Err(Error::State(format!(
-                "frame has {} features, dataset declares {}",
-                values.len(),
-                self.spec.features.len()
+                "frame has {} vector features, dataset declares {n_vec}",
+                values.len()
+            )));
+        }
+        if images.len() != n_img {
+            return Err(Error::State(format!(
+                "frame has {} image features, dataset declares {n_img}{}",
+                images.len(),
+                if n_img > 0 && images.is_empty() {
+                    " (use add_frame_with_images for datasets with image features)"
+                } else {
+                    ""
+                }
             )));
         }
         for (name, _) in values {
-            if !self.spec.features.iter().any(|f| f.name == *name) {
-                return Err(Error::State(format!("unknown feature '{name}'")));
+            match self.spec.features.iter().find(|f| f.name == *name) {
+                Some(f) if f.is_image() => {
+                    return Err(Error::State(format!(
+                        "feature '{name}' is an image feature; pass it in `images`"
+                    )));
+                }
+                Some(_) => {}
+                None => return Err(Error::State(format!("unknown feature '{name}'"))),
             }
         }
-        // Validate everything before mutating any buffer, so a failed frame
-        // never leaves the per-feature buffers ragged.
-        let mut ordered: Vec<&[f64]> = Vec::with_capacity(self.spec.features.len());
-        for feat in &self.spec.features {
-            let (_, v) = values
-                .iter()
-                .find(|(n, _)| *n == feat.name)
-                .ok_or_else(|| Error::State(format!("missing feature '{}'", feat.name)))?;
-            if v.len() != feat.dim {
-                return Err(Error::Shape {
-                    name: feat.name.clone(),
-                    expected: feat.dim,
-                    got: v.len(),
-                });
+        for (name, _) in images {
+            match self.spec.features.iter().find(|f| f.name == *name) {
+                Some(f) if !f.is_image() => {
+                    return Err(Error::State(format!(
+                        "feature '{name}' is a vector feature; pass it in `values`"
+                    )));
+                }
+                Some(_) => {}
+                None => return Err(Error::State(format!("unknown image feature '{name}'"))),
             }
-            ordered.push(v);
+        }
+        // Validate everything (including a full decode of every PNG) before
+        // mutating any buffer, so a failed frame never leaves the per-feature
+        // buffers ragged.
+        enum Ordered<'a> {
+            Vector(&'a [f64]),
+            Image(&'a [u8], PixelStats),
+        }
+        let mut ordered: Vec<Ordered<'_>> = Vec::with_capacity(self.spec.features.len());
+        for feat in &self.spec.features {
+            match &feat.kind {
+                FeatureKind::Vector { dim, .. } => {
+                    let (_, v) = values
+                        .iter()
+                        .find(|(n, _)| *n == feat.name)
+                        .ok_or_else(|| Error::State(format!("missing feature '{}'", feat.name)))?;
+                    if v.len() != *dim {
+                        return Err(Error::Shape {
+                            name: feat.name.clone(),
+                            expected: *dim,
+                            got: v.len(),
+                        });
+                    }
+                    ordered.push(Ordered::Vector(v));
+                }
+                FeatureKind::Image {
+                    height,
+                    width,
+                    channels,
+                } => {
+                    let (_, png) =
+                        images
+                            .iter()
+                            .find(|(n, _)| *n == feat.name)
+                            .ok_or_else(|| {
+                                Error::State(format!("missing image feature '{}'", feat.name))
+                            })?;
+                    let stats = decode_png_stats(&feat.name, png, *height, *width, *channels)?;
+                    ordered.push(Ordered::Image(png, stats));
+                }
+            }
         }
         for (buf, v) in self.buf.iter_mut().zip(ordered) {
-            buf.extend(v.iter().map(|&x| x as f32));
+            match (buf, v) {
+                (FeatureBuf::Vector(buf), Ordered::Vector(v)) => {
+                    buf.extend(v.iter().map(|&x| x as f32));
+                }
+                (FeatureBuf::Image(buf), Ordered::Image(png, stats)) => {
+                    buf.push(ImageFrame {
+                        png: png.to_vec(),
+                        stats,
+                    });
+                }
+                // Buffers are built from the same spec that `ordered` walked.
+                _ => unreachable!("buffer kind matches spec kind by construction"),
+            }
         }
         self.buf_times.push(timestamp);
         Ok(())
@@ -321,7 +521,10 @@ impl DatasetWriter {
         });
         self.global_index += len as i64;
         for buf in &mut self.buf {
-            buf.clear();
+            match buf {
+                FeatureBuf::Vector(b) => b.clear(),
+                FeatureBuf::Image(b) => b.clear(),
+            }
         }
         self.buf_times.clear();
         Ok(())
@@ -366,9 +569,24 @@ impl DatasetWriter {
         let stats_maps: Vec<BTreeMap<String, FeatureStats>> =
             self.episodes.iter().map(|e| e.stats.clone()).collect();
         let aggregated = aggregate_stats(&stats_maps);
+        // Image entries serialize with lerobot's (c, 1, 1) nesting so
+        // normalization layers can broadcast them against CHW tensors; vector
+        // entries keep the flat lists lerobot writes for 1-D features.
+        let image_names = self.image_feature_names();
+        let entries: BTreeMap<&String, StatsJson<'_>> = aggregated
+            .iter()
+            .map(|(name, s)| {
+                let entry = if image_names.contains(&name.as_str()) {
+                    StatsJson::Image(NestedFeatureStats::from(s))
+                } else {
+                    StatsJson::Flat(s)
+                };
+                (name, entry)
+            })
+            .collect();
         fs::write(
             self.root.join("meta/stats.json"),
-            serde_json::to_string_pretty(&aggregated)?,
+            serde_json::to_string_pretty(&entries)?,
         )?;
         fs::write(
             self.root.join("meta/info.json"),
@@ -378,6 +596,16 @@ impl DatasetWriter {
     }
 
     // ---- internals ----
+
+    /// Names of the declared image features (for stats-shape decisions).
+    fn image_feature_names(&self) -> Vec<&str> {
+        self.spec
+            .features
+            .iter()
+            .filter(|f| f.is_image())
+            .map(|f| f.name.as_str())
+            .collect()
+    }
 
     fn intern_task(&mut self, task: &str) -> i64 {
         if let Some(i) = self.tasks.iter().position(|t| t == task) {
@@ -396,16 +624,48 @@ impl DatasetWriter {
         let mut fields: Vec<Field> = Vec::new();
         let mut columns: Vec<ArrayRef> = Vec::new();
         for (feat, buf) in self.spec.features.iter().zip(&self.buf) {
-            let mut b = FixedSizeListBuilder::new(Float32Builder::new(), feat.dim as i32);
-            for row in buf.chunks_exact(feat.dim) {
-                for &x in row {
-                    b.values().append_value(x);
+            let arr: ArrayRef = match buf {
+                FeatureBuf::Vector(buf) => {
+                    let FeatureKind::Vector { dim, .. } = &feat.kind else {
+                        unreachable!("buffer kind matches spec kind by construction");
+                    };
+                    let mut b = FixedSizeListBuilder::new(Float32Builder::new(), *dim as i32);
+                    for row in buf.chunks_exact(*dim) {
+                        for &x in row {
+                            b.values().append_value(x);
+                        }
+                        b.append(true);
+                    }
+                    Arc::new(b.finish())
                 }
-                b.append(true);
-            }
-            let arr = b.finish();
+                // lerobot's `dtype: "image"` storage — the HF `datasets.Image`
+                // arrow layout: `struct<bytes: binary, path: string>` (field
+                // order bytes,path), `bytes` = one complete PNG file, `path` =
+                // the per-episode frame basename lerobot's own writer embeds.
+                FeatureBuf::Image(buf) => {
+                    let mut bytes_b = BinaryBuilder::new();
+                    let mut path_b = StringBuilder::new();
+                    for (i, frame) in buf.iter().enumerate() {
+                        bytes_b.append_value(&frame.png);
+                        path_b.append_value(format!("frame-{i:06}.png"));
+                    }
+                    let struct_fields = Fields::from(vec![
+                        Field::new("bytes", DataType::Binary, true),
+                        Field::new("path", DataType::Utf8, true),
+                    ]);
+                    let arr = StructArray::try_new(
+                        struct_fields,
+                        vec![
+                            Arc::new(bytes_b.finish()) as ArrayRef,
+                            Arc::new(path_b.finish()) as ArrayRef,
+                        ],
+                        None,
+                    )?;
+                    Arc::new(arr)
+                }
+            };
             fields.push(Field::new(&feat.name, arr.data_type().clone(), true));
-            columns.push(Arc::new(arr));
+            columns.push(arr);
         }
         let timestamp =
             Float32Array::from(self.buf_times.iter().map(|&t| t as f32).collect::<Vec<_>>());
@@ -489,11 +749,20 @@ impl DatasetWriter {
         let len = self.buf_times.len();
         let mut stats = BTreeMap::new();
         for (feat, buf) in self.spec.features.iter().zip(&self.buf) {
-            let rows: Vec<Vec<f64>> = buf
-                .chunks_exact(feat.dim)
-                .map(|row| row.iter().map(|&x| f64::from(x)).collect())
-                .collect();
-            stats.insert(feat.name.clone(), FeatureStats::compute(&rows, feat.dim));
+            let s = match buf {
+                FeatureBuf::Vector(buf) => {
+                    let FeatureKind::Vector { dim, .. } = &feat.kind else {
+                        unreachable!("buffer kind matches spec kind by construction");
+                    };
+                    let rows: Vec<Vec<f64>> = buf
+                        .chunks_exact(*dim)
+                        .map(|row| row.iter().map(|&x| f64::from(x)).collect())
+                        .collect();
+                    FeatureStats::compute(&rows, *dim)
+                }
+                FeatureBuf::Image(buf) => fold_image_stats(buf),
+            };
+            stats.insert(feat.name.clone(), s);
         }
         let scalar = |vals: Vec<f64>| -> FeatureStats {
             let rows: Vec<Vec<f64>> = vals.into_iter().map(|v| vec![v]).collect();
@@ -595,8 +864,14 @@ impl DatasetWriter {
         columns.push(Arc::new(tasks_arr));
 
         // stats/<feature>/<stat>: features sorted (BTreeMap order), stats in
-        // the converter's alphabetical count/max/mean/min/std order.
+        // the converter's alphabetical count/max/mean/min/std order. Image
+        // features nest their value cells as (c, 1, 1) — the shape lerobot's
+        // own episodes parquet carries — while `count` stays a flat frame
+        // count for every feature. (lerobot drops all stats/ columns when
+        // loading; the authoritative aggregate lives in meta/stats.json.)
+        let image_names = self.image_feature_names();
         for feat_name in self.episodes[0].stats.keys() {
+            let is_image = image_names.contains(&feat_name.as_str());
             for stat in ["count", "max", "mean", "min", "std"] {
                 let name = format!("stats/{feat_name}/{stat}");
                 if stat == "count" {
@@ -610,17 +885,37 @@ impl DatasetWriter {
                     let arr = b.finish();
                     fields.push(Field::new(&name, arr.data_type().clone(), true));
                     columns.push(Arc::new(arr));
+                    continue;
+                }
+                let pick = |s: &'static str, e: &EpisodeRecord| -> Vec<f64> {
+                    let st = &e.stats[feat_name];
+                    match s {
+                        "max" => st.max.clone(),
+                        "mean" => st.mean.clone(),
+                        "min" => st.min.clone(),
+                        _ => st.std.clone(),
+                    }
+                };
+                if is_image {
+                    // (c, 1, 1): List<List<List<f64>>> — per row, `c` outer
+                    // entries of `[[v]]`.
+                    let mut b =
+                        ListBuilder::new(ListBuilder::new(ListBuilder::new(Float64Builder::new())));
+                    for e in &self.episodes {
+                        for v in pick(stat, e) {
+                            b.values().values().values().append_value(v);
+                            b.values().values().append(true);
+                            b.values().append(true);
+                        }
+                        b.append(true);
+                    }
+                    let arr = b.finish();
+                    fields.push(Field::new(&name, arr.data_type().clone(), true));
+                    columns.push(Arc::new(arr));
                 } else {
                     let mut b = ListBuilder::new(Float64Builder::new());
                     for e in &self.episodes {
-                        let s = &e.stats[feat_name];
-                        let vals = match stat {
-                            "max" => &s.max,
-                            "mean" => &s.mean,
-                            "min" => &s.min,
-                            _ => &s.std,
-                        };
-                        for &v in vals {
+                        for v in pick(stat, e) {
                             b.values().append_value(v);
                         }
                         b.append(true);
@@ -719,18 +1014,32 @@ impl DatasetWriter {
     fn build_info(&self) -> Info {
         let mut features = BTreeMap::new();
         for f in &self.spec.features {
-            features.insert(
-                f.name.clone(),
-                FeatureInfo {
+            let info = match &f.kind {
+                FeatureKind::Vector { dim, names } => FeatureInfo {
                     dtype: "float32".into(),
-                    shape: vec![f.dim as u64],
-                    names: match &f.names {
+                    shape: vec![*dim as u64],
+                    names: match names {
                         Some(n) => serde_json::json!(n),
                         None => serde_json::Value::Null,
                     },
                     fps: Some(self.spec.fps),
                 },
-            );
+                // Exactly the entry lerobot's own `LeRobotDataset.create`
+                // writes for `dtype: "image"`: shape is (h, w, c) and names
+                // MUST be this list — `dataset_to_policy_features` checks
+                // `names[2] in ("channel", "channels")` to flip HWC→CHW.
+                FeatureKind::Image {
+                    height,
+                    width,
+                    channels,
+                } => FeatureInfo {
+                    dtype: "image".into(),
+                    shape: vec![*height as u64, *width as u64, *channels as u64],
+                    names: serde_json::json!(["height", "width", "channels"]),
+                    fps: Some(self.spec.fps),
+                },
+            };
+            features.insert(f.name.clone(), info);
         }
         for (name, dtype) in [
             ("timestamp", "float32"),
@@ -767,6 +1076,153 @@ impl DatasetWriter {
             data_path: DEFAULT_DATA_PATH.into(),
             video_path: None,
             features,
+        }
+    }
+}
+
+/// Decode-validate one PNG frame and compute its per-channel [`PixelStats`]
+/// (normalized to lerobot's [0, 1] scale). The bytes themselves are stored
+/// verbatim — this decode exists to reject wrong-shaped frames LOUDLY at
+/// `add_frame` time and to feed the image stats lerobot expects.
+fn decode_png_stats(
+    name: &str,
+    bytes: &[u8],
+    height: usize,
+    width: usize,
+    channels: usize,
+) -> Result<PixelStats, Error> {
+    let err = |msg: String| Error::Format(format!("image feature '{name}': {msg}"));
+    // png 0.18's Decoder wants Read + Seek — a Cursor over the slice provides both.
+    let mut decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+    // Normalize palette / sub-8-bit images to plain 8-bit samples so the
+    // channel check below sees real channels, whatever the encoder chose.
+    decoder.set_transformations(png::Transformations::EXPAND);
+    let mut reader = decoder
+        .read_info()
+        .map_err(|e| err(format!("not a decodable PNG: {e}")))?;
+    let size = reader
+        .output_buffer_size()
+        .ok_or_else(|| err("PNG output size overflows".into()))?;
+    let mut buf = vec![0u8; size];
+    let info = reader
+        .next_frame(&mut buf)
+        .map_err(|e| err(format!("PNG decode failed: {e}")))?;
+    if info.bit_depth != png::BitDepth::Eight {
+        return Err(err(format!(
+            "expected 8-bit samples, decoded {:?}",
+            info.bit_depth
+        )));
+    }
+    let got_c = info.color_type.samples();
+    if (info.height as usize, info.width as usize, got_c) != (height, width, channels) {
+        return Err(err(format!(
+            "decoded {}x{}x{got_c} (h x w x channels), spec declares {height}x{width}x{channels}",
+            info.height, info.width
+        )));
+    }
+    let data = &buf[..info.buffer_size()];
+    if data.len() != height * width * channels {
+        return Err(err(format!(
+            "decoded byte count {} != h*w*c = {}",
+            data.len(),
+            height * width * channels
+        )));
+    }
+    let mut st = PixelStats {
+        min: vec![f64::INFINITY; channels],
+        max: vec![f64::NEG_INFINITY; channels],
+        sum: vec![0.0; channels],
+        sumsq: vec![0.0; channels],
+        pixels: (height * width) as u64,
+    };
+    for px in data.chunks_exact(channels) {
+        for (j, &b) in px.iter().enumerate() {
+            let v = f64::from(b) / 255.0;
+            if v < st.min[j] {
+                st.min[j] = v;
+            }
+            if v > st.max[j] {
+                st.max[j] = v;
+            }
+            st.sum[j] += v;
+            st.sumsq[j] += v * v;
+        }
+    }
+    Ok(st)
+}
+
+/// Fold per-frame pixel stats into one episode-level [`FeatureStats`]:
+/// per-channel population stats over EVERY pixel of every frame, with
+/// lerobot's `count = [n_frames]` convention (pixels-per-frame is constant
+/// per feature, so the frame-weighted aggregation in `aggregate_stats` stays
+/// exact for images too).
+fn fold_image_stats(frames: &[ImageFrame]) -> FeatureStats {
+    let c = frames.first().map_or(0, |f| f.stats.min.len());
+    let mut min = vec![f64::INFINITY; c];
+    let mut max = vec![f64::NEG_INFINITY; c];
+    let mut sum = vec![0.0; c];
+    let mut sumsq = vec![0.0; c];
+    let mut total_px = 0u64;
+    for f in frames {
+        for j in 0..c {
+            if f.stats.min[j] < min[j] {
+                min[j] = f.stats.min[j];
+            }
+            if f.stats.max[j] > max[j] {
+                max[j] = f.stats.max[j];
+            }
+            sum[j] += f.stats.sum[j];
+            sumsq[j] += f.stats.sumsq[j];
+        }
+        total_px += f.stats.pixels;
+    }
+    let denom = total_px.max(1) as f64;
+    let mean: Vec<f64> = sum.iter().map(|s| s / denom).collect();
+    let std: Vec<f64> = sumsq
+        .iter()
+        .zip(&mean)
+        .map(|(sq, m)| (sq / denom - m * m).max(0.0).sqrt())
+        .collect();
+    FeatureStats {
+        min,
+        max,
+        mean,
+        std,
+        count: vec![frames.len() as u64],
+    }
+}
+
+/// `meta/stats.json` value shapes: vector features keep [`FeatureStats`]'s
+/// flat lists; image features nest each value as `(c, 1, 1)` — exactly the
+/// shape lerobot's own writer emits so normalization broadcasts over CHW.
+/// Untagged, so both serialize as the bare stats object.
+#[derive(serde::Serialize)]
+#[serde(untagged)]
+enum StatsJson<'a> {
+    Flat(&'a FeatureStats),
+    Image(NestedFeatureStats),
+}
+
+/// [`FeatureStats`] with `(c, 1, 1)`-nested values (field order matches
+/// `FeatureStats` so both variants pretty-print with the same key order).
+#[derive(serde::Serialize)]
+struct NestedFeatureStats {
+    min: Vec<[[f64; 1]; 1]>,
+    max: Vec<[[f64; 1]; 1]>,
+    mean: Vec<[[f64; 1]; 1]>,
+    std: Vec<[[f64; 1]; 1]>,
+    count: Vec<u64>,
+}
+
+impl From<&FeatureStats> for NestedFeatureStats {
+    fn from(s: &FeatureStats) -> Self {
+        let nest = |v: &[f64]| v.iter().map(|&x| [[x]]).collect();
+        Self {
+            min: nest(&s.min),
+            max: nest(&s.max),
+            mean: nest(&s.mean),
+            std: nest(&s.std),
+            count: s.count.clone(),
         }
     }
 }

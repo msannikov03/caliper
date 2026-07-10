@@ -19,3 +19,8 @@ serde_json.workspace = true
 # one arrow in the tree, snappy compression like lerobot's own writers.
 arrow = { version = "59", default-features = false }
 parquet = { version = "59", default-features = false, features = ["arrow", "snap"] }
+# Decode-only: validating pre-encoded PNG frames (dims/channels/bit depth) and
+# computing the per-channel image stats lerobot expects in stats.json. Pixels
+# are never re-encoded — the writer stores the caller's bytes verbatim. Same
+# version the workspace lockfile already pins (via tauri's icon handling).
+png = "0.18"

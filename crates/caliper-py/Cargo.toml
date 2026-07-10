@@ -23,6 +23,12 @@ doctest = false
 caliper = { workspace = true, features = ["dataset"] }
 caliper-collision.workspace = true
 caliper-dataset.workspace = true
+# Default features only (= NO `mujoco` feature): this pulls just the
+# pure-string MJCF generator (`caliper_sim_mujoco::mjcf`), which compiles and
+# runs without libmujoco — the Python wheel must never link MuJoCo. The
+# workspace dep spec carries no features, and nothing in this crate's graph
+# enables `mujoco`.
+caliper-sim-mujoco.workspace = true
 pyo3.workspace = true
 nalgebra.workspace = true
 serde_json.workspace = true

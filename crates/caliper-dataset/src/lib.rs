@@ -1,7 +1,10 @@
 //! Native LeRobotDataset **v3.0** writer/reader.
 //!
 //! Writes and reads the on-disk format of `lerobot` 0.4.4 (`codebase_version`
-//! `"v3.0"`), video-less this wave — lerobot loads such datasets fine. The
+//! `"v3.0"`), video-less — but camera data IS supported via lerobot's
+//! `dtype: "image"` features (pre-encoded PNG bytes stored inline in the data
+//! parquet as `struct<bytes, path>`, the HF `datasets.Image` layout; lerobot
+//! trains on `image` and `video` features identically). The
 //! format was reverse-engineered from two ground truths:
 //!
 //! 1. the installed `lerobot` sources (`datasets/lerobot_dataset.py`,
@@ -44,7 +47,7 @@ pub use error::Error;
 pub use meta::{FeatureInfo, Info, format_chunk_file_path};
 pub use reader::{DatasetReader, EpisodeData, EpisodeMeta};
 pub use stats::{FeatureStats, aggregate_stats};
-pub use writer::{DatasetSpec, DatasetWriter, FeatureSpec};
+pub use writer::{DatasetSpec, DatasetWriter, FeatureKind, FeatureSpec};
 
 /// `codebase_version` this crate writes and accepts.
 pub const CODEBASE_VERSION: &str = "v3.0";

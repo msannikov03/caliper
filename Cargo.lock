@@ -800,6 +800,7 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "parquet",
+ "png 0.18.1",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -921,6 +922,7 @@ dependencies = [
  "caliper",
  "caliper-collision",
  "caliper-dataset",
+ "caliper-sim-mujoco",
  "nalgebra",
  "pyo3",
  "serde_json",

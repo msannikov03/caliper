@@ -20,9 +20,10 @@ use caliper_dataset::{
     DatasetReader as EngineReaderV3, DatasetSpec as DatasetSpecV3, DatasetWriter as EngineWriterV3,
     FeatureSpec,
 };
+use caliper_sim_mujoco::mjcf::{MjcfOptions, mjcf_from_model};
 use nalgebra::{DMatrix, Matrix3, UnitQuaternion, Vector3};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList};
+use pyo3::types::{PyBytes, PyDict, PyList};
 use std::sync::{Arc, Mutex};
 
 /// Engine version string.
@@ -1444,11 +1445,26 @@ struct RecorderV3 {
 
 #[pymethods]
 impl RecorderV3 {
+    /// `image_features` declares camera streams as lerobot `dtype: "image"`
+    /// features: a list of `(name, height, width, channels)` tuples (e.g.
+    /// `("observation.images.cam", 96, 96, 3)`). Frames for them are passed
+    /// to `append(..., images=...)` as PRE-ENCODED PNG bytes — encode
+    /// Python-side (PIL/cv2); the writer validates each frame by decoding and
+    /// stores the bytes verbatim in the native lerobot image layout.
     #[new]
-    #[pyo3(signature = (robot, out, fps=30))]
-    fn new(robot: &Robot, out: &str, fps: u32) -> PyResult<Self> {
-        let inner = EngineWriterV3::create(out, dataset_spec_v3(&robot.inner.model, fps))
-            .map_err(ds_err)?;
+    #[pyo3(signature = (robot, out, fps=30, image_features=None))]
+    fn new(
+        robot: &Robot,
+        out: &str,
+        fps: u32,
+        image_features: Option<Vec<(String, usize, usize, usize)>>,
+    ) -> PyResult<Self> {
+        let mut spec = dataset_spec_v3(&robot.inner.model, fps);
+        for (name, height, width, channels) in image_features.unwrap_or_default() {
+            spec.features
+                .push(FeatureSpec::image(name, height, width, channels));
+        }
+        let inner = EngineWriterV3::create(out, spec).map_err(ds_err)?;
         Ok(RecorderV3 {
             inner: Mutex::new(Some(inner)),
             task: None,
@@ -1464,18 +1480,34 @@ impl RecorderV3 {
         self.task = Some(task.to_string());
         Ok(())
     }
-    fn append(&mut self, state: Vec<f64>, action: Vec<f64>, t: f64) -> PyResult<()> {
+    /// Append one frame. Datasets declared with `image_features` must pass
+    /// `images`: a dict mapping EVERY image feature name to that frame's
+    /// pre-encoded PNG bytes.
+    #[pyo3(signature = (state, action, t, images=None))]
+    fn append(
+        &mut self,
+        state: Vec<f64>,
+        action: Vec<f64>,
+        t: f64,
+        images: Option<std::collections::BTreeMap<String, Vec<u8>>>,
+    ) -> PyResult<()> {
         finite_or_err("state", &state)?;
         finite_or_err("action", &action)?;
         if self.task.is_none() {
             return Err(pyo3::exceptions::PyValueError::new_err("no open episode"));
         }
+        let images = images.unwrap_or_default();
+        let image_refs: Vec<(&str, &[u8])> = images
+            .iter()
+            .map(|(name, png)| (name.as_str(), png.as_slice()))
+            .collect();
         self.with_writer(|w| {
-            w.add_frame_at(
+            w.add_frame_at_with_images(
                 &[
                     ("observation.state", state.as_slice()),
                     ("action", action.as_slice()),
                 ],
+                &image_refs,
                 t,
             )
         })
@@ -1597,6 +1629,31 @@ impl DatasetReaderV3 {
         let states = take("observation.state")?;
         let actions = take("action")?;
         Ok((states, actions, e.timestamps))
+    }
+    /// Names of the dataset's `dtype: "image"` features (sorted). Empty for
+    /// image-less datasets.
+    #[getter]
+    fn image_features(&self) -> Vec<String> {
+        self.inner
+            .info()
+            .features
+            .iter()
+            .filter(|(_, f)| f.dtype == "image")
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+    /// Read one episode's camera frames → dict mapping each image feature
+    /// name to a list of per-frame encoded image bytes (PNG for datasets
+    /// written by Caliper or lerobot). Empty dict for image-less datasets.
+    fn read_episode_images(&self, py: Python<'_>, episode: usize) -> PyResult<Py<PyDict>> {
+        let e = self.inner.read_episode(episode).map_err(ds_err)?;
+        let d = PyDict::new(py);
+        for (name, frames) in &e.images {
+            let list: Vec<Bound<'_, PyBytes>> =
+                frames.iter().map(|png| PyBytes::new(py, png)).collect();
+            d.set_item(name, list)?;
+        }
+        Ok(d.into())
     }
 }
 
@@ -2219,6 +2276,57 @@ fn calibrate_joint_offsets(
     Ok(d.into())
 }
 
+// ===== MJCF export (module function) =====
+
+/// Generate a minimal MuJoCo MJCF document (an XML string) from a robot
+/// model: kinematic tree, hinge/slide joints, inertials, primitive collision
+/// geoms, optional ground plane. Pure string generation — nothing here links
+/// or requires MuJoCo; feed the result to `mujoco.MjModel.from_xml_string`.
+///
+/// `ground` adds an infinite ground plane at that world height. `extra_xml`
+/// is injected VERBATIM inside `<worldbody>` (after the ground plane, before
+/// the robot bodies) — the hook for `<camera>`/`<geom>`/`<light>` elements,
+/// e.g. an over-the-shoulder camera:
+/// `<camera name="ots" pos="1.1 -1.1 0.9" xyaxes="0.707 0.707 0 -0.4 0.4 0.825"/>`.
+///
+/// Convex-hull (mesh) colliders are not exported to MJCF; if the model has
+/// any, a `UserWarning` reports the reduced MuJoCo collision coverage.
+#[pyfunction]
+#[pyo3(signature = (robot, ground=None, extra_xml=None, timestep=1e-3, joint_damping=0.0))]
+fn model_to_mjcf(
+    py: Python<'_>,
+    robot: &Robot,
+    ground: Option<f64>,
+    extra_xml: Option<String>,
+    timestep: f64,
+    joint_damping: f64,
+) -> PyResult<String> {
+    let opt = MjcfOptions {
+        timestep,
+        joint_damping,
+        ground_plane: ground,
+        extra_worldbody_xml: extra_xml,
+        ..Default::default()
+    };
+    let doc = mjcf_from_model(&robot.inner.model, &opt)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+    if doc.skipped_hull_colliders > 0 {
+        let msg = std::ffi::CString::new(format!(
+            "model_to_mjcf: {} convex-hull (mesh) collider(s) were NOT exported — the MuJoCo \
+             model has less collision coverage than caliper on the same robot",
+            doc.skipped_hull_colliders
+        ))
+        .expect("no NUL in message");
+        PyErr::warn(
+            py,
+            &py.get_type::<pyo3::exceptions::PyUserWarning>(),
+            &msg,
+            1,
+        )?;
+    }
+    Ok(doc.xml)
+}
+
 #[pymodule]
 fn _caliper(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", caliper::VERSION)?;
@@ -2228,6 +2336,7 @@ fn _caliper(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(log6, m)?)?;
     m.add_function(wrap_pyfunction!(exp6, m)?)?;
     m.add_function(wrap_pyfunction!(calibrate_joint_offsets, m)?)?;
+    m.add_function(wrap_pyfunction!(model_to_mjcf, m)?)?;
     m.add_function(wrap_pyfunction!(dataset_delete_episodes, m)?)?;
     m.add_function(wrap_pyfunction!(dataset_split_episode, m)?)?;
     m.add_function(wrap_pyfunction!(dataset_merge_episodes, m)?)?;

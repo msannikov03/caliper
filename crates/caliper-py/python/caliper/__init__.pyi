@@ -79,6 +79,23 @@ def calibrate_joint_offsets(
     """
     ...
 
+def model_to_mjcf(
+    robot: "Robot",
+    ground: Optional[float] = ...,
+    extra_xml: Optional[str] = ...,
+    timestep: float = ...,
+    joint_damping: float = ...,
+) -> str:
+    """Generate a minimal MuJoCo MJCF document (XML string) from the robot.
+
+    Pure string generation — does not link or require MuJoCo. `ground` adds
+    an infinite ground plane at that world height; `extra_xml` is injected
+    verbatim inside `<worldbody>` (after the ground plane, before the robot
+    bodies) — the hook for `<camera>`/`<geom>`/`<light>` elements. Convex-hull
+    (mesh) colliders are not exported; a `UserWarning` reports any skipped.
+    """
+    ...
+
 def dataset_delete_episodes(root: str, episodes: Sequence[int]) -> None:
     """Delete episodes from a LeRobotDataset v3.0 at `root` (offline edit).
 
@@ -519,12 +536,35 @@ class DatasetReader:
 
 class RecorderV3:
     """Writes a LeRobotDataset v3.0 to disk (native lerobot >= 0.4 layout,
-    loadable by ``LeRobotDataset`` directly — no converter)."""
+    loadable by ``LeRobotDataset`` directly — no converter).
 
-    def __init__(self, robot: "Robot", out: str, fps: int = ...) -> None: ...
+    ``image_features`` declares camera streams as lerobot ``dtype: "image"``
+    features: ``(name, height, width, channels)`` tuples, e.g.
+    ``("observation.images.cam", 96, 96, 3)``. Their frames are passed to
+    ``append(..., images=...)`` as PRE-ENCODED PNG bytes (encode Python-side
+    with PIL/cv2); each frame is validated by decoding and the bytes are
+    stored verbatim in the native lerobot image layout."""
+
+    def __init__(
+        self,
+        robot: "Robot",
+        out: str,
+        fps: int = ...,
+        image_features: Optional[Sequence[tuple[str, int, int, int]]] = ...,
+    ) -> None: ...
 
     def start_episode(self, task: str) -> None: ...
-    def append(self, state: _Vec, action: _Vec, t: float) -> None: ...
+    def append(
+        self,
+        state: _Vec,
+        action: _Vec,
+        t: float,
+        images: Optional[dict[str, bytes]] = ...,
+    ) -> None:
+        """Append one frame. Datasets declared with ``image_features`` must
+        pass ``images``: every image feature name → that frame's PNG bytes."""
+        ...
+
     def finalize_episode(self) -> None: ...
     def close(self) -> str:
         """Finalize the dataset (writes meta/) and return its path."""
@@ -555,6 +595,18 @@ class DatasetReaderV3:
         self, episode: int
     ) -> tuple[list[list[float]], list[list[float]], list[float]]:
         """Read an episode → (states, actions, timestamps)."""
+        ...
+
+    @property
+    def image_features(self) -> list[str]:
+        """Names of the dataset's ``dtype: "image"`` features (sorted);
+        empty for image-less datasets."""
+        ...
+
+    def read_episode_images(self, episode: int) -> dict[str, list[bytes]]:
+        """Read one episode's camera frames → each image feature name to a
+        list of per-frame encoded image bytes (PNG for datasets written by
+        Caliper or lerobot). Empty dict for image-less datasets."""
         ...
 
 class CollisionModel:

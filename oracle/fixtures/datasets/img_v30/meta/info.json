@@ -1,0 +1,86 @@
+{
+    "codebase_version": "v3.0",
+    "robot_type": "caliper",
+    "total_episodes": 2,
+    "total_frames": 6,
+    "total_tasks": 1,
+    "chunks_size": 1000,
+    "data_files_size_in_mb": 100,
+    "video_files_size_in_mb": 200,
+    "fps": 30,
+    "splits": {
+        "train": "0:2"
+    },
+    "data_path": "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet",
+    "video_path": null,
+    "features": {
+        "observation.state": {
+            "dtype": "float32",
+            "shape": [
+                2
+            ],
+            "names": [
+                "j1",
+                "j2"
+            ]
+        },
+        "action": {
+            "dtype": "float32",
+            "shape": [
+                2
+            ],
+            "names": [
+                "j1",
+                "j2"
+            ]
+        },
+        "observation.images.cam": {
+            "dtype": "image",
+            "shape": [
+                32,
+                32,
+                3
+            ],
+            "names": [
+                "height",
+                "width",
+                "channels"
+            ]
+        },
+        "timestamp": {
+            "dtype": "float32",
+            "shape": [
+                1
+            ],
+            "names": null
+        },
+        "frame_index": {
+            "dtype": "int64",
+            "shape": [
+                1
+            ],
+            "names": null
+        },
+        "episode_index": {
+            "dtype": "int64",
+            "shape": [
+                1
+            ],
+            "names": null
+        },
+        "index": {
+            "dtype": "int64",
+            "shape": [
+                1
+            ],
+            "names": null
+        },
+        "task_index": {
+            "dtype": "int64",
+            "shape": [
+                1
+            ],
+            "names": null
+        }
+    }
+}

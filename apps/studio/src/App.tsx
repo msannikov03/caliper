@@ -3,6 +3,7 @@ import { Canvas } from "@react-three/fiber";
 import { Grid, OrbitControls, GizmoHelper, GizmoViewport } from "@react-three/drei";
 import { invoke } from "@tauri-apps/api/core";
 import { RobotView } from "./three/RobotView";
+import { PropsLayer } from "./three/PropsLayer";
 import { IkGizmo } from "./three/IkGizmo";
 import { Toolbar, openUrdf } from "./ui/Toolbar";
 import { Palette } from "./ui/Palette";
@@ -154,6 +155,8 @@ export default function App() {
           <Canvas camera={{ position: [0.7, 0.7, 0.7], fov: 50 }}>
             <SceneChrome />
             <RobotView />
+            {/* contact-sim free props follow the same playback clock */}
+            <PropsLayer />
             {!docked && <IkGizmo />}
           </Canvas>
           {!docked && <JointPanel />}

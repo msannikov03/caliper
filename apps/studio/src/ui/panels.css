@@ -108,3 +108,86 @@
 .pose-panel .rp-row b.bad {
   color: var(--singular);
 }
+
+/* --- simulate panel: contact-engine segmented toggle ---
+   Reuses the global .segmented chrome; in-panel it stretches full width and
+   its buttons must NOT pick up the accent-filled .sim-panel button look. */
+.sim-panel .sim-engine {
+  display: flex;
+  align-self: stretch;
+  padding: 2px;
+  gap: 2px;
+}
+.sim-panel .sim-engine button {
+  flex: 1;
+  background: transparent;
+  border: none;
+  color: var(--muted);
+  font-weight: 500;
+  padding: 4px 0;
+}
+.sim-panel .sim-engine button:hover:not(:disabled) {
+  background: transparent;
+  color: var(--text);
+}
+.sim-panel .sim-engine button.active {
+  color: #fff;
+  background: var(--raised-2);
+  box-shadow: var(--e1), 0 0 0 1px var(--border) inset;
+}
+.sim-panel .sim-engine button.active:hover:not(:disabled) {
+  background: var(--raised-2);
+}
+
+/* --- simulate panel: compact free-prop list (contact view) --- */
+.sim-panel .prop-add {
+  display: flex;
+  gap: 6px;
+}
+.sim-panel .prop-add button {
+  flex: 1;
+  background: var(--raised);
+  border: 1px solid var(--border-2);
+  color: var(--text);
+  font-weight: 500;
+  padding: 4px 0;
+}
+.sim-panel .prop-add button:hover:not(:disabled) {
+  background: var(--raised-2);
+}
+.sim-panel .prop-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.sim-panel .prop-list li {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  letter-spacing: 0.02em;
+  color: var(--muted);
+}
+.sim-panel .prop-list .p-name {
+  flex: 1;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sim-panel .prop-list .p-del {
+  background: var(--raised);
+  border: 1px solid var(--border-2);
+  color: var(--muted);
+  font-weight: 500;
+  padding: 0 7px;
+  line-height: 1.5;
+}
+.sim-panel .prop-list .p-del:hover:not(:disabled) {
+  color: var(--singular);
+  background: var(--raised-2);
+}

@@ -44,6 +44,11 @@ export interface CommandCtx {
   urdfPath: string | null;
   /** a dataset is open in Data mode (gates Refresh dataset) */
   datasetLoaded: boolean;
+  /** this build exposes the MuJoCo contact engine (sim_engines ∋ "mujoco").
+   *  A build capability, not a transient gate: when false the contact-sim
+   *  commands are NOT listed at all — the palette is byte-identical to a
+   *  pre-contact build. */
+  contactEngine: boolean;
   actions: {
     openUrdf: () => void;
     openPath: (path: string, record: boolean) => void;
@@ -54,6 +59,9 @@ export interface CommandCtx {
     gravityDrop: () => void; // runGravityDrop
     planRrtHome: () => void; // runPlan(0…0)
     checkCollision: () => void; // checkCollision(null)
+    contactDrop: () => void; // runContactSim("drop")
+    contactHold: () => void; // runContactSim("hold")
+    contactDriveHome: () => void; // runContactSim("drive_to", 0…0)
     runGraph: () => void;
     validateGraph: () => void;
     duplicateSelection: () => void; // duplicateGraphSelection (⌘D in the editor)
@@ -87,8 +95,18 @@ export function modeNeedsRobot(id: StudioMode): boolean {
 /** Assemble the full command list in section order. Gated commands stay
  *  visible but disabled, with the gate spelled out in the hint. */
 export function buildCommands(ctx: CommandCtx): Command[] {
-  const { fixtures, recents, poses, mode, robotLoaded, hasInertia, urdfPath, datasetLoaded, actions } =
-    ctx;
+  const {
+    fixtures,
+    recents,
+    poses,
+    mode,
+    robotLoaded,
+    hasInertia,
+    urdfPath,
+    datasetLoaded,
+    contactEngine,
+    actions,
+  } = ctx;
   const noRobot = robotLoaded ? null : "no robot loaded";
   const cmds: Command[] = [];
 
@@ -204,6 +222,34 @@ export function buildCommands(ctx: CommandCtx): Command[] {
     enabled: simGate === null,
     run: actions.checkCollision,
   });
+  // contact sim exists only in mujoco-enabled builds — absent engine, absent
+  // commands (mode/inertia gates then behave exactly like the builtin runs)
+  if (contactEngine) {
+    cmds.push({
+      id: "sim.contact.drop",
+      title: "Run contact sim: gravity drop",
+      hint: dynGate ?? undefined,
+      section: "Simulate",
+      enabled: dynGate === null,
+      run: actions.contactDrop,
+    });
+    cmds.push({
+      id: "sim.contact.hold",
+      title: "Run contact sim: hold pose",
+      hint: dynGate ?? undefined,
+      section: "Simulate",
+      enabled: dynGate === null,
+      run: actions.contactHold,
+    });
+    cmds.push({
+      id: "sim.contact.home",
+      title: "Run contact sim: drive to home",
+      hint: dynGate ?? undefined,
+      section: "Simulate",
+      enabled: dynGate === null,
+      run: actions.contactDriveHome,
+    });
+  }
 
   // ---- Graph ----
   const graphGate = noRobot ?? (mode === "graph" ? null : "switch to Graph mode");

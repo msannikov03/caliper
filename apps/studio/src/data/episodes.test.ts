@@ -106,6 +106,7 @@ describe("palette — dataset command gating", () => {
     hasInertia: false,
     urdfPath: null,
     datasetLoaded: false,
+    contactEngine: false,
     actions: {
       openUrdf: noop,
       openPath: noop,
@@ -116,6 +117,9 @@ describe("palette — dataset command gating", () => {
       gravityDrop: noop,
       planRrtHome: noop,
       checkCollision: noop,
+      contactDrop: noop,
+      contactHold: noop,
+      contactDriveHome: noop,
       runGraph: noop,
       validateGraph: noop,
       duplicateSelection: noop,

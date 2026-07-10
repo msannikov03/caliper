@@ -48,6 +48,9 @@ pub struct MujocoSim {
     joint_names: Vec<String>,
     nu: usize,
     skipped_hull_colliders: usize,
+    /// `(prop name, MuJoCo body id)` for every free prop passed at build,
+    /// in [`MjcfOptions::props`] order (empty for raw-MJCF loads).
+    props: Vec<(String, usize)>,
 }
 
 impl MujocoSim {
@@ -62,7 +65,12 @@ impl MujocoSim {
         let doc = mjcf::mjcf_from_model(m, opt)?;
         let mj =
             MjModel::from_xml_string(&doc.xml).map_err(|e| MujocoError::Load(e.to_string()))?;
-        let sim = Self::from_parts(mj, m.joint_names.clone(), doc.skipped_hull_colliders)?;
+        let sim = Self::from_parts(
+            mj,
+            m.joint_names.clone(),
+            doc.skipped_hull_colliders,
+            &doc.prop_bodies,
+        )?;
         // Our MJCF contains exactly the caliper joints — anything else is a
         // generator bug, not a user error.
         debug_assert_eq!(sim.qpos_adr.len(), m.ndof);
@@ -81,13 +89,14 @@ impl MujocoSim {
                     .unwrap_or_else(|| format!("joint{id}"))
             })
             .collect();
-        Self::from_parts(mj, names, 0)
+        Self::from_parts(mj, names, 0, &[])
     }
 
     fn from_parts(
         mj: MjModel,
         joint_names: Vec<String>,
         skipped_hull_colliders: usize,
+        prop_bodies: &[(String, String)],
     ) -> Result<Self, MujocoError> {
         let mut qpos_adr = Vec::with_capacity(joint_names.len());
         let mut dof_adr = Vec::with_capacity(joint_names.len());
@@ -112,6 +121,15 @@ impl MujocoSim {
             return Err(MujocoError::Load(format!("model timestep {h} invalid")));
         }
         let nu = mj.nu() as usize;
+        // Resolve prop body ids by NAME while we still own the model — our
+        // MJCF emitted these bodies, so a miss is a generator bug surfaced loud.
+        let mut props = Vec::with_capacity(prop_bodies.len());
+        for (pname, bname) in prop_bodies {
+            let id = mj
+                .name_to_id(MjtObj::mjOBJ_BODY, bname)
+                .ok_or_else(|| MujocoError::MissingBody(bname.clone()))?;
+            props.push((pname.clone(), id));
+        }
         let mut data = MjData::new(Arc::new(mj));
         data.forward(); // consistent derived quantities before first read
         Ok(Self {
@@ -122,6 +140,7 @@ impl MujocoSim {
             joint_names,
             nu,
             skipped_hull_colliders,
+            props,
         })
     }
 
@@ -290,6 +309,35 @@ impl MujocoSim {
     /// frame for contact index `i` (`[0.0; 6]` when out of range).
     pub fn contact_force(&self, i: usize) -> [f64; 6] {
         self.data.contact_force(i)
+    }
+
+    // ---- bodies & props ----
+    /// World pose of a named MJCF body from the last `step`/`forward`:
+    /// `(xpos, xquat)` with the quaternion in MuJoCo order `[w, x, y, z]`.
+    /// Robot bodies are `b_{joint}`, props `prop_{name}` (see [`mjcf`]).
+    pub fn body_pose(&self, name: &str) -> Result<([f64; 3], [f64; 4]), MujocoError> {
+        let id = self
+            .data
+            .model()
+            .name_to_id(MjtObj::mjOBJ_BODY, name)
+            .ok_or_else(|| MujocoError::MissingBody(name.to_string()))?;
+        Ok((self.data.xpos()[id], self.data.xquat()[id]))
+    }
+
+    /// Prop names passed at build, in [`MjcfOptions::props`] order.
+    pub fn prop_names(&self) -> Vec<&str> {
+        self.props.iter().map(|(n, _)| n.as_str()).collect()
+    }
+
+    /// `(name, world pos, world quat [w,x,y,z])` for every prop, in build
+    /// order, from the last `step`/`forward`. Empty for raw-MJCF loads.
+    pub fn prop_poses(&self) -> Vec<(String, [f64; 3], [f64; 4])> {
+        let xp = self.data.xpos();
+        let xq = self.data.xquat();
+        self.props
+            .iter()
+            .map(|(n, id)| (n.clone(), xp[*id], xq[*id]))
+            .collect()
     }
 
     // ---- escape hatches ----

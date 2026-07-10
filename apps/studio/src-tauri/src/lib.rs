@@ -1129,6 +1129,13 @@ struct SimTrajectoryDto {
     ok: bool,
     reached: f64,
     max_jerk_ratio: f64,
+    // contact-sim extension (kind = "contact"; absent for builtin results):
+    /// Per-prop world-pose tracks, aligned with `times`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    props: Option<Vec<PropTrackDto>>,
+    /// MuJoCo contact count at each sample, aligned with `times`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    contacts: Option<Vec<u32>>,
 }
 
 #[derive(Deserialize)]
@@ -1262,6 +1269,8 @@ fn sim_drop_impl(
         ok: true,
         reached: 1.0,
         max_jerk_ratio: 0.0,
+        props: None,
+        contacts: None,
     })
 }
 
@@ -1466,6 +1475,335 @@ fn control_run_impl(
         ok: true,
         reached: 1.0,
         max_jerk_ratio: 0.0,
+        props: None,
+        contacts: None,
+    })
+}
+
+// ===== contact sim (MuJoCo, cargo feature `mujoco` — default OFF) =====
+//
+// The feature stays OFF in release bundles: mujoco-rs links a SHARED
+// libmujoco we do not bundle (dylib-in-.app shipping unsolved — see
+// Cargo.toml). Everything below is graceful without it: `sim_engines` omits
+// "mujoco" (the FE hides the toggle) and `sim_contact_run` returns a clear Err.
+
+/// One free-floating prop in a contact-sim request. `kind` selects the size
+/// fields exactly like `VisualDto`: box → `half_extents`; sphere → `radius`;
+/// cylinder → `radius` + `length` (FULL length, Z-aligned).
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(not(feature = "mujoco"), allow(dead_code))]
+struct PropDto {
+    name: String,
+    kind: String,
+    half_extents: Option<[f64; 3]>,
+    radius: Option<f64>,
+    length: Option<f64>,
+    /// Initial world position of the primitive's center.
+    pos: [f64; 3],
+    /// Initial world orientation, w-first (MJCF order); `None` = identity.
+    quat: Option<[f64; 4]>,
+    /// Mass in kg (default 0.1).
+    mass: Option<f64>,
+    rgba: Option<[f32; 4]>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(not(feature = "mujoco"), allow(dead_code))]
+struct SimContactReq {
+    q0: Vec<f64>,
+    /// "drop" (passive, zero torque) | "hold" (computed-torque hold at q0) |
+    /// "drive_to" (computed-torque toward `target`).
+    mode: String,
+    target: Option<Vec<f64>>,
+    #[serde(default)]
+    props: Vec<PropDto>,
+    duration_s: Option<f64>,
+    fps: Option<f64>,
+    /// Ground plane height (default 0.0).
+    ground: Option<f64>,
+    kp: Option<f64>,
+    kd: Option<f64>,
+}
+
+/// Baked world-pose track of one prop, echoing its shape/color so the renderer
+/// draws it without re-deriving anything. `frames[k]` (aligned with the parent
+/// DTO's `times[k]`) = `[x, y, z, qw, qx, qy, qz]`.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PropTrackDto {
+    name: String,
+    kind: String,
+    half_extents: Option<[f64; 3]>,
+    radius: Option<f64>,
+    length: Option<f64>,
+    rgba: Option<[f32; 4]>,
+    frames: Vec<[f64; 7]>,
+}
+
+/// Simulation engines this build can run: always `["builtin"]`, plus
+/// `"mujoco"` iff compiled with `--features mujoco`. The frontend uses this
+/// to show/hide the contact-sim controls — a missing engine is graceful.
+#[tauri::command]
+fn sim_engines() -> Vec<String> {
+    let mut engines = vec!["builtin".to_string()];
+    if cfg!(feature = "mujoco") {
+        engines.push("mujoco".to_string());
+    }
+    engines
+}
+
+/// Contact simulation (MuJoCo): drop/hold/drive_to with free props on a ground
+/// plane, baked into the SAME render-only SimTrajectoryDto transport
+/// (kind = "contact") extended with per-frame prop poses + contact counts.
+#[tauri::command]
+fn sim_contact_run(
+    req: SimContactReq,
+    state: tauri::State<'_, AppState>,
+) -> Result<SimTrajectoryDto, String> {
+    logged("sim_contact_run", sim_contact_run_impl(req, state))
+}
+
+#[cfg(not(feature = "mujoco"))]
+fn sim_contact_run_impl(
+    _req: SimContactReq,
+    _state: tauri::State<'_, AppState>,
+) -> Result<SimTrajectoryDto, String> {
+    Err("contact sim not compiled — build studio with --features mujoco".into())
+}
+
+#[cfg(feature = "mujoco")]
+fn sim_contact_run_impl(
+    req: SimContactReq,
+    state: tauri::State<'_, AppState>,
+) -> Result<SimTrajectoryDto, String> {
+    let guard = state.model.lock().map_err(|_| "state lock poisoned")?;
+    let model = guard.as_ref().ok_or("no robot loaded")?;
+    // Clone the model into an Arc and release the state lock BEFORE the heavy
+    // rollout, so other commands aren't frozen (same idiom as sim_drop).
+    let arc = Arc::new(model.clone());
+    drop(guard);
+    sim_contact_run_on(arc, req)
+}
+
+/// Wire prop → engine PropSpec (validation of dimensions/mass/quat lives in
+/// the generator, which rejects bad specs loudly before MuJoCo sees them).
+#[cfg(feature = "mujoco")]
+fn prop_spec(p: &PropDto) -> Result<caliper_sim_mujoco::mjcf::PropSpec, String> {
+    use caliper_sim_mujoco::mjcf::PropShape;
+    let shape = match p.kind.as_str() {
+        "box" => PropShape::Box {
+            half: p
+                .half_extents
+                .ok_or_else(|| format!("prop `{}`: box needs halfExtents", p.name))?,
+        },
+        "sphere" => PropShape::Sphere {
+            r: p.radius
+                .ok_or_else(|| format!("prop `{}`: sphere needs radius", p.name))?,
+        },
+        "cylinder" => PropShape::Cylinder {
+            r: p.radius
+                .ok_or_else(|| format!("prop `{}`: cylinder needs radius", p.name))?,
+            h: p.length
+                .ok_or_else(|| format!("prop `{}`: cylinder needs length", p.name))?,
+        },
+        k => {
+            return Err(format!(
+                "prop `{}`: unknown kind `{k}` (box|sphere|cylinder)",
+                p.name
+            ));
+        }
+    };
+    Ok(caliper_sim_mujoco::mjcf::PropSpec {
+        name: p.name.clone(),
+        shape,
+        pos: p.pos,
+        quat: p.quat,
+        mass: p.mass.unwrap_or(0.1),
+        rgba: p.rgba,
+    })
+}
+
+/// Testable core of `sim_contact_run` (no tauri::State so tests can drive it).
+#[cfg(feature = "mujoco")]
+fn sim_contact_run_on(arc: Arc<Model>, req: SimContactReq) -> Result<SimTrajectoryDto, String> {
+    use caliper_sim_mujoco::mjcf::MjcfOptions;
+    use caliper_sim_mujoco::{MujocoBackend, MujocoSim};
+
+    let model: &Model = arc.as_ref();
+    if !model.has_inertia {
+        return Err(
+            "this robot has no inertial data — load one with <inertial> (showcase6 or dyn_pendulum2)"
+                .into(),
+        );
+    }
+    let n = model.ndof;
+    if req.q0.len() != n || !req.q0.iter().all(|x| x.is_finite()) {
+        return Err(format!("q0 needs {n} finite values"));
+    }
+    let fps = req.fps.unwrap_or(50.0).clamp(1.0, 240.0);
+    let duration = req.duration_s.unwrap_or(4.0).clamp(0.1, 30.0);
+    let ground = req.ground.unwrap_or(0.0);
+    if !ground.is_finite() {
+        return Err("ground must be finite".into());
+    }
+    let kp = req.kp.unwrap_or(100.0);
+    let kd = req.kd.unwrap_or(20.0);
+    if !kp.is_finite() || !kd.is_finite() || kp < 0.0 || kd < 0.0 {
+        return Err("kp/kd must be finite and non-negative".into());
+    }
+    // hold = drive to the start pose itself; drive_to needs an explicit target.
+    let goal = match req.mode.as_str() {
+        "drop" => None,
+        "hold" => Some(req.q0.clone()),
+        "drive_to" => {
+            let t = req.target.as_ref().ok_or("drive_to needs a target")?;
+            if t.len() != n || !t.iter().all(|x| x.is_finite()) {
+                return Err(format!("target needs {n} finite values"));
+            }
+            Some(t.clone())
+        }
+        m => return Err(format!("unknown mode `{m}` (drop|hold|drive_to)")),
+    };
+    let specs = req
+        .props
+        .iter()
+        .map(prop_spec)
+        .collect::<Result<Vec<_>, _>>()?;
+    let opt = MjcfOptions {
+        ground_plane: Some(ground),
+        props: specs,
+        ..Default::default() // torque-direct, Earth gravity, 1 ms timestep
+    };
+
+    // Render cadence: an INTEGER number of sim steps per baked frame, so the
+    // MuJoCo clock and the sample clock can never drift apart.
+    let h = opt.timestep;
+    let spp = ((1.0 / fps / h).round() as usize).max(1);
+    let render_dt = spp as f64 * h;
+    let nsamp = ((duration / render_dt).ceil() as usize).max(1);
+
+    struct Bake {
+        times: Vec<f64>,
+        q: Vec<Vec<f64>>,
+        qd: Vec<Vec<f64>>,
+        tip_path: Vec<[f64; 3]>,
+        frames: Vec<Vec<[f64; 16]>>,
+        contacts: Vec<u32>,
+        prop_frames: Vec<Vec<[f64; 7]>>,
+    }
+    let mut bake = Bake {
+        times: vec![],
+        q: vec![],
+        qd: vec![],
+        tip_path: vec![],
+        frames: vec![],
+        contacts: vec![],
+        prop_frames: vec![Vec::new(); req.props.len()],
+    };
+    let record = |bake: &mut Bake, sim: &MujocoSim, t: f64| {
+        let q = sim.qpos();
+        let qd = sim.qvel();
+        let (fr, tp) = bake_frame_row(model, &q);
+        bake.times.push(t);
+        bake.q.push(q);
+        bake.qd.push(qd);
+        bake.tip_path.push(tp);
+        bake.frames.push(fr);
+        bake.contacts.push(sim.ncon() as u32);
+        for (i, (_, p, qt)) in sim.prop_poses().into_iter().enumerate() {
+            bake.prop_frames[i].push([p[0], p[1], p[2], qt[0], qt[1], qt[2], qt[3]]);
+        }
+    };
+
+    let mut settled = false;
+    match goal {
+        // "drop": passive dynamics — step MuJoCo directly, zero torque.
+        None => {
+            let mut sim =
+                MujocoSim::from_caliper_model_with(model, &opt).map_err(|e| e.to_string())?;
+            sim.set_state(&req.q0, &vec![0.0; n])
+                .map_err(|e| e.to_string())?;
+            record(&mut bake, &sim, 0.0);
+            for _ in 0..nsamp {
+                for _ in 0..spp {
+                    sim.step_once();
+                }
+                record(&mut bake, &sim, sim.time());
+            }
+        }
+        // "hold"/"drive_to": the EXISTING computed-torque ControlLoop drives
+        // the MuJoCo backend unchanged (same machinery as control_run).
+        Some(goal) => {
+            let mut backend =
+                MujocoBackend::with_options(model, &opt).map_err(|e| e.to_string())?;
+            backend
+                .set_state(&req.q0, &vec![0.0; n])
+                .map_err(|e| e.to_string())?;
+            let mut loopy = ControlLoop::new(backend, arc.clone(), h)
+                .map_err(|e| e.to_string())?
+                .with_gains(Gains { kp, kd });
+            let mut sp = HoldSetpoint::new(goal.clone());
+            record(&mut bake, loopy.backend().sim(), loopy.time());
+            for _ in 0..nsamp {
+                for _ in 0..spp {
+                    loopy.step(&mut sp, None).map_err(|e| e.to_string())?;
+                }
+                record(&mut bake, loopy.backend().sim(), loopy.time());
+                let q = bake.q.last().expect("just recorded");
+                let qd = bake.qd.last().expect("just recorded");
+                let qdmax = qd.iter().fold(0.0f64, |a, &x| a.max(x.abs()));
+                let qerr = q
+                    .iter()
+                    .zip(&goal)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0, f64::max);
+                if qdmax < 1e-3 && qerr < 1e-3 && loopy.time() > 0.1 {
+                    settled = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    let prop_tracks: Vec<PropTrackDto> = req
+        .props
+        .iter()
+        .zip(bake.prop_frames)
+        .map(|(p, frames)| PropTrackDto {
+            name: p.name.clone(),
+            kind: p.kind.clone(),
+            half_extents: p.half_extents,
+            radius: p.radius,
+            length: p.length,
+            rgba: p.rgba,
+            frames,
+        })
+        .collect();
+    // MuJoCo energy accounting is not enabled — zeros keep the playback-union
+    // shape without pretending to a drift number we did not measure.
+    let energy = vec![0.0; bake.times.len()];
+    Ok(SimTrajectoryDto {
+        kind: "contact".into(),
+        duration: *bake.times.last().unwrap_or(&0.0),
+        ndof: n,
+        dt: render_dt,
+        times: bake.times,
+        q: bake.q,
+        qd: bake.qd,
+        tip_path: bake.tip_path,
+        frames: bake.frames,
+        energy,
+        energy_drift: 0.0,
+        settled,
+        gravity: [0.0, 0.0, -9.81],
+        damping: 0.0,
+        ok: true,
+        reached: 1.0,
+        max_jerk_ratio: 0.0,
+        props: Some(prop_tracks),
+        contacts: Some(bake.contacts),
     })
 }
 
@@ -1649,6 +1987,8 @@ fn plan_run_impl(
         ok: true,
         reached: 1.0,
         max_jerk_ratio: 0.0,
+        props: None,
+        contacts: None,
     })
 }
 
@@ -2409,6 +2749,8 @@ pub fn run() {
             sim_drop,
             dynamics_at,
             control_run,
+            sim_engines,
+            sim_contact_run,
             check_collision,
             plan_run,
             reach_check,
@@ -2589,6 +2931,92 @@ mod tests {
         // the bake the command uses yields one render matrix per drawn frame
         let (fr, _tp) = bake_frame_row(&m, &q);
         assert_eq!(fr.len(), frames_at(&m, &q).len());
+    }
+
+    /// The default (feature-less) build advertises exactly the builtin engine.
+    #[cfg(not(feature = "mujoco"))]
+    #[test]
+    fn engines_builtin_only() {
+        assert_eq!(sim_engines(), vec!["builtin".to_string()]);
+    }
+
+    #[cfg(feature = "mujoco")]
+    #[test]
+    fn engines_include_mujoco() {
+        assert_eq!(
+            sim_engines(),
+            vec!["builtin".to_string(), "mujoco".to_string()]
+        );
+    }
+
+    /// Contact-sim bake: a dropped box prop settles on the ground plane; the
+    /// DTO carries aligned prop tracks + contact counts (kind = "contact").
+    #[cfg(feature = "mujoco")]
+    #[test]
+    fn contact_run_drop_bakes_prop_track() {
+        let m = load("dyn_pendulum2.urdf");
+        let req = SimContactReq {
+            q0: vec![0.0, 0.0],
+            mode: "drop".into(),
+            target: None,
+            props: vec![PropDto {
+                name: "crate".into(),
+                kind: "box".into(),
+                half_extents: Some([0.05, 0.05, 0.05]),
+                radius: None,
+                length: None,
+                pos: [0.6, 0.0, 0.4],
+                quat: None,
+                mass: Some(0.2),
+                rgba: Some([0.8, 0.2, 0.2, 1.0]),
+            }],
+            duration_s: Some(2.0),
+            fps: Some(25.0),
+            ground: Some(0.0),
+            kp: None,
+            kd: None,
+        };
+        let dto = sim_contact_run_on(std::sync::Arc::new(m), req).unwrap();
+        assert_eq!(dto.kind, "contact");
+        let props = dto.props.expect("prop tracks present");
+        assert_eq!(props.len(), 1);
+        assert_eq!(props[0].frames.len(), dto.times.len());
+        let last = props[0].frames.last().unwrap();
+        assert!(
+            (last[2] - 0.05).abs() < 0.02,
+            "prop did not settle on the plane: z = {}",
+            last[2]
+        );
+        let contacts = dto.contacts.expect("contact counts present");
+        assert_eq!(contacts.len(), dto.times.len());
+        assert!(*contacts.last().unwrap() >= 1, "no contact after settling");
+        assert_eq!(contacts[0], 0, "must start contact-free");
+    }
+
+    /// Contact-sim "hold": the existing computed-torque loop drives the MuJoCo
+    /// backend and keeps the arm at q0 under gravity.
+    #[cfg(feature = "mujoco")]
+    #[test]
+    fn contact_run_hold_stays_at_q0() {
+        let m = load("dyn_pendulum2.urdf");
+        let q0 = vec![0.3, -0.2];
+        let req = SimContactReq {
+            q0: q0.clone(),
+            mode: "hold".into(),
+            target: None,
+            props: vec![],
+            duration_s: Some(1.0),
+            fps: Some(50.0),
+            ground: Some(-1.0), // well below the pendulum
+            kp: None,
+            kd: None,
+        };
+        let dto = sim_contact_run_on(std::sync::Arc::new(m), req).unwrap();
+        let q_end = dto.q.last().unwrap();
+        for (a, b) in q_end.iter().zip(&q0) {
+            assert!((a - b).abs() < 0.05, "hold drifted: {q_end:?} vs {q0:?}");
+        }
+        assert_eq!(dto.props.expect("track list present, empty").len(), 0);
     }
 
     #[test]

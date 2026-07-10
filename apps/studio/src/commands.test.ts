@@ -23,6 +23,7 @@ function mkCtx(over: Partial<CommandCtx> = {}): CommandCtx {
     hasInertia: true,
     urdfPath: "/fx/showcase6.urdf",
     datasetLoaded: false,
+    contactEngine: false, // default pins the no-mujoco build baseline
     actions: {
       openUrdf: noop,
       openPath: noop,
@@ -33,6 +34,9 @@ function mkCtx(over: Partial<CommandCtx> = {}): CommandCtx {
       gravityDrop: noop,
       planRrtHome: noop,
       checkCollision: noop,
+      contactDrop: noop,
+      contactHold: noop,
+      contactDriveHome: noop,
       runGraph: noop,
       validateGraph: noop,
       duplicateSelection: noop,
@@ -142,6 +146,42 @@ describe("buildCommands", () => {
     byId(cmds, "graph.export").run();
     byId(cmds, "graph.import").run();
     expect(calls).toEqual(["dup", "fit", "export", "import"]);
+  });
+
+  it("omits the contact-sim commands entirely when the mujoco engine is absent", () => {
+    // even in Simulate mode with inertia — the palette must be byte-identical
+    // to a pre-contact build (the no-mujoco zero-visual-change pin)
+    const cmds = buildCommands(mkCtx({ mode: "simulate" }));
+    expect(cmds.some((c) => c.id.startsWith("sim.contact."))).toBe(false);
+  });
+
+  it("gates contact-sim commands on simulate mode + inertia when mujoco is present", () => {
+    const ids = ["sim.contact.drop", "sim.contact.hold", "sim.contact.home"];
+    const sim = buildCommands(mkCtx({ mode: "simulate", contactEngine: true }));
+    for (const id of ids) expect(byId(sim, id).enabled).toBe(true);
+    const jog = buildCommands(mkCtx({ contactEngine: true })); // jog mode
+    for (const id of ids) {
+      expect(byId(jog, id).enabled).toBe(false);
+      expect(byId(jog, id).hint).toBe("switch to Simulate mode");
+    }
+    const noDyn = buildCommands(mkCtx({ mode: "simulate", contactEngine: true, hasInertia: false }));
+    for (const id of ids) {
+      expect(byId(noDyn, id).enabled).toBe(false);
+      expect(byId(noDyn, id).hint).toBe("no inertial data");
+    }
+  });
+
+  it("dispatches the contact-sim actions when run", () => {
+    const calls: string[] = [];
+    const ctx = mkCtx({ mode: "simulate", contactEngine: true });
+    ctx.actions.contactDrop = () => calls.push("drop");
+    ctx.actions.contactHold = () => calls.push("hold");
+    ctx.actions.contactDriveHome = () => calls.push("home");
+    const cmds = buildCommands(ctx);
+    byId(cmds, "sim.contact.drop").run();
+    byId(cmds, "sim.contact.hold").run();
+    byId(cmds, "sim.contact.home").run();
+    expect(calls).toEqual(["drop", "hold", "home"]);
   });
 
   it("hints ⌘1…⌘4 in ModeTabs order on enabled mode switches", () => {

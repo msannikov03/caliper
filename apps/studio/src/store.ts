@@ -14,6 +14,8 @@ import { diagnosticsOk } from "./graph/types";
 import type { KindName } from "./graph/spec";
 import { defaultParams, outPortType, inPortTypes, PORT_COLORS, NODE_SPECS } from "./graph/spec";
 import { serializeGraph, parseGraph } from "./graph/serialize";
+import { hasContactEngine, withProp } from "./sim/props";
+import type { PropKind, PropTrack, SimProp } from "./sim/props";
 
 // ---- wire types: mirror the serde structs in src-tauri/src/lib.rs exactly ----
 
@@ -128,7 +130,15 @@ export interface SimTrajectoryDto extends TrajectoryDto {
   settled: boolean;
   gravity: [number, number, number];
   damping: number;
+  // contact-sim extension (kind = "contact"; the backend omits both fields on
+  // builtin rollouts — serde skip_serializing_if):
+  /** per-prop world-pose tracks, aligned with `times` */
+  props?: PropTrack[] | null;
+  /** MuJoCo contact count at each baked sample, aligned with `times` */
+  contacts?: number[] | null;
 }
+/** `sim_contact_run` rollout flavors (mirrors the backend mode strings). */
+export type ContactMode = "drop" | "hold" | "drive_to";
 export interface CollisionDto {
   collision: boolean;
   collidingFrames: string[];
@@ -264,6 +274,22 @@ export interface StudioState {
   runGravityDrop: () => Promise<void>;
   clearSim: () => void;
 
+  // contact sim (MuJoCo-backed, feature-gated by the build)
+  /** engines this build can run — `["builtin"]`, plus `"mujoco"` when compiled
+   *  in. Fetched once per robot load; the whole contact UI hides without it. */
+  simEngines: string[];
+  /** engine selection for the Simulate panel ("mujoco" = Contact view) */
+  simEngine: "builtin" | "mujoco";
+  /** user-added free props (max MAX_PROPS), sent verbatim to sim_contact_run */
+  simProps: SimProp[];
+  setSimEngine: (e: "builtin" | "mujoco") => void;
+  addSimProp: (kind: PropKind) => void;
+  removeSimProp: (i: number) => void;
+  /** Run a contact rollout and feed it through the EXISTING playback path —
+   *  the result IS a SimTrajectoryDto (kind "contact") with per-frame prop
+   *  tracks + contact counts riding alongside the baked robot frames. */
+  runContactSim: (mode: ContactMode, target?: number[]) => Promise<void>;
+
   // control + collision (Phase 5)
   collision: CollisionDto | null;
   runControl: (goal: number[]) => Promise<void>;
@@ -347,6 +373,9 @@ export const useStore = create<StudioState>((set, get) => ({
   simGravity: true,
   simDamping: 0.2,
   simTorque: [],
+  simEngines: ["builtin"],
+  simEngine: "builtin",
+  simProps: [],
   collision: null,
   graphNodes: [],
   graphEdges: [],
@@ -449,6 +478,9 @@ export const useStore = create<StudioState>((set, get) => ({
         playing: false,
         playhead: 0,
         poses: [],
+        // contact-sim state is per-robot (prop poses live in its workspace)
+        simEngine: "builtin",
+        simProps: [],
         // a new robot invalidates the (ndof-bound) graph
         graphNodes: [],
         graphEdges: [],
@@ -460,6 +492,11 @@ export const useStore = create<StudioState>((set, get) => ({
       await get().refreshFrames();
       await get().refreshPoses();
       void get().refreshGraphList();
+      // engine availability is a build capability — fetch is cheap; a failure
+      // (older backend without the command) degrades to builtin-only.
+      void invoke<string[]>("sim_engines")
+        .then((simEngines) => set({ simEngines }))
+        .catch(() => set({ simEngines: ["builtin"] }));
     } catch (e) {
       set({ error: String(e), robot: null });
     } finally {
@@ -673,6 +710,51 @@ export const useStore = create<StudioState>((set, get) => ({
     stopClock();
     set({ simTraj: null, playing: false, playhead: 0 });
     void get().refreshFrames();
+  },
+
+  // ---- contact sim (MuJoCo, feature-gated by the build) ----
+  setSimEngine(e) {
+    set({ simEngine: e });
+  },
+  addSimProp(kind) {
+    set({ simProps: withProp(get().simProps, kind) });
+  },
+  removeSimProp(i) {
+    set({ simProps: get().simProps.filter((_, j) => j !== i) });
+  },
+  async runContactSim(mode, target) {
+    const { q, robot, simProps, simEngines } = get();
+    if (!robot) return;
+    if (!hasContactEngine(simEngines)) {
+      set({ error: "contact sim needs a mujoco-enabled build" });
+      return;
+    }
+    if (!robot.hasInertia) {
+      set({ error: "this robot has no inertial data" });
+      return;
+    }
+    if (mode === "drive_to" && (!target || target.length !== robot.ndof)) {
+      set({ error: `target needs ${robot.ndof} values` });
+      return;
+    }
+    try {
+      const simTraj = await invoke<SimTrajectoryDto>("sim_contact_run", {
+        req: {
+          q0: q,
+          mode,
+          target: mode === "drive_to" ? target : null,
+          props: simProps,
+          durationS: 4.0,
+        },
+      });
+      // same adoption as every other rollout: the baked clip owns playback,
+      // prop tracks + contact counts ride on the DTO itself.
+      set({ simTraj, traj: null, playhead: 0, playing: false });
+      get()._applyTrajAt(0);
+      get().play();
+    } catch (e) {
+      set({ error: String(e) });
+    }
   },
 
   // ---- control + collision (Phase 5) ----

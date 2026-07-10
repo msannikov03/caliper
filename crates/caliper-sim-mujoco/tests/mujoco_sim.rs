@@ -8,7 +8,7 @@
 
 use caliper_hal::{ControlLoop, Gains, HoldSetpoint, RobotBackend};
 use caliper_model::Model;
-use caliper_sim_mujoco::mjcf::{Actuation, MjcfOptions};
+use caliper_sim_mujoco::mjcf::{Actuation, MjcfOptions, PropShape, PropSpec};
 use caliper_sim_mujoco::{MujocoBackend, MujocoSim};
 use std::path::Path;
 use std::sync::Arc;
@@ -221,6 +221,91 @@ fn position_servo_variant() {
             "servo did not track: q={q:?} target={target:?}"
         );
     }
+}
+
+/// (f) PROPS: a free box dropped above the ground plane settles ON it
+/// (z ≈ half-height) with a live ground contact; the same pose is readable
+/// through `prop_poses` and name-resolved `body_pose`.
+#[test]
+fn box_prop_settles_on_plane() {
+    let m = model("dyn_pendulum2.urdf");
+    let opt = MjcfOptions {
+        ground_plane: Some(0.0),
+        joint_damping: 0.5,
+        props: vec![PropSpec {
+            name: "crate".into(),
+            shape: PropShape::Box {
+                half: [0.05, 0.05, 0.05],
+            },
+            pos: [0.6, 0.0, 0.4],
+            quat: None,
+            mass: 0.2,
+            rgba: Some([0.8, 0.2, 0.2, 1.0]),
+        }],
+        ..Default::default()
+    };
+    let mut sim = MujocoSim::from_caliper_model_with(&m, &opt).unwrap();
+    assert_eq!(sim.prop_names(), ["crate"]);
+    // initial pose = the spec, identity orientation
+    let (p0, q0) = sim.body_pose("prop_crate").unwrap();
+    assert!((p0[2] - 0.4).abs() < 1e-12 && (q0[0] - 1.0).abs() < 1e-12);
+    sim.step(2.0).unwrap(); // fall 0.35 m + settle
+    let props = sim.prop_poses();
+    assert_eq!(props.len(), 1);
+    let (name, pos, quat) = &props[0];
+    assert_eq!(name, "crate");
+    assert!(
+        (pos[2] - 0.05).abs() < 0.01,
+        "box not resting on the plane: z = {}",
+        pos[2]
+    );
+    assert!(
+        (pos[0] - 0.6).abs() < 0.05 && pos[1].abs() < 0.05,
+        "box slid: {pos:?}"
+    );
+    assert!(quat[0].abs() > 0.99, "box tumbled: {quat:?}");
+    let contacts = sim.contacts();
+    assert!(
+        contacts
+            .iter()
+            .any(|c| c.geom1 == "caliper_ground" || c.geom2 == "caliper_ground"),
+        "no ground contact after settling: {contacts:?}"
+    );
+    // body_pose agrees with prop_poses; unknown bodies fail loudly
+    let (bp, bq) = sim.body_pose("prop_crate").unwrap();
+    assert_eq!(bp, *pos);
+    assert_eq!(bq, *quat);
+    assert!(sim.body_pose("nope").is_err());
+}
+
+/// (g) Prop trajectories are bitwise deterministic across identical runs.
+#[test]
+fn prop_pose_determinism() {
+    let m = model("dyn_pendulum2.urdf");
+    let opt = MjcfOptions {
+        ground_plane: Some(0.0),
+        props: vec![PropSpec {
+            name: "b".into(),
+            shape: PropShape::Sphere { r: 0.05 },
+            pos: [0.5, 0.1, 0.5],
+            quat: None,
+            mass: 0.1,
+            rgba: None,
+        }],
+        ..Default::default()
+    };
+    let run = || {
+        let mut sim = MujocoSim::from_caliper_model_with(&m, &opt).unwrap();
+        let mut trace: Vec<u64> = Vec::new();
+        for _ in 0..300 {
+            sim.step(1e-3).unwrap();
+            for (_, p, q) in sim.prop_poses() {
+                trace.extend(p.iter().chain(q.iter()).map(|x| x.to_bits()));
+            }
+        }
+        trace
+    };
+    assert_eq!(run(), run(), "prop trajectories diverged bitwise");
 }
 
 /// (e) Cross-check: caliper's own gravity Simulator vs MuJoCo on the

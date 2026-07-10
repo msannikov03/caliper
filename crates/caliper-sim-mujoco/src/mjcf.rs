@@ -14,6 +14,9 @@
 //! - Bodies are emitted in caliper's topological joint order, so MuJoCo's
 //!   `qpos`/`qvel` order matches caliper `q`/`qd` index-for-index (the sim
 //!   layer still re-resolves by joint NAME and never assumes this).
+//! - Free props ([`MjcfOptions::props`]) are emitted AFTER the robot bodies,
+//!   so the robot's `qpos`/`qvel` prefix ordering is unchanged (each
+//!   `<freejoint>` appends 7 qpos / 6 qvel entries at the end).
 
 use crate::MujocoError;
 use caliper_model::{CollisionShape, JointKind, Model};
@@ -34,8 +37,37 @@ pub enum Actuation {
     PositionServo { kp: f64, kv: f64 },
 }
 
+/// Primitive shape of a free-floating prop body. Same conventions as the
+/// robot colliders: box carries HALF-extents, cylinder `h` is the FULL length
+/// (Z-aligned) — the generator emits MJCF's (radius, half-length) itself.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PropShape {
+    Box { half: [f64; 3] },
+    Sphere { r: f64 },
+    Cylinder { r: f64, h: f64 },
+}
+
+/// A free-floating rigid body dropped into the world: one `<freejoint>`, an
+/// explicit COM `<inertial>` derived analytically from `mass` + the uniform
+/// primitive, and one collision geom. The MJCF body is named
+/// `prop_{sanitize(name)}` (see [`MjcfDocument::prop_bodies`]).
+#[derive(Clone, Debug)]
+pub struct PropSpec {
+    /// User-facing name; must be non-empty and unique after sanitizing.
+    pub name: String,
+    pub shape: PropShape,
+    /// Initial world position of the body frame (= the primitive's center).
+    pub pos: [f64; 3],
+    /// Initial world orientation, MJCF order `[w, x, y, z]`; `None` = identity.
+    pub quat: Option<[f64; 4]>,
+    /// Mass (kg), finite and > 0. Inertia is computed from it, never guessed.
+    pub mass: f64,
+    /// Geom `rgba` in [0,1]; `None` leaves the MuJoCo default.
+    pub rgba: Option<[f32; 4]>,
+}
+
 /// Options for [`mjcf_from_model`]. `Default` = torque-driven, Earth gravity,
-/// 1 ms timestep, no damping, no ground plane — the closest match to
+/// 1 ms timestep, no damping, no ground plane, no props — the closest match to
 /// `caliper_hal::PhysicsSimBackend` defaults.
 #[derive(Clone, Debug)]
 pub struct MjcfOptions {
@@ -60,6 +92,10 @@ pub struct MjcfOptions {
     /// Determinism: the string is emitted byte-for-byte, so a fixed options
     /// struct still produces a fixed document.
     pub extra_worldbody_xml: Option<String>,
+    /// Free-floating primitive bodies (each: `<freejoint>` + explicit COM
+    /// inertial + one geom), emitted in `<worldbody>` AFTER the robot bodies
+    /// so the robot's `qpos`/`qvel` prefix is unchanged. Empty by default.
+    pub props: Vec<PropSpec>,
 }
 
 impl Default for MjcfOptions {
@@ -71,6 +107,7 @@ impl Default for MjcfOptions {
             ground_plane: None,
             actuation: Actuation::TorqueDirect,
             extra_worldbody_xml: None,
+            props: Vec::new(),
         }
     }
 }
@@ -84,6 +121,9 @@ pub struct MjcfDocument {
     /// collision coverage than `caliper-collision` on the same model —
     /// surface this to users, never swallow it.
     pub skipped_hull_colliders: usize,
+    /// `(prop name, MJCF body name)` for every [`MjcfOptions::props`] entry,
+    /// in input order — the name map the sim layer resolves body ids from.
+    pub prop_bodies: Vec<(String, String)>,
 }
 
 /// Generate a minimal MJCF document from a caliper model. Errors when the
@@ -106,6 +146,23 @@ pub fn mjcf_from_model(m: &Model, opt: &MjcfOptions) -> Result<MjcfDocument, Muj
             "joint_damping must be finite and >= 0, got {}",
             opt.joint_damping
         )));
+    }
+
+    // Props: validate everything and lock the name map BEFORE emitting a byte.
+    let mut prop_bodies: Vec<(String, String)> = Vec::with_capacity(opt.props.len());
+    {
+        let mut seen = std::collections::HashSet::new();
+        for p in &opt.props {
+            validate_prop(p)?;
+            let body = format!("prop_{}", sanitize(&p.name));
+            if !seen.insert(body.clone()) {
+                return Err(MujocoError::Mjcf(format!(
+                    "duplicate prop name `{}` (after sanitizing)",
+                    p.name
+                )));
+            }
+            prop_bodies.push((p.name.clone(), body));
+        }
     }
 
     // Collision geoms, grouped by the movable joint their frame rides on
@@ -173,6 +230,42 @@ pub fn mjcf_from_model(m: &Model, opt: &MjcfOptions) -> Result<MjcfDocument, Muj
     for &r in &roots {
         emit_body(&mut xml, m, opt, r, &kids, &body_geoms, 2)?;
     }
+    // Free props AFTER the robot bodies (see the header: keeps the robot's
+    // qpos/qvel prefix ordering; each freejoint appends 7 qpos / 6 qvel).
+    for (p, (_, body)) in opt.props.iter().zip(&prop_bodies) {
+        let mut battr = format!("pos=\"{} {} {}\"", f(p.pos[0]), f(p.pos[1]), f(p.pos[2]));
+        if let Some(q) = p.quat {
+            let _ = write!(
+                battr,
+                " quat=\"{} {} {} {}\"",
+                f(q[0]),
+                f(q[1]),
+                f(q[2]),
+                f(q[3])
+            );
+        }
+        let _ = writeln!(xml, "    <body name=\"{body}\" {battr}>");
+        let _ = writeln!(xml, "      <freejoint name=\"{body}_free\"/>");
+        let di = prop_diaginertia(&p.shape, p.mass);
+        let _ = writeln!(
+            xml,
+            "      <inertial pos=\"0 0 0\" mass=\"{}\" diaginertia=\"{} {} {}\"/>",
+            f(p.mass),
+            f(di[0]),
+            f(di[1]),
+            f(di[2])
+        );
+        let rgba = p
+            .rgba
+            .map(|c| format!(" rgba=\"{:?} {:?} {:?} {:?}\"", c[0], c[1], c[2], c[3]))
+            .unwrap_or_default();
+        let _ = writeln!(
+            xml,
+            "      <geom name=\"{body}_geom\" {}{rgba}/>",
+            prop_geom_attrs(&p.shape)
+        );
+        let _ = writeln!(xml, "    </body>");
+    }
     xml.push_str("  </worldbody>\n");
 
     if let Actuation::PositionServo { kp, kv } = opt.actuation {
@@ -198,7 +291,87 @@ pub fn mjcf_from_model(m: &Model, opt: &MjcfOptions) -> Result<MjcfDocument, Muj
     Ok(MjcfDocument {
         xml,
         skipped_hull_colliders,
+        prop_bodies,
     })
+}
+
+/// Reject a bad prop BEFORE it reaches the MuJoCo compiler (clearer errors,
+/// and the generator stays deterministic-or-Err, never partially emitted).
+fn validate_prop(p: &PropSpec) -> Result<(), MujocoError> {
+    if p.name.trim().is_empty() {
+        return Err(MujocoError::Mjcf("prop name must be non-empty".into()));
+    }
+    if !(p.mass.is_finite() && p.mass > 0.0) {
+        return Err(MujocoError::Mjcf(format!(
+            "prop `{}`: mass must be finite and > 0, got {}",
+            p.name, p.mass
+        )));
+    }
+    if !p.pos.iter().all(|x| x.is_finite()) {
+        return Err(MujocoError::NonFinite { what: "prop pos" });
+    }
+    if let Some(q) = p.quat {
+        let norm = q.iter().map(|x| x * x).sum::<f64>().sqrt();
+        if !q.iter().all(|x| x.is_finite()) || norm < 1e-9 {
+            return Err(MujocoError::Mjcf(format!(
+                "prop `{}`: quat must be finite with non-zero norm",
+                p.name
+            )));
+        }
+    }
+    if let Some(c) = p.rgba
+        && !c.iter().all(|x| x.is_finite())
+    {
+        return Err(MujocoError::NonFinite { what: "prop rgba" });
+    }
+    let dims_ok = match p.shape {
+        PropShape::Box { half } => half.iter().all(|x| x.is_finite() && *x > 0.0),
+        PropShape::Sphere { r } => r.is_finite() && r > 0.0,
+        PropShape::Cylinder { r, h } => r.is_finite() && r > 0.0 && h.is_finite() && h > 0.0,
+    };
+    if !dims_ok {
+        return Err(MujocoError::Mjcf(format!(
+            "prop `{}`: shape dimensions must be finite and > 0",
+            p.name
+        )));
+    }
+    Ok(())
+}
+
+/// Principal moments about the COM of a uniform-density primitive (kg·m²).
+/// Box takes HALF-extents `[a,b,c]`: `Ixx = m/3·(b²+c²)` (= m/12 of the full
+/// sides); sphere `2/5·m·r²`; cylinder (full length `h`, Z axis)
+/// `Ixx = Iyy = m·(3r²+h²)/12`, `Izz = m·r²/2`.
+fn prop_diaginertia(shape: &PropShape, mass: f64) -> [f64; 3] {
+    match *shape {
+        PropShape::Box { half: [a, b, c] } => [
+            mass / 3.0 * (b * b + c * c),
+            mass / 3.0 * (a * a + c * c),
+            mass / 3.0 * (a * a + b * b),
+        ],
+        PropShape::Sphere { r } => {
+            let i = 0.4 * mass * r * r;
+            [i, i, i]
+        }
+        PropShape::Cylinder { r, h } => {
+            let ixy = mass * (3.0 * r * r + h * h) / 12.0;
+            [ixy, ixy, 0.5 * mass * r * r]
+        }
+    }
+}
+
+/// `type`/`size` attributes for a prop geom (MJCF cylinder size = radius +
+/// HALF-length, same translation as the robot colliders).
+fn prop_geom_attrs(shape: &PropShape) -> String {
+    match *shape {
+        PropShape::Box { half: [a, b, c] } => {
+            format!("type=\"box\" size=\"{} {} {}\"", f(a), f(b), f(c))
+        }
+        PropShape::Sphere { r } => format!("type=\"sphere\" size=\"{}\"", f(r)),
+        PropShape::Cylinder { r, h } => {
+            format!("type=\"cylinder\" size=\"{} {}\"", f(r), f(h / 2.0))
+        }
+    }
 }
 
 fn emit_body(
@@ -474,6 +647,136 @@ mod tests {
         // determinism: same options, same document
         let doc2 = mjcf_from_model(&m, &opt).unwrap();
         assert_eq!(doc.xml, doc2.xml);
+    }
+
+    #[test]
+    fn props_emitted_as_free_bodies() {
+        let m = model("dyn_pendulum2.urdf");
+        let opt = MjcfOptions {
+            ground_plane: Some(0.0),
+            props: vec![
+                PropSpec {
+                    name: "crate 1".into(),
+                    shape: PropShape::Box {
+                        half: [0.1, 0.2, 0.3],
+                    },
+                    pos: [0.5, 0.0, 0.4],
+                    quat: None,
+                    mass: 0.3,
+                    rgba: Some([0.8, 0.2, 0.2, 1.0]),
+                },
+                PropSpec {
+                    name: "ball".into(),
+                    shape: PropShape::Sphere { r: 0.05 },
+                    pos: [0.0, 0.5, 0.2],
+                    quat: Some([1.0, 0.0, 0.0, 0.0]),
+                    mass: 0.1,
+                    rgba: None,
+                },
+                PropSpec {
+                    name: "can".into(),
+                    shape: PropShape::Cylinder { r: 0.04, h: 0.12 },
+                    pos: [0.0, -0.5, 0.2],
+                    quat: None,
+                    mass: 0.2,
+                    rgba: None,
+                },
+            ],
+            ..Default::default()
+        };
+        let doc = mjcf_from_model(&m, &opt).unwrap();
+        let x = &doc.xml;
+        assert_eq!(x.matches("<freejoint").count(), 3);
+        assert!(x.contains("<body name=\"prop_crate_1\" pos=\"0.5 0.0 0.4\">"));
+        // box: Ixx = m/3·(b²+c²), formatted exactly like the generator
+        let ixx = 0.3f64 / 3.0 * (0.2f64 * 0.2 + 0.3 * 0.3);
+        assert!(x.contains(&format!("diaginertia=\"{ixx:?}")), "{x}");
+        // sphere: 2/5·m·r² on all three axes
+        let i_s = 0.4 * 0.1f64 * 0.05 * 0.05;
+        assert!(x.contains(&format!("diaginertia=\"{i_s:?} {i_s:?} {i_s:?}\"")));
+        // cylinder geom size = (radius, HALF-length)
+        assert!(x.contains(&format!(
+            "type=\"cylinder\" size=\"0.04 {:?}\"",
+            0.12f64 / 2.0
+        )));
+        assert!(x.contains("rgba=\"0.8 0.2 0.2 1.0\""));
+        // explicit quat forwarded on the ball body
+        assert!(
+            x.contains("<body name=\"prop_ball\" pos=\"0.0 0.5 0.2\" quat=\"1.0 0.0 0.0 0.0\">")
+        );
+        // name map, in input order
+        assert_eq!(
+            doc.prop_bodies,
+            vec![
+                ("crate 1".to_string(), "prop_crate_1".to_string()),
+                ("ball".to_string(), "prop_ball".to_string()),
+                ("can".to_string(), "prop_can".to_string()),
+            ]
+        );
+        // props sit AFTER the last robot joint, inside <worldbody>
+        let wb_end = x.find("</worldbody>").unwrap();
+        let prop_at = x.find("prop_crate_1").unwrap();
+        let last_joint = x.rfind("type=\"hinge\"").unwrap();
+        assert!(last_joint < prop_at && prop_at < wb_end);
+        // determinism: same options, same document
+        assert_eq!(mjcf_from_model(&m, &opt).unwrap().xml, doc.xml);
+    }
+
+    #[test]
+    fn bad_props_rejected() {
+        let m = model("dyn_pendulum2.urdf");
+        let prop = |name: &str, shape: PropShape, mass: f64, quat: Option<[f64; 4]>| PropSpec {
+            name: name.into(),
+            shape,
+            pos: [0.0, 0.0, 0.5],
+            quat,
+            mass,
+            rgba: None,
+        };
+        let sphere = PropShape::Sphere { r: 0.05 };
+        let cases: Vec<Vec<PropSpec>> = vec![
+            vec![prop("p", sphere, 0.0, None)],      // zero mass
+            vec![prop("p", sphere, f64::NAN, None)], // NaN mass
+            vec![prop("p", PropShape::Sphere { r: -0.05 }, 0.1, None)], // bad radius
+            vec![prop(
+                "p",
+                PropShape::Box {
+                    half: [0.1, 0.0, 0.1],
+                },
+                0.1,
+                None,
+            )], // zero half-extent
+            vec![prop(
+                "p",
+                PropShape::Cylinder { r: 0.04, h: 0.0 },
+                0.1,
+                None,
+            )], // zero length
+            vec![prop("p", sphere, 0.1, Some([0.0; 4]))], // zero-norm quat
+            vec![prop("  ", sphere, 0.1, None)],     // blank name
+            vec![
+                prop("a b", sphere, 0.1, None),
+                prop("a_b", sphere, 0.1, None),
+            ], // dup after sanitize
+        ];
+        for props in cases {
+            let opt = MjcfOptions {
+                props,
+                ..Default::default()
+            };
+            assert!(
+                mjcf_from_model(&m, &opt).is_err(),
+                "accepted bad props: {:?}",
+                opt.props
+            );
+        }
+        let mut p = prop("p", sphere, 0.1, None);
+        p.pos = [f64::NAN, 0.0, 0.0];
+        let opt = MjcfOptions {
+            props: vec![p],
+            ..Default::default()
+        };
+        assert!(mjcf_from_model(&m, &opt).is_err(), "accepted NaN pos");
     }
 
     #[test]

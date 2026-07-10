@@ -10,6 +10,7 @@ import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import { useStore } from "../store";
 import { buildCommands, filterCommands } from "../commands";
 import type { Command } from "../commands";
+import { hasContactEngine } from "../sim/props";
 import { openUrdf, selectRobot } from "./Toolbar";
 import { openDatasetDialog } from "../data/DataMode";
 import { exportGraphToFile, fitGraphView, importGraphFromFile } from "../graph/GraphEditor";
@@ -29,6 +30,7 @@ export function Palette({ onClose }: { onClose: () => void }) {
   const poses = useStore((s) => s.poses);
   const urdfPath = useStore((s) => s.urdfPath);
   const datasetLoaded = useStore((s) => s.dataset !== null);
+  const contactEngine = useStore((s) => hasContactEngine(s.simEngines));
 
   const commands = useMemo(() => {
     // every action wraps an existing store/toolbar operation — no new backend calls
@@ -42,6 +44,7 @@ export function Palette({ onClose }: { onClose: () => void }) {
       hasInertia: robot?.hasInertia ?? false,
       urdfPath,
       datasetLoaded,
+      contactEngine,
       actions: {
         openUrdf: () => void openUrdf(),
         openPath: (path, record) => void selectRobot(path, record),
@@ -52,6 +55,9 @@ export function Palette({ onClose }: { onClose: () => void }) {
         gravityDrop: () => void useStore.getState().runGravityDrop(),
         planRrtHome: () => void useStore.getState().runPlan(home()),
         checkCollision: () => void useStore.getState().checkCollision(null),
+        contactDrop: () => void useStore.getState().runContactSim("drop"),
+        contactHold: () => void useStore.getState().runContactSim("hold"),
+        contactDriveHome: () => void useStore.getState().runContactSim("drive_to", home()),
         runGraph: () => void useStore.getState().runGraph(),
         validateGraph: () => void useStore.getState().validateGraph(),
         duplicateSelection: () => useStore.getState().duplicateGraphSelection(),
@@ -63,7 +69,7 @@ export function Palette({ onClose }: { onClose: () => void }) {
       },
     });
     return filterCommands(query, all);
-  }, [query, fixtures, recents, poses, mode, robot, urdfPath, datasetLoaded]);
+  }, [query, fixtures, recents, poses, mode, robot, urdfPath, datasetLoaded, contactEngine]);
 
   useEffect(() => inputRef.current?.focus(), []);
 

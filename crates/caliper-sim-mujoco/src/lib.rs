@@ -15,7 +15,10 @@
 //!    sim unchanged.
 //!
 //! # Scope (honest)
-//! - Fixed-base articulated trees of 1-dof joints (hinge/slide) only.
+//! - Fixed-base articulated trees of 1-dof joints (hinge/slide) only — plus
+//!   free-floating primitive PROPS ([`mjcf::MjcfOptions::props`]): each is a
+//!   `<freejoint>` body emitted after the robot, tracked by name and read back
+//!   via `MujocoSim::prop_poses`/`body_pose` (feature `mujoco`).
 //! - Collision export covers the exact primitives (box/sphere/cylinder/capsule).
 //!   `ConvexHull` mesh colliders are **NOT exported yet** (MJCF mesh assets are
 //!   deferred); the generator counts and reports them via
@@ -72,6 +75,8 @@ pub enum MujocoError {
     BadDt { dt: f64, h: f64 },
     #[error("joint `{0}` missing from the compiled MuJoCo model")]
     MissingJoint(String),
+    #[error("body `{0}` missing from the compiled MuJoCo model")]
+    MissingBody(String),
     /// A raw MJCF model contains a joint kind the seam cannot map onto the
     /// flat `q`/`qd` vectors (free/ball joints — fixed-base 1-dof trees only).
     #[error("unsupported MuJoCo joint type for `{0}` (only hinge/slide are mapped)")]

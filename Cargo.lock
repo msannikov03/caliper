@@ -4569,6 +4569,7 @@ dependencies = [
  "caliper",
  "caliper-collision",
  "caliper-dataset",
+ "caliper-sim-mujoco",
  "log",
  "nalgebra",
  "serde",

@@ -17,11 +17,15 @@ when a Hub checkpoint is actually loaded; the core sidecar stays lerobot-free.
 __version__ = "0.1.0"
 
 from .collect import collect_demos
+from .collect_sim import collect_camera_dataset
 from .hub import CheckpointSecurityError, LoadedPolicy, load_lerobot_policy
 from .runner import run_policy
+from .sim_camera import SimCameraScene
 
 __all__ = [
     "collect_demos",
+    "collect_camera_dataset",
+    "SimCameraScene",
     "load_lerobot_policy",
     "LoadedPolicy",
     "CheckpointSecurityError",

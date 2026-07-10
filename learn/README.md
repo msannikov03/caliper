@@ -26,6 +26,17 @@ env -u CONDA_PREFIX uv pip install --python .venv/bin/python -e learn      # the
 env -u CONDA_PREFIX .venv/bin/python -m pytest learn -v
 ```
 
+## Sim camera datasets (image-conditioned BC)
+
+`collect_camera_dataset(out, n_episodes=..., fps=30)` replaces a physical camera:
+it renders every planner-labelled frame through a MuJoCo offscreen camera
+(`sim_camera.SimCameraScene`, built from the robot via `caliper.model_to_mjcf` +
+an auto-scaled over-the-shoulder `<camera>`) and writes a native LeRobotDataset
+v3.0 with a `dtype: "image"` feature via `caliper.RecorderV3` — PIL-encoded PNG
+bytes (compress level 6, lerobot parity), byte-deterministic given the seed. Needs
+`mujoco` + `Pillow` (lazy imports; both live in the repo `.venv`). Gate:
+`oracle/tests/test_sim_camera.py` — real-lerobot load + a 2-step image-ACT train.
+
 ## Deploying lerobot Hub checkpoints
 
 `hub.load_lerobot_policy(dir)` loads a lerobot-0.4.4-convention checkpoint (config.json +

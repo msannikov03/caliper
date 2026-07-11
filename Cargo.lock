@@ -777,6 +777,7 @@ dependencies = [
  "caliper",
  "caliper-collision",
  "caliper-dataset",
+ "caliper-sim-mujoco",
  "clap",
  "nalgebra",
  "serde_json",

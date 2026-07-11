@@ -83,3 +83,50 @@ cargo test -p caliper-sim-mujoco --features mujoco
 
 CI runs only the default (MuJoCo-free) build of this crate; the feature-gated
 tests are a local/gated lane until a cached-artifact CI job is added.
+
+## Shipping the app with contact sim (macOS)
+
+The recipe above serves *development*: the dylib lives in a cache directory
+with an absolute install id, so the binary only runs on the machine that
+fetched it. To ship a Studio `.app`/`.dmg` with the `mujoco` feature **on**,
+the bundle must carry `libmujoco` itself and resolve it via `@rpath`:
+
+```bash
+scripts/bundle_mujoco.sh    # fetch + stage src-tauri/vendor/ (gitignored)
+cd apps/studio
+MUJOCO_DYNAMIC_LINK_DIR="$PWD/src-tauri/vendor" npm run tauri build -- \
+  --features mujoco \
+  --config "$PWD/src-tauri/tauri.mujoco.conf.json"
+```
+
+How the pieces fit (each step verified against the tauri 2.x sources):
+
+1. `bundle_mujoco.sh` copies the pinned dylib into
+   `apps/studio/src-tauri/vendor/`, rewrites its install id to
+   `@rpath/libmujoco.3.9.0.dylib`, and ad-hoc re-signs it
+   (`install_name_tool` invalidates signatures, which SIGKILLs on Apple
+   Silicon). Linking against **this** copy is what stamps the relocatable
+   `@rpath/...` load command into the executable — the bundler never rewrites
+   install names after the fact.
+2. `tauri.mujoco.conf.json` is a *separate overlay* config, merged over
+   `tauri.conf.json` by `--config` (JSON Merge Patch). It adds
+   `bundle.macOS.frameworks = ["vendor/libmujoco.3.9.0.dylib"]`. It cannot
+   live in the default config: tauri-build hard-errors whenever a listed
+   dylib is missing, which would break every ordinary build.
+3. With a non-empty `frameworks` list, tauri-build links the executable with
+   `-Wl,-rpath,@executable_path/../Frameworks`, and the bundler copies the
+   dylib into `Contents/Frameworks/` and signs it with the app. At launch,
+   `@rpath/libmujoco.3.9.0.dylib` resolves inside the bundle — no
+   `DYLD_LIBRARY_PATH`, no per-machine paths.
+
+Honest caveats:
+
+- The `.dmg` grows by ~9 MB (the universal2 `libmujoco.3.9.0.dylib` is
+  8.6 MB).
+- The staged dylib is ad-hoc signed, then re-signed with whatever identity
+  signs the app (currently an Apple Development cert, not notarized) — the
+  usual right-click → Open applies, same as the plain release.
+- `--features mujoco` **without** the overlay config produces a binary whose
+  `@rpath/libmujoco...` load command resolves nowhere — always pass both
+  flags together (or neither).
+- macOS only; the default MuJoCo-free bundle is completely unaffected.

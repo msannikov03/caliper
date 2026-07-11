@@ -20,11 +20,18 @@ tauri-build = { version = "2", features = [] }
 [features]
 default = []
 # MuJoCo contact sim: `sim_contact_run` + the "mujoco" engine in `sim_engines`.
-# OFF by default and it must STAY OFF for release bundles: mujoco-rs links a
-# SHARED libmujoco we do not (yet) bundle — shipping the dylib inside the
-# signed .app (rpath, codesign, notarization) is unsolved. Dev-only:
+# OFF by default; CI and plain bundles stay MuJoCo-free. Dev builds:
 #   MUJOCO_DYNAMIC_LINK_DIR=<dir> cargo build --features mujoco
 # with DYLD_LIBRARY_PATH / LD_LIBRARY_PATH containing that dir at run time.
+# SHIPPING (macOS): the .app/.dmg CAN carry libmujoco — run
+# scripts/bundle_mujoco.sh (stages src-tauri/vendor/ with an @rpath install
+# id), then build with `--features mujoco --config
+# src-tauri/tauri.mujoco.conf.json`. The overlay conf's
+# bundle.macOS.frameworks entry makes tauri-build add the
+# @executable_path/../Frameworks rpath and the bundler embed + sign the dylib
+# into Contents/Frameworks. Do NOT add frameworks to the default conf:
+# tauri-build hard-errors when the listed dylib is missing. Details:
+# docs/book/src/capabilities/contact-sim.md, "Shipping the app with contact sim".
 # Without the feature the commands stay registered and fail gracefully
 # (`sim_engines` omits "mujoco", `sim_contact_run` returns a clear Err).
 mujoco = ["dep:caliper-sim-mujoco", "caliper-sim-mujoco/mujoco"]

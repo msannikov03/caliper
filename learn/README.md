@@ -37,6 +37,28 @@ bytes (compress level 6, lerobot parity), byte-deterministic given the seed. Nee
 `mujoco` + `Pillow` (lazy imports; both live in the repo `.venv`). Gate:
 `oracle/tests/test_sim_camera.py` — real-lerobot load + a 2-step image-ACT train.
 
+## Vectorized simulation envs (RL/data-gen substrate)
+
+`vec_env.VecSimEnv` is Caliper's ONE vectorized env: N MuJoCo instances (one shared
+compiled `MjModel`, N cheap `MjData`) over any caliper Robot, gymnasium.vector-style
+`reset`/`step` semantics without importing gymnasium, per-env auto-reset, seeded and
+bitwise-deterministic. Substrate, not framework: reward/termination are user hooks
+(`set_task`), external RL libraries do the learning; `reach_task` is the single built-in
+example and `rollout_random` the smoke/data-gen helper. Actions are qpos targets tracked
+by an internal PD + gravity compensation (`model_to_mjcf` emits torque-direct MJCF, no
+actuators). `obs_images=True` adds a per-env offscreen camera (GL context each — keep N small).
+
+```python
+import caliper
+from caliper_learn import VecSimEnv, reach_task
+
+robot = caliper.Robot.from_urdf("arm.urdf")
+env = VecSimEnv(robot, num_envs=8, fps=50, seed=0)
+env.set_task(*reach_task(robot, "tool0", [0.4, 0.0, 0.3], tol=0.02))
+obs = env.reset()
+obs, reward, terminated, truncated, info = env.step(actions)  # (8, ndof) qpos targets
+```
+
 ## Deploying lerobot Hub checkpoints
 
 `hub.load_lerobot_policy(dir)` loads a lerobot-0.4.4-convention checkpoint (config.json +

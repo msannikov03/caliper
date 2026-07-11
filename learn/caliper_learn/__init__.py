@@ -21,11 +21,15 @@ from .collect_sim import collect_camera_dataset
 from .hub import CheckpointSecurityError, LoadedPolicy, load_lerobot_policy
 from .runner import run_policy
 from .sim_camera import SimCameraScene
+from .vec_env import VecSimEnv, reach_task, rollout_random
 
 __all__ = [
     "collect_demos",
     "collect_camera_dataset",
     "SimCameraScene",
+    "VecSimEnv",
+    "reach_task",
+    "rollout_random",
     "load_lerobot_policy",
     "LoadedPolicy",
     "CheckpointSecurityError",

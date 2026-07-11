@@ -12,6 +12,7 @@
 // ============================================================
 
 import { useEffect, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { useStore } from "../store";
 import type { DatasetEpisodeSeries, DatasetSummary } from "../store";
@@ -21,12 +22,15 @@ import {
   alignChannel,
   clampSplitFrame,
   cursorIndex,
+  decodeThumbs,
   dimLabels,
   fmtDuration,
   mergePartner,
   removeTag,
   rowView,
   seriesColor,
+  THUMB_COUNT,
+  thumbFrameIndices,
 } from "./episodes";
 import "./data.css";
 
@@ -112,6 +116,108 @@ function EpisodeTable({
           })}
         </tbody>
       </table>
+    </div>
+  );
+}
+
+/** Camera thumbnail strip for the selected episode: `THUMB_COUNT` evenly
+ *  spaced frames fetched as one binary payload (`dataset_episode_thumbs`),
+ *  decoded to object URLs that are ALWAYS revoked when the strip re-fetches
+ *  or unmounts (episode/camera switch — no Blob-URL leaks). Clicking a thumb
+ *  seeks the split cursor (the dashed line on every channel plot) to that
+ *  frame. Rendered only when the dataset declares image features. */
+function ThumbStrip({
+  ds,
+  sel,
+  onSeek,
+}: {
+  ds: DatasetSummary;
+  sel: number;
+  onSeek: (frame: number) => void;
+}) {
+  const [feature, setFeature] = useState(ds.imageFeatures[0] ?? "");
+  const [thumbs, setThumbs] = useState<string[]>([]);
+  const [failed, setFailed] = useState(false);
+  const len = ds.episodes[sel]?.length ?? 0;
+  const frames = thumbFrameIndices(len, THUMB_COUNT);
+
+  // keep the selected camera valid across dataset reloads
+  useEffect(() => {
+    if (!ds.imageFeatures.includes(feature)) setFeature(ds.imageFeatures[0] ?? "");
+  }, [ds, feature]);
+
+  useEffect(() => {
+    if (!feature) return;
+    let cancelled = false;
+    let urls: string[] = [];
+    void (async () => {
+      try {
+        // binary tauri::ipc::Response → ArrayBuffer (older bridges: number[])
+        const raw = await invoke<ArrayBuffer | number[]>("dataset_episode_thumbs", {
+          path: ds.path,
+          episode: sel,
+          feature,
+          count: THUMB_COUNT,
+        });
+        const buf: ArrayBuffer = raw instanceof ArrayBuffer ? raw : new Uint8Array(raw).buffer;
+        const blobs = decodeThumbs(buf);
+        if (cancelled) return; // too late — the cleanup already ran
+        urls = blobs.map((b) => URL.createObjectURL(b));
+        setThumbs(urls);
+        setFailed(false);
+      } catch {
+        if (!cancelled) {
+          setThumbs([]);
+          setFailed(true);
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+      for (const u of urls) URL.revokeObjectURL(u);
+      urls = [];
+      setThumbs([]);
+    };
+  }, [ds, sel, feature]);
+
+  return (
+    <div className="data-thumbs">
+      <div className="dt-head">
+        <span className="eyebrow">Camera</span>
+        {ds.imageFeatures.length > 1 ? (
+          <select
+            className="dt-select"
+            value={feature}
+            onChange={(e) => setFeature(e.target.value)}
+          >
+            {ds.imageFeatures.map((f) => (
+              <option key={f} value={f}>
+                {f}
+              </option>
+            ))}
+          </select>
+        ) : (
+          <span className="dc-meta">{feature}</span>
+        )}
+      </div>
+      <div className="dt-strip">
+        {thumbs.map((u, i) => (
+          <button
+            key={u}
+            className="dt-thumb"
+            title={`seek split cursor to frame ${frames[i] ?? 0}`}
+            onClick={() => onSeek(frames[i] ?? 0)}
+          >
+            <img src={u} alt={`frame ${frames[i] ?? 0}`} />
+            <span className="dt-frame">{frames[i] ?? 0}</span>
+          </button>
+        ))}
+        {thumbs.length === 0 && (
+          <div className="data-empty dt-empty">
+            {failed ? "could not load thumbnails" : "loading thumbnails…"}
+          </div>
+        )}
+      </div>
     </div>
   );
 }
@@ -272,6 +378,10 @@ function EpisodeDetail({
           />
         </div>
       </div>
+
+      {ds.imageFeatures.length > 0 && (
+        <ThumbStrip ds={ds} sel={sel} onSeek={(f) => setSplitFrame(Math.max(1, f))} />
+      )}
 
       <div className="data-charts">
         {!live && <div className="data-empty">loading series…</div>}

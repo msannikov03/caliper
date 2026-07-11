@@ -296,6 +296,75 @@
   border-color: var(--accent);
 }
 
+/* ---- camera thumbnail strip ---- */
+.data-thumbs {
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  background: var(--surface);
+  padding: 8px 10px;
+}
+.dt-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  margin-bottom: 6px;
+}
+.dt-select {
+  background: var(--base);
+  border: 1px solid var(--border-2);
+  border-radius: var(--r-sm);
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 10.5px;
+  padding: 2px 6px;
+  outline: none;
+  max-width: 260px;
+}
+.dt-select:focus {
+  border-color: var(--accent);
+}
+.dt-strip {
+  display: flex;
+  gap: 6px;
+  overflow-x: auto;
+  padding-bottom: 2px; /* keep the scrollbar off the thumbs */
+}
+.dt-thumb {
+  position: relative;
+  flex: 0 0 auto;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background: var(--base);
+  cursor: pointer;
+  overflow: hidden;
+  line-height: 0;
+}
+.dt-thumb:hover {
+  border-color: var(--accent);
+}
+.dt-thumb img {
+  display: block;
+  height: 72px;
+  width: auto;
+}
+.dt-frame {
+  position: absolute;
+  right: 2px;
+  bottom: 2px;
+  font-family: var(--mono);
+  font-size: 8.5px;
+  line-height: 1.4;
+  color: rgba(255, 255, 255, 0.9);
+  background: rgba(0, 0, 0, 0.55);
+  border-radius: 2px;
+  padding: 0 3px;
+  pointer-events: none;
+}
+.dt-empty {
+  padding: 8px 4px;
+}
+
 /* ---- channel chart cards ---- */
 .data-charts {
   display: flex;

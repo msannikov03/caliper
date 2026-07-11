@@ -183,6 +183,8 @@ export interface DatasetSummary {
   totalTasks: number;
   tasks: string[];
   features: DatasetFeature[];
+  /** names of the dataset's `dtype: "image"` camera features (thumbnail strips) */
+  imageFeatures: string[];
   episodes: DatasetEpisodeRow[];
 }
 /** One plotted feature of one episode: series[dim][point]. */

@@ -10,10 +10,13 @@ import {
   dimLabels,
   fmtDuration,
   mergePartner,
+  decodeThumbFrames,
+  decodeThumbs,
   removeTag,
   rowView,
   seriesColor,
   SERIES_COLORS,
+  thumbFrameIndices,
 } from "./episodes";
 import { buildCommands } from "../commands";
 import type { CommandCtx } from "../commands";
@@ -92,6 +95,73 @@ describe("episodes — pure helpers", () => {
     expect(seriesColor(0)).toBe(SERIES_COLORS[0]);
     expect(seriesColor(SERIES_COLORS.length)).toBe(SERIES_COLORS[0]);
     expect(seriesColor(-1)).toBe(SERIES_COLORS[SERIES_COLORS.length - 1]);
+  });
+});
+
+describe("episodes — camera thumbnails", () => {
+  it("thumbFrameIndices mirrors the backend picker (endpoints, clamping)", () => {
+    // must equal `thumb_picks` in src-tauri/src/lib.rs for the same inputs
+    expect(thumbFrameIndices(100, 8)).toEqual([0, 14, 28, 42, 56, 70, 84, 99]);
+    expect(thumbFrameIndices(3, 8)).toEqual([0, 1, 2]); // fewer frames than thumbs
+    expect(thumbFrameIndices(1, 8)).toEqual([0]);
+    expect(thumbFrameIndices(10, 1)).toEqual([0]);
+    expect(thumbFrameIndices(10, 0)).toEqual([0]); // count floors at 1
+    expect(thumbFrameIndices(0, 8)).toEqual([]);
+    expect(thumbFrameIndices(Number.NaN, 8)).toEqual([]);
+  });
+
+  /** Build the backend's framing: u32 LE count, per image u32 LE len + bytes. */
+  const frame = (images: Uint8Array[]): ArrayBuffer => {
+    const total = 4 + images.reduce((a, b) => a + 4 + b.length, 0);
+    const buf = new ArrayBuffer(total);
+    const dv = new DataView(buf);
+    const u8 = new Uint8Array(buf);
+    dv.setUint32(0, images.length, true);
+    let off = 4;
+    for (const img of images) {
+      dv.setUint32(off, img.length, true);
+      u8.set(img, off + 4);
+      off += 4 + img.length;
+    }
+    return buf;
+  };
+
+  it("decodeThumbFrames round-trips the framing byte-exactly", () => {
+    const imgs = [
+      new Uint8Array([0x89, 0x50, 0x4e, 0x47, 1, 2, 3]),
+      new Uint8Array([]), // zero-length images are legal framing
+      new Uint8Array([255, 0, 128]),
+    ];
+    const got = decodeThumbFrames(frame(imgs));
+    expect(got).toHaveLength(3);
+    for (const [i, img] of imgs.entries()) {
+      expect(Array.from(got[i])).toEqual(Array.from(img));
+    }
+  });
+
+  it("decodeThumbs wraps each frame in a typed Blob of the right size", () => {
+    const imgs = [new Uint8Array([1, 2, 3]), new Uint8Array([4])];
+    const blobs = decodeThumbs(frame(imgs));
+    expect(blobs).toHaveLength(2);
+    expect(blobs.map((b) => b.size)).toEqual([3, 1]);
+    expect(blobs.map((b) => b.type)).toEqual(["image/png", "image/png"]);
+  });
+
+  it("decodeThumbFrames handles an empty strip and rejects malformed framing", () => {
+    expect(decodeThumbFrames(frame([]))).toEqual([]);
+    expect(() => decodeThumbFrames(new ArrayBuffer(2))).toThrow(/truncated header/);
+    // count says 1 image but no length prefix follows
+    const noLen = new ArrayBuffer(4);
+    new DataView(noLen).setUint32(0, 1, true);
+    expect(() => decodeThumbFrames(noLen)).toThrow(/truncated length/);
+    // length prefix promises more bytes than the buffer holds
+    const short = frame([new Uint8Array([1, 2, 3])]).slice(0, 9);
+    expect(() => decodeThumbFrames(short)).toThrow(/truncated bytes/);
+    // extra bytes after the last image are an error, not silently ignored
+    const ok = frame([new Uint8Array([1])]);
+    const trailing = new Uint8Array(ok.byteLength + 1);
+    trailing.set(new Uint8Array(ok), 0);
+    expect(() => decodeThumbFrames(trailing.buffer)).toThrow(/trailing/);
   });
 });
 

@@ -83,6 +83,51 @@ export function removeTag(tags: string[], tag: string): string[] {
   return tags.includes(tag) ? tags.filter((x) => x !== tag) : tags;
 }
 
+// ---- camera thumbnails ----
+
+/** Thumbnails per strip (the backend clamps to the episode length). */
+export const THUMB_COUNT = 8;
+
+/** Evenly-spaced full-resolution frame indices for a thumbnail strip,
+ *  endpoints included — MUST stay in lockstep with `thumb_picks` in
+ *  `src-tauri/src/lib.rs`, which selects the frames the backend actually
+ *  encodes; this mirror maps a clicked thumb back to its source frame. */
+export function thumbFrameIndices(length: number, count: number): number[] {
+  if (!Number.isFinite(length) || length <= 0) return [];
+  const n = Math.min(Math.max(Math.floor(count), 1), Math.floor(length));
+  if (n === 1) return [0];
+  return Array.from({ length: n }, (_, i) => Math.floor((i * (length - 1)) / (n - 1)));
+}
+
+/** Decode `dataset_episode_thumbs`' length-prefixed binary framing — u32 LE
+ *  image count, then per image a u32 LE byte length + the encoded bytes —
+ *  into one byte view per image. Throws on malformed framing (truncation or
+ *  trailing bytes) instead of yielding broken images. Pure bytes → bytes so
+ *  the vitest suite can assert exact round-trips without Blob support. */
+export function decodeThumbFrames(buf: ArrayBuffer): Uint8Array[] {
+  const view = new DataView(buf);
+  if (buf.byteLength < 4) throw new Error("thumb framing: truncated header");
+  const count = view.getUint32(0, true);
+  const out: Uint8Array[] = [];
+  let off = 4;
+  for (let k = 0; k < count; k++) {
+    if (off + 4 > buf.byteLength) throw new Error(`thumb framing: truncated length of image ${k}`);
+    const len = view.getUint32(off, true);
+    off += 4;
+    if (off + len > buf.byteLength) throw new Error(`thumb framing: truncated bytes of image ${k}`);
+    out.push(new Uint8Array(buf.slice(off, off + len)));
+    off += len;
+  }
+  if (off !== buf.byteLength) throw new Error("thumb framing: trailing bytes");
+  return out;
+}
+
+/** [`decodeThumbFrames`] wrapped into displayable Blobs (feed each through
+ *  `URL.createObjectURL` — and revoke the URLs when done). */
+export function decodeThumbs(buf: ArrayBuffer, mime = "image/png"): Blob[] {
+  return decodeThumbFrames(buf).map((bytes) => new Blob([bytes], { type: mime }));
+}
+
 /** Categorical stroke palette for multi-dim episode plots (accent first). */
 export const SERIES_COLORS = [
   "#7c82ff",

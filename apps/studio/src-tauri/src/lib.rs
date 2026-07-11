@@ -2427,6 +2427,9 @@ struct DatasetSummary {
     total_tasks: u64,
     tasks: Vec<String>,
     features: Vec<DatasetFeatureDto>,
+    /// Names of the dataset's `dtype: "image"` camera features (thumbnail
+    /// strips fetch their frames via `dataset_episode_thumbs`).
+    image_features: Vec<String>,
     episodes: Vec<DatasetEpisodeRow>,
 }
 
@@ -2491,6 +2494,12 @@ fn dataset_summary_impl(root: &Path) -> Result<DatasetSummary, String> {
             }),
         })
         .collect();
+    let image_features: Vec<String> = info
+        .features
+        .iter()
+        .filter(|(_, f)| f.dtype == "image")
+        .map(|(name, _)| name.clone())
+        .collect();
     let episodes = reader
         .episodes()
         .iter()
@@ -2513,6 +2522,7 @@ fn dataset_summary_impl(root: &Path) -> Result<DatasetSummary, String> {
         total_tasks: info.total_tasks,
         tasks: reader.tasks().to_vec(),
         features,
+        image_features,
         episodes,
     })
 }
@@ -2576,6 +2586,64 @@ fn dataset_episode(
         "dataset_episode",
         dataset_episode_impl(&path, episode, max_points),
     )
+}
+
+/// Evenly-spaced sample indices over `0..len`, endpoints included — MUST stay
+/// in lockstep with `thumbFrameIndices` in `apps/studio/src/data/episodes.ts`
+/// (the FE maps thumb clicks back to full-res frames with the same formula).
+fn thumb_picks(len: usize, count: usize) -> Vec<usize> {
+    if len == 0 {
+        return Vec::new();
+    }
+    let n = count.clamp(1, len);
+    if n == 1 {
+        return vec![0];
+    }
+    (0..n).map(|i| i * (len - 1) / (n - 1)).collect()
+}
+
+fn dataset_episode_thumbs_impl(
+    path: &str,
+    episode: usize,
+    feature: &str,
+    count: usize,
+) -> Result<Vec<u8>, String> {
+    let root = dataset_dir(path)?;
+    let reader = caliper_dataset::DatasetReader::open(&root).map_err(|e| e.to_string())?;
+    let ep = reader.read_episode(episode).map_err(|e| e.to_string())?;
+    let frames = ep
+        .images
+        .get(feature)
+        .ok_or_else(|| format!("dataset has no image feature '{feature}'"))?;
+    let picks = thumb_picks(frames.len(), count);
+    let mut out = Vec::with_capacity(4 + picks.iter().map(|&i| 4 + frames[i].len()).sum::<usize>());
+    out.extend_from_slice(&(picks.len() as u32).to_le_bytes());
+    for &i in &picks {
+        let bytes = &frames[i];
+        let len = u32::try_from(bytes.len())
+            .map_err(|_| format!("image frame {i} exceeds the u32 framing limit"))?;
+        out.extend_from_slice(&len.to_le_bytes());
+        out.extend_from_slice(bytes);
+    }
+    Ok(out)
+}
+
+/// `count` evenly-spaced frames' encoded PNG bytes of one episode's image
+/// feature, as a BINARY IPC response (mirrors `read_mesh`): `u32` LE image
+/// count, then per image a `u32` LE byte length + the bytes verbatim.
+/// Decoded by `decodeThumbs` in `apps/studio/src/data/episodes.ts`.
+#[tauri::command]
+fn dataset_episode_thumbs(
+    path: String,
+    episode: usize,
+    feature: String,
+    count: usize,
+) -> Result<tauri::ipc::Response, String> {
+    logged(
+        "dataset_episode_thumbs",
+        dataset_episode_thumbs_impl(&path, episode, &feature, count),
+    )
+    .map(tauri::ipc::Response::new)
 }
 
 fn dataset_delete_episodes_impl(path: &str, episodes: &[usize]) -> Result<DatasetSummary, String> {
@@ -2764,6 +2832,7 @@ pub fn run() {
             load_graph_file,
             dataset_open,
             dataset_episode,
+            dataset_episode_thumbs,
             dataset_delete_episodes,
             dataset_split_episode,
             dataset_merge_episodes,
@@ -3310,5 +3379,18 @@ mod tests {
         let b = sanitize_name("a.b").unwrap();
         assert!(a.starts_with("a_b-") && b.starts_with("a_b-"));
         assert_ne!(a, b, "distinct unsafe names must map to distinct files");
+    }
+
+    #[test]
+    fn thumb_picks_are_evenly_spaced_and_clamped() {
+        // endpoints included, monotonic, evenly spaced
+        assert_eq!(thumb_picks(100, 8), vec![0, 14, 28, 42, 56, 70, 84, 99]);
+        // fewer frames than thumbs → every frame once
+        assert_eq!(thumb_picks(3, 8), vec![0, 1, 2]);
+        assert_eq!(thumb_picks(1, 8), vec![0]);
+        // degenerate requests
+        assert_eq!(thumb_picks(10, 1), vec![0]);
+        assert_eq!(thumb_picks(10, 0), vec![0]); // count floors at 1
+        assert!(thumb_picks(0, 8).is_empty());
     }
 }

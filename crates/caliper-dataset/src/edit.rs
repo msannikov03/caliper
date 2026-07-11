@@ -30,8 +30,13 @@
 //! episode/index numbering (dense), `meta/tasks.parquet` (unused tasks
 //! dropped, indices remapped first-seen), all per-episode stats bookkeeping in
 //! `meta/episodes`, aggregated `meta/stats.json`, totals, and `splits` (reset
-//! to `train: 0:N`). Not supported (rejected loudly, dataset untouched):
-//! features that are not flat `float32` vectors (video/image datasets).
+//! to `train: 0:N`). Image (`dtype: "image"`) features ride along
+//! byte-for-byte: episode transforms are index-level, so each surviving
+//! frame's encoded PNG streams through the writer verbatim (re-validated by
+//! decode on the way; image stats are recomputed with everything else). Not
+//! supported (rejected loudly, dataset untouched): any other feature layout —
+//! notably `dtype: "video"` datasets, whose frames live outside the data
+//! parquet where an index-level rewrite cannot carry them.
 //!
 //! # Timestamp semantics
 //!
@@ -311,20 +316,37 @@ fn dataset_root(root: &Path) -> Result<PathBuf, Error> {
     Ok(canon)
 }
 
-/// Rebuild `FeatureSpec`s from `info.json`. Only flat `float32` vector
-/// features are editable; anything else (video, images, multi-dim arrays) is
-/// rejected loudly — the rewrite would silently drop it otherwise. Element
-/// names survive when they are a plain string list (`names: null` otherwise).
+/// Rebuild `FeatureSpec`s from `info.json`. Editable features are flat
+/// `float32` vectors and `dtype: "image"` camera features (whose PNG bytes
+/// stream through the rewrite verbatim); anything else (video, multi-dim
+/// arrays) is rejected loudly — the rewrite would silently drop it otherwise.
+/// Vector element names survive when they are a plain string list
+/// (`names: null` otherwise).
 fn feature_specs(info: &Info) -> Result<Vec<FeatureSpec>, Error> {
     let mut specs = Vec::new();
     for (name, f) in &info.features {
         if RESERVED_FEATURES.contains(&name.as_str()) {
             continue;
         }
+        if f.dtype == "image" {
+            let &[h, w, c] = &f.shape[..] else {
+                return Err(Error::Edit(format!(
+                    "image feature '{name}' has shape {:?} — expected (height, width, channels)",
+                    f.shape
+                )));
+            };
+            specs.push(FeatureSpec::image(
+                name.clone(),
+                h as usize,
+                w as usize,
+                c as usize,
+            ));
+            continue;
+        }
         if f.dtype != "float32" || f.shape.len() != 1 {
             return Err(Error::Edit(format!(
-                "feature '{name}' is dtype '{}' shape {:?} — edit ops only support datasets \
-                 whose user features are flat float32 vectors",
+                "feature '{name}' is dtype '{}' shape {:?} — edit ops only support flat float32 \
+                 vector and image features (video datasets are not editable)",
                 f.dtype, f.shape
             )));
         }
@@ -401,7 +423,16 @@ fn build_into(
     tags: &BTreeMap<u64, Vec<String>>,
 ) -> Result<(), Error> {
     let fps = info.fps;
-    let feature_names: Vec<String> = specs.iter().map(|s| s.name.clone()).collect();
+    let vector_names: Vec<String> = specs
+        .iter()
+        .filter(|s| !s.is_image())
+        .map(|s| s.name.clone())
+        .collect();
+    let image_names: Vec<String> = specs
+        .iter()
+        .filter(|s| s.is_image())
+        .map(|s| s.name.clone())
+        .collect();
     let mut spec = DatasetSpec::new(fps, info.robot_type.clone().unwrap_or_default(), specs);
     spec.data_files_size_in_mb = info.data_files_size_in_mb;
     spec.chunks_size = info.chunks_size;
@@ -434,9 +465,9 @@ fn build_into(
             };
             for i in slice.range.clone() {
                 let t = ep.timestamps[i] + offset;
-                let mut values: Vec<(&str, &[f64])> = Vec::with_capacity(feature_names.len());
-                let mut rows: Vec<Vec<f64>> = Vec::with_capacity(feature_names.len());
-                for name in &feature_names {
+                let mut values: Vec<(&str, &[f64])> = Vec::with_capacity(vector_names.len());
+                let mut rows: Vec<Vec<f64>> = Vec::with_capacity(vector_names.len());
+                for name in &vector_names {
                     let feat = ep.features.get(name).ok_or_else(|| {
                         Error::Format(format!(
                             "episode {} is missing feature '{name}'",
@@ -445,10 +476,27 @@ fn build_into(
                     })?;
                     rows.push(feat[i].iter().map(|&x| f64::from(x)).collect());
                 }
-                for (name, row) in feature_names.iter().zip(&rows) {
+                for (name, row) in vector_names.iter().zip(&rows) {
                     values.push((name.as_str(), row.as_slice()));
                 }
-                writer.add_frame_at(&values, t)?;
+                // Image bytes ride along untouched: episode transforms are
+                // index-level, so frame `i`'s PNG is appended verbatim (the
+                // writer re-validates each frame's decode against the spec).
+                let mut images: Vec<(&str, &[u8])> = Vec::with_capacity(image_names.len());
+                for name in &image_names {
+                    let png = ep
+                        .images
+                        .get(name)
+                        .and_then(|frames| frames.get(i))
+                        .ok_or_else(|| {
+                            Error::Format(format!(
+                                "episode {} is missing image feature '{name}' frame {i}",
+                                slice.episode
+                            ))
+                        })?;
+                    images.push((name.as_str(), png.as_slice()));
+                }
+                writer.add_frame_at_with_images(&values, &images, t)?;
                 let ti = usize::try_from(ep.task_indices[i])
                     .ok()
                     .filter(|&x| x < all_tasks.len());

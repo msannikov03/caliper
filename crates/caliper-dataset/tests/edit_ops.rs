@@ -291,6 +291,112 @@ fn validation_errors_leave_dataset_untouched() {
     let _ = fs::remove_dir_all(&root);
 }
 
+// ===== image datasets: PNG bytes must ride along through every op =====
+
+const IH: usize = 4;
+const IW: usize = 3;
+
+/// Deterministic RGB PNG for (episode, frame) — every pixel identifies its
+/// source frame, so the byte-equality assertions below prove exact
+/// index-level streaming (not just "some image survived").
+fn png_rgb(ep: usize, frame: usize) -> Vec<u8> {
+    let px: Vec<u8> = (0..IH * IW * 3)
+        .map(|i| (((10 * ep + frame) * 7 + i) % 256) as u8)
+        .collect();
+    let mut out = Vec::new();
+    let mut enc = png::Encoder::new(&mut out, IW as u32, IH as u32);
+    enc.set_color(png::ColorType::Rgb);
+    enc.set_depth(png::BitDepth::Eight);
+    let mut w = enc.write_header().unwrap();
+    w.write_image_data(&px).unwrap();
+    w.finish().unwrap();
+    out
+}
+
+/// Like [`build`] but with a camera feature next to the vector; returns the
+/// per-episode PNGs exactly as recorded.
+fn build_img(tag: &str, lengths: [usize; 3]) -> (PathBuf, Vec<Vec<Vec<u8>>>) {
+    let dir = tmpdir(tag);
+    let mut w = DatasetWriter::create(
+        &dir,
+        DatasetSpec::new(
+            FPS,
+            "edit_bot",
+            vec![
+                FeatureSpec::vector("observation.state", 2, None),
+                FeatureSpec::image("observation.images.cam", IH, IW, 3),
+            ],
+        ),
+    )
+    .unwrap();
+    let mut pngs = Vec::new();
+    for (ep, (&len, task)) in lengths.iter().zip(["wave", "reach", "wave"]).enumerate() {
+        let mut ep_pngs = Vec::new();
+        for i in 0..len {
+            let v = (10 * ep + i) as f64;
+            let png = png_rgb(ep, i);
+            w.add_frame_with_images(
+                &[("observation.state", &[v, -v][..])],
+                &[("observation.images.cam", &png)],
+            )
+            .unwrap();
+            ep_pngs.push(png);
+        }
+        w.save_episode(task).unwrap();
+        pngs.push(ep_pngs);
+    }
+    (w.finalize().unwrap(), pngs)
+}
+
+fn ep_pngs(r: &DatasetReader, ep: usize) -> Vec<Vec<u8>> {
+    r.read_episode(ep).unwrap().images["observation.images.cam"].clone()
+}
+
+#[test]
+fn delete_streams_image_bytes_through() {
+    let (root, pngs) = build_img("img_delete", [4, 3, 5]);
+    delete_episodes(&root, &[1]).unwrap();
+    let r = DatasetReader::open(&root).unwrap();
+    assert_eq!(r.total_episodes(), 2);
+    // surviving episodes' PNGs round-trip byte-exactly through the rewrite
+    assert_eq!(ep_pngs(&r, 0), pngs[0]);
+    assert_eq!(ep_pngs(&r, 1), pngs[2]);
+    // the image feature survives in info.json with its shape intact
+    let f = &r.info().features["observation.images.cam"];
+    assert_eq!(f.dtype, "image");
+    assert_eq!(f.shape, vec![IH as u64, IW as u64, 3]);
+    // vector features still ride along next to the images
+    assert_eq!(frame_val(&r, 1, 4), 24.0);
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn split_slices_image_bytes() {
+    let (root, pngs) = build_img("img_split", [4, 3, 5]);
+    split_episode(&root, 2, 2).unwrap();
+    let r = DatasetReader::open(&root).unwrap();
+    assert_eq!(r.total_episodes(), 4);
+    // untouched episodes copy verbatim; the split halves slice the byte vectors
+    assert_eq!(ep_pngs(&r, 0), pngs[0]);
+    assert_eq!(ep_pngs(&r, 1), pngs[1]);
+    assert_eq!(ep_pngs(&r, 2), pngs[2][..2].to_vec());
+    assert_eq!(ep_pngs(&r, 3), pngs[2][2..].to_vec());
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn merge_concatenates_image_bytes() {
+    let (root, pngs) = build_img("img_merge", [4, 3, 5]);
+    merge_episodes(&root, 0, 1).unwrap();
+    let r = DatasetReader::open(&root).unwrap();
+    assert_eq!(r.total_episodes(), 2);
+    // merged episode keeps BOTH halves' frames, in order, byte-exact
+    let want: Vec<Vec<u8>> = pngs[0].iter().chain(&pngs[1]).cloned().collect();
+    assert_eq!(ep_pngs(&r, 0), want);
+    assert_eq!(ep_pngs(&r, 1), pngs[2]);
+    let _ = fs::remove_dir_all(&root);
+}
+
 #[test]
 fn tags_roundtrip_and_tolerate_missing_file() {
     let root = build("tags", [4, 3, 5]);

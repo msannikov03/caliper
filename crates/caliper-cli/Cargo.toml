@@ -19,6 +19,9 @@ path = "src/main.rs"
 caliper = { workspace = true, features = ["dataset"] }
 caliper-collision.workspace = true
 caliper-dataset.workspace = true
+# MJCF generation only (pure string work) — deliberately WITHOUT the `mujoco`
+# feature, so `caliper mjcf` needs no libmujoco on the machine.
+caliper-sim-mujoco.workspace = true
 clap.workspace = true
 anyhow.workspace = true
 nalgebra.workspace = true

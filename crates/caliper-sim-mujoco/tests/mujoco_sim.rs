@@ -142,6 +142,82 @@ fn sphere_settles_on_ground_plane() {
     assert!(sim.qvel()[0].abs() < 1.0);
 }
 
+/// (b2) HULL MESHES: a model exported WITH `export_hull_meshes` — a pendulum
+/// whose only collider is a mesh (unit-cube STL → ConvexHull) — LOADS in the
+/// real MuJoCo compiler with zero skipped colliders, and the hull geom makes
+/// a sane contact when the cube swings down onto a ground plane.
+#[test]
+fn hull_mesh_collider_loads_and_contacts() {
+    // Same layout as `sphere_settles_on_ground_plane`, but the tip collider
+    // is the shared unit-cube fixture (corners ±0.5) scaled to a 0.12 m cube,
+    // referenced by ABSOLUTE path so the temp URDF resolves it.
+    let stl = format!(
+        "{}/../../oracle/fixtures/robots/unit_cube.stl",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let urdf = format!(
+        r#"<?xml version="1.0"?>
+      <robot name="hulltap">
+        <link name="base"/>
+        <link name="arm">
+          <inertial><origin xyz="0 0 0.2" rpy="0 0 0"/><mass value="0.5"/>
+            <inertia ixx="0.007" ixy="0" ixz="0" iyy="0.007" iyz="0" izz="0.0002"/></inertial>
+          <collision><origin xyz="0 0 0.4" rpy="0 0 0"/>
+            <geometry><mesh filename="{stl}" scale="0.12 0.12 0.12"/></geometry></collision>
+        </link>
+        <joint name="j1" type="revolute">
+          <parent link="base"/><child link="arm"/>
+          <origin xyz="0 0 0" rpy="0 0 0"/><axis xyz="0 1 0"/>
+          <limit lower="-6.28" upper="6.28" effort="50" velocity="20"/>
+        </joint>
+      </robot>"#
+    );
+    let path = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("hulltap.urdf");
+    std::fs::write(&path, urdf).unwrap();
+    let m = Model::from_urdf(&path).unwrap();
+
+    // Cube center orbit radius 0.4, half-extent 0.06: hanging straight down
+    // the cube bottom (-0.46) is below a plane at z=-0.35 — it must come to
+    // rest ON the plane instead.
+    let opt = MjcfOptions {
+        ground_plane: Some(-0.35),
+        joint_damping: 0.5,
+        export_hull_meshes: true,
+        ..Default::default()
+    };
+    let mut sim = MujocoSim::from_caliper_model_with(&m, &opt).unwrap();
+    assert_eq!(
+        sim.skipped_hull_colliders(),
+        0,
+        "hull collider skipped despite export_hull_meshes"
+    );
+    sim.set_state(&[2.0], &[0.0]).unwrap();
+    assert_eq!(sim.ncon(), 0, "must start contact-free");
+    sim.step(3.0).unwrap(); // fall + settle (damped)
+    let contacts = sim.contacts();
+    assert!(!contacts.is_empty(), "no contact after settling");
+    let c = contacts
+        .iter()
+        .find(|c| c.geom1 == "caliper_ground" || c.geom2 == "caliper_ground")
+        .expect("no contact with the ground plane");
+    assert!(
+        c.geom1 == "col0_arm" || c.geom2 == "col0_arm",
+        "ground contact is not with the hull geom: {c:?}"
+    );
+    assert!(c.depth > 0.0, "non-penetrating contact reported: {c:?}");
+    assert!(
+        c.normal[2].abs() > 0.9,
+        "ground contact normal should be ±z: {c:?}"
+    );
+    // Contact point sits on the plane, within the cube's half-diagonal.
+    assert!(
+        (c.pos[2] - (-0.35)).abs() < 0.11,
+        "contact z off-plane: {c:?}"
+    );
+    // And the joint is finite / at rest-ish under damping.
+    assert!(sim.qvel()[0].abs() < 1.0);
+}
+
 /// (c) Determinism: identical runs are BITWISE identical (same binary + same
 /// pinned libmujoco; warmstart included because both runs share every step).
 #[test]

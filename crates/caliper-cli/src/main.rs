@@ -19,6 +19,7 @@ use caliper_collision::{CollisionModel, WorldScene};
 use caliper_dataset::{
     DatasetReader as DatasetReaderV3, DatasetSpec as DatasetSpecV3, DatasetWriter, FeatureSpec,
 };
+use caliper_sim_mujoco::mjcf::{Actuation, MjcfOptions, mjcf_from_model};
 use clap::{Parser, Subcommand, ValueEnum};
 use nalgebra::{Matrix3, Matrix4, UnitQuaternion, Vector3};
 use std::path::PathBuf;
@@ -329,6 +330,43 @@ enum Cmd {
         /// Machine-readable JSON instead of the table.
         #[arg(long)]
         json: bool,
+    },
+    /// Export a robot as an MJCF (MuJoCo XML) model — the lingua franca of
+    /// the MuJoCo / MJX / Warp / Newton GPU-sim ecosystem.
+    ///
+    /// Collision/dynamics-focused: primitive colliders always; mesh
+    /// (convex-hull) colliders only with --hull-meshes (inline-vertex mesh
+    /// assets — no files on disk); visuals are never exported. The XML goes
+    /// to stdout (or --out); the one-line summary and errors go to stderr.
+    Mjcf {
+        /// Path to a .urdf file.
+        urdf: PathBuf,
+        /// Output .xml path; prints the MJCF to stdout when omitted.
+        #[arg(short, long)]
+        out: Option<PathBuf>,
+        /// Add an infinite ground plane at z = <GROUND>. Bare `--ground`
+        /// means z = 0; negative heights need the `=` form, e.g.
+        /// `--ground=-0.2`.
+        #[arg(long, num_args = 0..=1, default_missing_value = "0")]
+        ground: Option<f64>,
+        /// Emit one <position> servo per joint (--kp/--kv gains) instead of
+        /// the default torque-direct (actuator-less) document.
+        #[arg(long)]
+        actuators: bool,
+        /// Position-servo proportional gain (only with --actuators).
+        #[arg(long, default_value_t = 100.0)]
+        kp: f64,
+        /// Position-servo damping gain (only with --actuators).
+        #[arg(long, default_value_t = 10.0)]
+        kv: f64,
+        /// Export ConvexHull (mesh) colliders as inline-vertex MJCF mesh
+        /// assets (MuJoCo convex-hulls them natively). Off by default: hull
+        /// colliders are then SKIPPED and counted in the summary.
+        #[arg(long)]
+        hull_meshes: bool,
+        /// MuJoCo integration timestep (s).
+        #[arg(long, default_value_t = 1e-3)]
+        timestep: f64,
     },
     /// Run or validate a Caliper node graph (.caliper-graph.json) (Phase 8).
     Graph {
@@ -1345,6 +1383,52 @@ fn main() -> anyhow::Result<()> {
                 );
                 report::print_table(m, &rep, &seg_durations);
             }
+        }
+        Cmd::Mjcf {
+            urdf,
+            out,
+            ground,
+            actuators,
+            kp,
+            kv,
+            hull_meshes,
+            timestep,
+        } => {
+            let robot = caliper::model::Robot::from_urdf(&urdf)?;
+            let opt = MjcfOptions {
+                timestep,
+                ground_plane: ground,
+                actuation: if actuators {
+                    Actuation::PositionServo { kp, kv }
+                } else {
+                    Actuation::TorqueDirect
+                },
+                export_hull_meshes: hull_meshes,
+                ..Default::default()
+            };
+            let doc = mjcf_from_model(&robot.model, &opt)?;
+            match &out {
+                Some(path) => std::fs::write(path, &doc.xml)
+                    .map_err(|e| anyhow::anyhow!("failed to write `{}`: {e}", path.display()))?,
+                None => print!("{}", doc.xml),
+            }
+            // Summary on stderr so stdout stays pure XML (pipeable).
+            let skipped = if doc.skipped_hull_colliders > 0 {
+                format!(
+                    "{} hull collider(s) SKIPPED (re-run with --hull-meshes to export them)",
+                    doc.skipped_hull_colliders
+                )
+            } else {
+                "0 skipped".to_string()
+            };
+            let dest = out
+                .as_ref()
+                .map(|p| format!(" -> {}", p.display()))
+                .unwrap_or_default();
+            eprintln!(
+                "mjcf '{}': {} bodies, {} joints, {} geoms, {}{}",
+                robot.name, doc.body_count, doc.joint_count, doc.geom_count, skipped, dest
+            );
         }
         Cmd::Graph { action } => match action {
             GraphCmd::Run { urdf, graph, out } => {

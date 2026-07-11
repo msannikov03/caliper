@@ -1,10 +1,27 @@
 //! Minimal MJCF generation from a caliper [`Model`].
 //!
-//! Deliberately SMALL: kinematic tree + 1-dof joints + inertials + primitive
-//! collision geoms + (optional) ground plane + (optional) position actuators.
-//! No meshes (hull colliders are counted, not exported), no sensors, no solver
-//! tuning beyond the timestep — MuJoCo defaults apply. Pure string generation:
-//! this module compiles and is tested WITHOUT MuJoCo present.
+//! Deliberately SMALL: kinematic tree + 1-dof joints + inertials + collision
+//! geoms + (optional) ground plane + (optional) position actuators. No
+//! sensors, no solver tuning beyond `<option timestep gravity>` — MuJoCo
+//! defaults apply. Pure string generation: this module compiles and is tested
+//! WITHOUT MuJoCo present.
+//!
+//! # What IS and ISN'T exported
+//!
+//! The document is COLLISION/DYNAMICS-focused — it is meant to drop into the
+//! MuJoCo / MJX / Warp / Newton ecosystem for physics, not for rendering.
+//!
+//! | caliper model feature | MJCF output |
+//! |---|---|
+//! | kinematic tree (revolute/prismatic) | nested `<body>` + `<joint type="hinge"/"slide">`, topological order (`qpos` order = caliper `q` order) |
+//! | inertials | `<inertial>` (mass + COM + `fullinertia`) — REQUIRED, `has_inertia` must hold |
+//! | joint limits | `range` on each `<joint>` (radians / meters) |
+//! | primitive colliders (box/sphere/cylinder/capsule) | one `<geom>` each, always |
+//! | mesh colliders ([`CollisionShape::ConvexHull`]) | SKIPPED by default (counted in [`MjcfDocument::skipped_hull_colliders`]); with [`MjcfOptions::export_hull_meshes`] each hull becomes an inline-vertex `<asset><mesh vertex="…">` + `<geom type="mesh">` — MuJoCo convex-hulls vertex-only meshes natively |
+//! | visuals ([`caliper_model::VisualShape`]) | NOT exported — render meshes stay in Studio; MuJoCo sees collision geometry only |
+//! | joint `<dynamics damping>` | NOT translated (caliper does not parse it); the uniform [`MjcfOptions::joint_damping`] knob instead |
+//! | actuators | none by default (torque via `qfrc_applied`); opt-in `<position>` servos ([`Actuation::PositionServo`]) |
+//! | sensors / transmissions / solver tuning | NOT exported — MuJoCo defaults |
 //!
 //! Conventions locked in the header we emit:
 //! - `<compiler angle="radian" autolimits="true"/>` — caliper is radians-only.
@@ -21,7 +38,7 @@
 use crate::MujocoError;
 use caliper_model::{CollisionShape, JointKind, Model};
 use caliper_spatial::{Se3, SpatialInertia};
-use nalgebra::{Matrix3, Vector3};
+use nalgebra::{Matrix3, Point3, Vector3};
 use std::fmt::Write as _;
 
 /// How the generated model is driven. Mutually exclusive by construction: a
@@ -96,6 +113,16 @@ pub struct MjcfOptions {
     /// inertial + one geom), emitted in `<worldbody>` AFTER the robot bodies
     /// so the robot's `qpos`/`qvel` prefix is unchanged. Empty by default.
     pub props: Vec<PropSpec>,
+    /// Export [`CollisionShape::ConvexHull`] colliders as inline-vertex
+    /// `<asset><mesh vertex="x y z …">` assets + `<geom type="mesh">` geoms.
+    /// MuJoCo accepts vertex-only meshes embedded directly in the XML and
+    /// convex-hulls them natively (qhull), which matches caliper's own GJK
+    /// hull semantics — no mesh files are written. OFF by default (the
+    /// pre-existing behavior: hulls are counted in
+    /// [`MjcfDocument::skipped_hull_colliders`], never silently dropped);
+    /// when ON, `skipped_hull_colliders` drops to 0. A hull with fewer than
+    /// 4 vertices is rejected loudly (MuJoCo's hull needs a 3D simplex).
+    pub export_hull_meshes: bool,
 }
 
 impl Default for MjcfOptions {
@@ -108,6 +135,7 @@ impl Default for MjcfOptions {
             actuation: Actuation::TorqueDirect,
             extra_worldbody_xml: None,
             props: Vec::new(),
+            export_hull_meshes: false,
         }
     }
 }
@@ -117,10 +145,21 @@ impl Default for MjcfOptions {
 pub struct MjcfDocument {
     pub xml: String,
     /// Number of `CollisionShape::ConvexHull` colliders that were SKIPPED
-    /// (mesh assets are deferred). Non-zero means the MuJoCo model has LESS
-    /// collision coverage than `caliper-collision` on the same model —
-    /// surface this to users, never swallow it.
+    /// because [`MjcfOptions::export_hull_meshes`] was off (with it on, this
+    /// is always 0). Non-zero means the MuJoCo model has LESS collision
+    /// coverage than `caliper-collision` on the same model — surface this to
+    /// users, never swallow it.
     pub skipped_hull_colliders: usize,
+    /// `<body>` elements emitted: robot bodies (= ndof) + free-floating props.
+    pub body_count: usize,
+    /// Articulated robot `<joint>` elements (= ndof; prop `<freejoint>`s are
+    /// NOT counted here).
+    pub joint_count: usize,
+    /// Collision `<geom>` elements emitted: robot colliders (incl. hull
+    /// meshes when enabled) + prop geoms + the optional ground plane. Geoms
+    /// inside [`MjcfOptions::extra_worldbody_xml`] are NOT counted (verbatim
+    /// passthrough).
+    pub geom_count: usize,
     /// `(prop name, MJCF body name)` for every [`MjcfOptions::props`] entry,
     /// in input order — the name map the sim layer resolves body ids from.
     pub prop_bodies: Vec<(String, String)>,
@@ -171,17 +210,35 @@ pub fn mjcf_from_model(m: &Model, opt: &MjcfOptions) -> Result<MjcfDocument, Muj
     // folded fixed-chain offset.
     let mut world_geoms: Vec<String> = Vec::new();
     let mut body_geoms: Vec<Vec<String>> = vec![Vec::new(); m.ndof];
+    let mut hull_assets: Vec<String> = Vec::new();
     let mut skipped_hull_colliders = 0usize;
     for (gi, g) in m.collision.iter().enumerate() {
         let frame = &m.frames[g.frame];
         let pose = frame.offset.compose(&g.origin);
         let name = format!("col{gi}_{}", sanitize(&frame.name));
-        match geom_xml(&name, &pose, &g.shape) {
-            Some(x) => match frame.anchor {
+        let emitted = match geom_xml(&name, &pose, &g.shape) {
+            Some(x) => Some(x),
+            None if opt.export_hull_meshes => {
+                let CollisionShape::ConvexHull { points } = &g.shape else {
+                    unreachable!("geom_xml returns None only for ConvexHull");
+                };
+                let mesh_name = format!("mesh_{name}");
+                hull_assets.push(hull_mesh_asset(&mesh_name, points)?);
+                Some(format!(
+                    "<geom name=\"{name}\" type=\"mesh\" mesh=\"{mesh_name}\" {}/>",
+                    pose_attrs(&pose)
+                ))
+            }
+            None => {
+                skipped_hull_colliders += 1;
+                None
+            }
+        };
+        if let Some(x) = emitted {
+            match frame.anchor {
                 Some(j) => body_geoms[j].push(x),
                 None => world_geoms.push(x),
-            },
-            None => skipped_hull_colliders += 1,
+            }
         }
     }
 
@@ -206,6 +263,13 @@ pub fn mjcf_from_model(m: &Model, opt: &MjcfOptions) -> Result<MjcfDocument, Muj
         f(opt.gravity[1]),
         f(opt.gravity[2])
     );
+    if !hull_assets.is_empty() {
+        xml.push_str("  <asset>\n");
+        for a in &hull_assets {
+            let _ = writeln!(xml, "    {a}");
+        }
+        xml.push_str("  </asset>\n");
+    }
     xml.push_str("  <worldbody>\n");
     if let Some(z) = opt.ground_plane {
         if !z.is_finite() {
@@ -288,11 +352,49 @@ pub fn mjcf_from_model(m: &Model, opt: &MjcfOptions) -> Result<MjcfDocument, Muj
     }
     xml.push_str("</mujoco>\n");
 
+    let geom_count = usize::from(opt.ground_plane.is_some())
+        + world_geoms.len()
+        + body_geoms.iter().map(Vec::len).sum::<usize>()
+        + opt.props.len();
     Ok(MjcfDocument {
         xml,
         skipped_hull_colliders,
+        body_count: m.ndof + opt.props.len(),
+        joint_count: m.ndof,
+        geom_count,
         prop_bodies,
     })
+}
+
+/// One inline-vertex `<mesh>` asset from hull points. MuJoCo's `vertex`
+/// attribute takes whitespace-separated coordinates (a multiple of 3) in the
+/// mesh frame; with no `face` data MuJoCo builds the convex hull itself —
+/// exactly caliper's hull semantics. Fails loudly on non-finite coordinates
+/// or fewer than 4 vertices (a 3D hull needs a simplex; qhull would reject
+/// it at load time with a far less helpful message).
+fn hull_mesh_asset(name: &str, points: &[Point3<f64>]) -> Result<String, MujocoError> {
+    if points.len() < 4 {
+        return Err(MujocoError::Mjcf(format!(
+            "hull mesh `{name}`: MuJoCo needs at least 4 vertices, got {}",
+            points.len()
+        )));
+    }
+    if !points
+        .iter()
+        .all(|p| p.coords.iter().all(|c| c.is_finite()))
+    {
+        return Err(MujocoError::NonFinite {
+            what: "hull mesh vertex",
+        });
+    }
+    let mut v = String::with_capacity(points.len() * 24);
+    for (i, p) in points.iter().enumerate() {
+        if i > 0 {
+            v.push(' ');
+        }
+        let _ = write!(v, "{} {} {}", f(p.x), f(p.y), f(p.z));
+    }
+    Ok(format!("<mesh name=\"{name}\" vertex=\"{v}\"/>"))
 }
 
 /// Reject a bad prop BEFORE it reaches the MuJoCo compiler (clearer errors,
@@ -446,8 +548,9 @@ fn emit_body(
     Ok(())
 }
 
-/// Primitive collider → MJCF `<geom>`; `None` for `ConvexHull` (meshes are
-/// deferred — the caller COUNTS these, it must not drop them silently).
+/// Primitive collider → MJCF `<geom>`; `None` for `ConvexHull` — the caller
+/// either exports it as a mesh asset ([`MjcfOptions::export_hull_meshes`]) or
+/// COUNTS it as skipped, never drops it silently.
 fn geom_xml(name: &str, pose: &Se3, shape: &CollisionShape) -> Option<String> {
     let body = match shape {
         CollisionShape::Box { half } => format!(
@@ -777,6 +880,131 @@ mod tests {
             ..Default::default()
         };
         assert!(mjcf_from_model(&m, &opt).is_err(), "accepted NaN pos");
+    }
+
+    /// A hull collider exports as an inline-vertex `<asset><mesh>` +
+    /// `<geom type="mesh">` when `export_hull_meshes` is on (vertex data
+    /// bit-exactly matching the model's hull points), and stays SKIPPED +
+    /// counted when off. Pure string-level — no MuJoCo needed.
+    #[test]
+    fn hull_meshes_exported_when_enabled() {
+        // Temp URDF referencing the shared unit-cube STL fixture (corners at
+        // ±0.5) by ABSOLUTE path, plus an inertial so MJCF generation runs.
+        let stl = format!(
+            "{}/../../oracle/fixtures/robots/unit_cube.stl",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let urdf = format!(
+            r#"<?xml version="1.0"?>
+<robot name="hullbot">
+  <link name="base"/>
+  <link name="l1">
+    <inertial><origin xyz="0 0 0.1" rpy="0 0 0"/><mass value="0.5"/>
+      <inertia ixx="0.004" ixy="0" ixz="0" iyy="0.004" iyz="0" izz="0.001"/></inertial>
+    <collision><origin xyz="0 0 0.2" rpy="0 0 0"/>
+      <geometry><mesh filename="{stl}"/></geometry></collision>
+  </link>
+  <joint name="j1" type="revolute">
+    <parent link="base"/><child link="l1"/>
+    <origin xyz="0 0 0.1" rpy="0 0 0"/><axis xyz="0 1 0"/>
+    <limit lower="-3.14" upper="3.14" effort="10" velocity="2"/>
+  </joint>
+</robot>"#
+        );
+        let path =
+            std::env::temp_dir().join(format!("caliper_mjcf_hull_{}.urdf", std::process::id()));
+        std::fs::write(&path, urdf).unwrap();
+        let m = Model::from_urdf(&path).unwrap();
+        let points = m
+            .collision
+            .iter()
+            .find_map(|g| match &g.shape {
+                CollisionShape::ConvexHull { points } => Some(points.clone()),
+                _ => None,
+            })
+            .expect("fixture must produce a ConvexHull collider");
+        assert_eq!(points.len(), 8, "unit cube hull = 8 corners");
+
+        // OFF (the default): skipped + counted, no mesh anywhere.
+        let off = mjcf_from_model(&m, &MjcfOptions::default()).unwrap();
+        assert_eq!(off.skipped_hull_colliders, 1);
+        assert_eq!(off.geom_count, 0);
+        assert!(!off.xml.contains("<asset>") && !off.xml.contains("type=\"mesh\""));
+
+        // ON: <asset> before <worldbody>, geom references the mesh, skipped 0.
+        let opt = MjcfOptions {
+            export_hull_meshes: true,
+            ..Default::default()
+        };
+        let doc = mjcf_from_model(&m, &opt).unwrap();
+        assert_eq!(doc.skipped_hull_colliders, 0);
+        assert_eq!(doc.body_count, 1);
+        assert_eq!(doc.joint_count, 1);
+        assert_eq!(doc.geom_count, 1);
+        let x = &doc.xml;
+        let asset_at = x.find("<asset>").expect("no <asset> block");
+        assert!(asset_at < x.find("<worldbody>").unwrap());
+        assert!(x.contains("<mesh name=\"mesh_col0_l1\" vertex=\""));
+        assert!(
+            x.contains("type=\"mesh\" mesh=\"mesh_col0_l1\""),
+            "geom does not reference the mesh asset:\n{x}"
+        );
+        // Vertex data round-trips bit-exactly to the model's hull points
+        // (shortest-roundtrip formatting is parse-exact).
+        let vstart = x.find("vertex=\"").unwrap() + "vertex=\"".len();
+        let vend = vstart + x[vstart..].find('"').unwrap();
+        let nums: Vec<f64> = x[vstart..vend]
+            .split_whitespace()
+            .map(|s| s.parse().unwrap())
+            .collect();
+        assert_eq!(nums.len(), 3 * points.len());
+        for (i, p) in points.iter().enumerate() {
+            for (k, c) in [p.x, p.y, p.z].iter().enumerate() {
+                assert_eq!(
+                    nums[3 * i + k].to_bits(),
+                    c.to_bits(),
+                    "vertex {i} coord {k} did not round-trip"
+                );
+            }
+        }
+        // Determinism: same options, same document.
+        assert_eq!(mjcf_from_model(&m, &opt).unwrap().xml, doc.xml);
+    }
+
+    #[test]
+    fn hull_mesh_asset_rejects_degenerate() {
+        let tri = vec![
+            Point3::new(0.0, 0.0, 0.0),
+            Point3::new(1.0, 0.0, 0.0),
+            Point3::new(0.0, 1.0, 0.0),
+        ];
+        assert!(hull_mesh_asset("m", &tri).is_err(), "3 vertices accepted");
+        let mut quad = tri.clone();
+        quad.push(Point3::new(0.0, 0.0, f64::NAN));
+        assert!(hull_mesh_asset("m", &quad).is_err(), "NaN vertex accepted");
+    }
+
+    #[test]
+    fn counts_reported() {
+        let m = model("collide_arm.urdf");
+        let opt = MjcfOptions {
+            ground_plane: Some(0.0),
+            props: vec![PropSpec {
+                name: "ball".into(),
+                shape: PropShape::Sphere { r: 0.05 },
+                pos: [0.5, 0.0, 0.3],
+                quat: None,
+                mass: 0.1,
+                rgba: None,
+            }],
+            ..Default::default()
+        };
+        let doc = mjcf_from_model(&m, &opt).unwrap();
+        assert_eq!(doc.joint_count, m.ndof);
+        assert_eq!(doc.body_count, m.ndof + 1); // + 1 prop
+        // 3 box colliders + ground plane + 1 prop geom
+        assert_eq!(doc.geom_count, 3 + 1 + 1);
+        assert_eq!(doc.geom_count, doc.xml.matches("<geom ").count());
     }
 
     #[test]

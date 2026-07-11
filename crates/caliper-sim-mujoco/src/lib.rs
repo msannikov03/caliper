@@ -4,8 +4,9 @@
 //!
 //! 1. [`mjcf`] — generate a MINIMAL MJCF document from a caliper
 //!    [`Model`](caliper_model::Model): kinematic tree, hinge/slide joints,
-//!    inertials, PRIMITIVE collision geoms, optional ground plane, optional
-//!    position actuators. Pure string work — always compiled, no MuJoCo needed.
+//!    inertials, collision geoms (primitives always, convex-hull meshes
+//!    opt-in), optional ground plane, optional position actuators. Pure
+//!    string work — always compiled, no MuJoCo needed.
 //! 2. `MujocoSim` / `MujocoBackend` (feature `mujoco` — the names are not
 //!    doc-linked because the items only exist with the feature) — a thin safe
 //!    layer
@@ -19,9 +20,11 @@
 //!   free-floating primitive PROPS ([`mjcf::MjcfOptions::props`]): each is a
 //!   `<freejoint>` body emitted after the robot, tracked by name and read back
 //!   via `MujocoSim::prop_poses`/`body_pose` (feature `mujoco`).
-//! - Collision export covers the exact primitives (box/sphere/cylinder/capsule).
-//!   `ConvexHull` mesh colliders are **NOT exported yet** (MJCF mesh assets are
-//!   deferred); the generator counts and reports them via
+//! - Collision export covers the exact primitives (box/sphere/cylinder/capsule)
+//!   always. `ConvexHull` mesh colliders export as inline-vertex `<mesh>`
+//!   assets when [`mjcf::MjcfOptions::export_hull_meshes`] is on (MuJoCo
+//!   convex-hulls vertex-only meshes natively — no mesh files on disk); OFF by
+//!   default, in which case the generator counts and reports them via
 //!   [`mjcf::MjcfDocument::skipped_hull_colliders`] instead of silently
 //!   dropping coverage.
 //! - Torque actuation writes `qfrc_applied` directly (no actuators — the recon

@@ -1,6 +1,7 @@
 # Summary
 
 [Introduction](./introduction.md)
+[Zero to moving in 10 minutes](./quickstart.md)
 
 - [Architecture](./architecture.md)
 
@@ -24,5 +25,8 @@
   - [Studio (desktop app)](./faces/studio.md)
 
 - [Capability matrix](./reference/capability-matrix.md)
+- [Lightweight, measured](./reference/lightweight.md)
+- [Stability contract](./reference/stability.md)
+- [Headless CI recipe](./reference/headless-ci.md)
 - [Verification](./verification.md)
 - [License plan](./license.md)

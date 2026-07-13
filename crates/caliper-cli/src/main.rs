@@ -28,6 +28,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 mod report;
+mod zoo;
 
 #[derive(Parser)]
 #[command(
@@ -48,6 +49,23 @@ enum Cmd {
     Load {
         /// Path to a .urdf file.
         urdf: PathBuf,
+    },
+    /// Materialize a real-robot URDF from the built-in zoo (no network).
+    ///
+    /// Four corpus robots ship EMBEDDED in this binary as small text URDFs,
+    /// vendored verbatim (licenses attributed in the output). Meshes are
+    /// deliberately NOT embedded: visuals fall back, collision meshes drop
+    /// LOUDLY, kinematics stay exact. Known `caliper doctor` Error findings
+    /// per file are documented, not papered over.
+    Fetch {
+        /// Robot name from the zoo (see `caliper fetch --list`).
+        name: Option<String>,
+        /// Output directory. Defaults to `~/.cache/caliper/zoo/`.
+        #[arg(long)]
+        dir: Option<PathBuf>,
+        /// Table the registry (name, dof, license, source) instead of fetching.
+        #[arg(long)]
+        list: bool,
     },
     /// Forward kinematics for a joint configuration (Phase 1).
     Fk {
@@ -534,6 +552,63 @@ fn main() -> anyhow::Result<()> {
             println!("dof:   {}", robot.ndof());
             for (i, j) in robot.joint_names.iter().enumerate() {
                 println!("  [{i}] {j}");
+            }
+        }
+        Cmd::Fetch { name, dir, list } => {
+            if list {
+                anyhow::ensure!(
+                    name.is_none() && dir.is_none(),
+                    "--list only tables the registry; it takes no <NAME> or --dir"
+                );
+                println!(
+                    "ZOO — {} real-robot URDFs embedded in this binary (no network)",
+                    zoo::REGISTRY.len()
+                );
+                println!("  {:<18} {:>3}  {:<12}  source", "name", "dof", "license");
+                for e in zoo::REGISTRY {
+                    println!(
+                        "  {:<18} {:>3}  {:<12}  {}",
+                        e.name, e.dof, e.license, e.source
+                    );
+                }
+                println!("  caveat: {}", zoo::MESH_CAVEAT);
+                println!("  fetch one: caliper fetch <name> [--dir DIR]");
+            } else {
+                let name = name.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "pass a robot name (or --list); the zoo has: [{}]",
+                        zoo::names().join(", ")
+                    )
+                })?;
+                let entry = zoo::find(&name).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "unknown robot `{name}`; the zoo has: [{}]",
+                        zoo::names().join(", ")
+                    )
+                })?;
+                let dir = match dir {
+                    Some(d) => d,
+                    None => zoo::default_dir()?,
+                };
+                let (path, status) = zoo::fetch(entry, &dir)?;
+                // first line = the bare absolute path (scriptable: `head -1`)
+                println!("{}", path.display());
+                println!("  status  : {}", status.describe());
+                println!("  robot   : {} — {} dof", entry.robot, entry.dof);
+                println!(
+                    "  license : {} — vendored verbatim from {}",
+                    entry.license, entry.source
+                );
+                println!("  caveat  : {}", zoo::MESH_CAVEAT);
+                if entry.known_doctor_errors.is_empty() {
+                    println!("  doctor  : clean (no known Error findings)");
+                } else {
+                    println!(
+                        "  doctor  : known Error findings [{}] — {}",
+                        entry.known_doctor_errors.join(", "),
+                        entry.doctor_note
+                    );
+                }
             }
         }
         Cmd::Fk { urdf, joints } => {

@@ -33,6 +33,10 @@ def test_face_parity():
     r = caliper.Robot.from_urdf(str(URDF))
     assert r.name in out
     assert f"dof:   {r.ndof}" in out
+    # version identity: both faces report the one workspace crate version
+    assert caliper.__version__ in subprocess.run(
+        [str(CLI), "--version"], capture_output=True, text=True
+    ).stdout
 
 
 # FK / Jacobian cross-validation vs Pinocchio now lives in test_pinocchio.py

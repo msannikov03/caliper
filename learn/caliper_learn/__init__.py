@@ -21,7 +21,14 @@ W2 DIAGNOSTICS: `eval` (seeded closed-loop harness + checkpoint `sweep`),
 safetensors reads) stay lazy inside those modules, matching the package rule.
 """
 
-__version__ = "0.1.0"
+# Version identity: single-sourced from the installed distribution's metadata
+# (pyproject.toml [project].version) so a bump never needs a code edit here.
+try:
+    from importlib.metadata import version as _dist_version
+
+    __version__ = _dist_version("caliper_learn")
+except Exception:  # graceful fallback: plain-checkout import, not pip-installed
+    __version__ = "0.1.0"
 
 from .autopsy import AutopsyReport, autopsy
 from .collect import collect_demos

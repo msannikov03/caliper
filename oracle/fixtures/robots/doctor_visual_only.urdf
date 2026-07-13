@@ -1,0 +1,20 @@
+<?xml version="1.0"?>
+<!-- A005 positive: l1 renders (a visual box) but carries NO <collision>, so it
+     is invisible to collision checking. Everything else is healthy — the A005
+     Warn must be the report's ONLY finding. -->
+<robot name="doctor_visual_only">
+  <link name="base">
+    <inertial><origin xyz="0 0 0"/><mass value="1.0"/>
+      <inertia ixx="0.01" ixy="0" ixz="0" iyy="0.01" iyz="0" izz="0.01"/></inertial>
+  </link>
+  <link name="l1">
+    <inertial><origin xyz="0 0 0"/><mass value="0.5"/>
+      <inertia ixx="0.005" ixy="0" ixz="0" iyy="0.005" iyz="0" izz="0.005"/></inertial>
+    <visual><origin xyz="0 0 0.1"/><geometry><box size="0.05 0.05 0.2"/></geometry></visual>
+  </link>
+
+  <joint name="j1" type="revolute">
+    <parent link="base"/><child link="l1"/><origin xyz="0 0 0.1"/><axis xyz="0 0 1"/>
+    <limit lower="-1" upper="1" effort="1" velocity="1"/>
+  </joint>
+</robot>

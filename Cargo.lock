@@ -777,6 +777,7 @@ dependencies = [
  "caliper",
  "caliper-collision",
  "caliper-dataset",
+ "caliper-doctor",
  "caliper-sim-mujoco",
  "clap",
  "nalgebra",
@@ -802,6 +803,18 @@ dependencies = [
  "arrow",
  "parquet",
  "png 0.18.1",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "caliper-doctor"
+version = "0.1.0"
+dependencies = [
+ "caliper-model",
+ "caliper-spatial",
+ "nalgebra",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -923,6 +936,7 @@ dependencies = [
  "caliper",
  "caliper-collision",
  "caliper-dataset",
+ "caliper-doctor",
  "caliper-sim-mujoco",
  "nalgebra",
  "pyo3",
@@ -4570,6 +4584,7 @@ dependencies = [
  "caliper",
  "caliper-collision",
  "caliper-dataset",
+ "caliper-doctor",
  "caliper-sim-mujoco",
  "log",
  "nalgebra",

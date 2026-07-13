@@ -1,0 +1,29 @@
+<?xml version="1.0"?>
+<!-- A010 positive: the onshape-to-robot signature — a root link with NO
+     <inertial> while every other link carries mass. Fine for a fixed base in
+     caliper (the root folds into the world), so it is an Info-level
+     [heuristic] note, and it must be the ONLY finding here. -->
+<robot name="doctor_onshape">
+  <link name="base">
+    <collision><geometry><box size="0.2 0.2 0.05"/></geometry></collision>
+  </link>
+  <link name="l1">
+    <inertial><origin xyz="0 0 0"/><mass value="0.8"/>
+      <inertia ixx="0.008" ixy="0" ixz="0" iyy="0.008" iyz="0" izz="0.008"/></inertial>
+    <collision><geometry><box size="0.05 0.05 0.2"/></geometry></collision>
+  </link>
+  <link name="l2">
+    <inertial><origin xyz="0 0 0"/><mass value="0.4"/>
+      <inertia ixx="0.004" ixy="0" ixz="0" iyy="0.004" iyz="0" izz="0.004"/></inertial>
+    <collision><geometry><box size="0.04 0.04 0.15"/></geometry></collision>
+  </link>
+
+  <joint name="j1" type="revolute">
+    <parent link="base"/><child link="l1"/><origin xyz="0 0 0.05"/><axis xyz="0 0 1"/>
+    <limit lower="-1.5" upper="1.5" effort="2" velocity="1"/>
+  </joint>
+  <joint name="j2" type="revolute">
+    <parent link="l1"/><child link="l2"/><origin xyz="0 0 0.2"/><axis xyz="0 1 0"/>
+    <limit lower="-1.5" upper="1.5" effort="2" velocity="1"/>
+  </joint>
+</robot>

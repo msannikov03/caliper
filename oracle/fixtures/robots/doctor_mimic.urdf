@@ -1,0 +1,58 @@
+<?xml version="1.0"?>
+<!-- Mimic defects:
+     - j2 mimics `ghost` (no such joint)            -> A011 Error
+     - j3 mimics j1                                  -> VALID, no finding
+     - j4 mimics j3, which is itself a mimic (chain) -> A012 Error
+     - j5 mimics ITSELF                              -> A012 Error
+     Links/limits/axes are all healthy: expected report = A011 x1 + A012 x2. -->
+<robot name="doctor_mimic">
+  <link name="base">
+    <inertial><origin xyz="0 0 0"/><mass value="1.0"/>
+      <inertia ixx="0.01" ixy="0" ixz="0" iyy="0.01" iyz="0" izz="0.01"/></inertial>
+  </link>
+  <link name="l1">
+    <inertial><origin xyz="0 0 0"/><mass value="0.2"/>
+      <inertia ixx="0.002" ixy="0" ixz="0" iyy="0.002" iyz="0" izz="0.002"/></inertial>
+  </link>
+  <link name="l2">
+    <inertial><origin xyz="0 0 0"/><mass value="0.2"/>
+      <inertia ixx="0.002" ixy="0" ixz="0" iyy="0.002" iyz="0" izz="0.002"/></inertial>
+  </link>
+  <link name="l3">
+    <inertial><origin xyz="0 0 0"/><mass value="0.2"/>
+      <inertia ixx="0.002" ixy="0" ixz="0" iyy="0.002" iyz="0" izz="0.002"/></inertial>
+  </link>
+  <link name="l4">
+    <inertial><origin xyz="0 0 0"/><mass value="0.2"/>
+      <inertia ixx="0.002" ixy="0" ixz="0" iyy="0.002" iyz="0" izz="0.002"/></inertial>
+  </link>
+  <link name="l5">
+    <inertial><origin xyz="0 0 0"/><mass value="0.2"/>
+      <inertia ixx="0.002" ixy="0" ixz="0" iyy="0.002" iyz="0" izz="0.002"/></inertial>
+  </link>
+
+  <joint name="j1" type="revolute">
+    <parent link="base"/><child link="l1"/><origin xyz="0 0 0.1"/><axis xyz="0 0 1"/>
+    <limit lower="-1" upper="1" effort="1" velocity="1"/>
+  </joint>
+  <joint name="j2" type="revolute">
+    <parent link="l1"/><child link="l2"/><origin xyz="0 0 0.1"/><axis xyz="0 0 1"/>
+    <limit lower="-1" upper="1" effort="1" velocity="1"/>
+    <mimic joint="ghost"/>
+  </joint>
+  <joint name="j3" type="revolute">
+    <parent link="l2"/><child link="l3"/><origin xyz="0 0 0.1"/><axis xyz="0 0 1"/>
+    <limit lower="-1" upper="1" effort="1" velocity="1"/>
+    <mimic joint="j1" multiplier="0.5"/>
+  </joint>
+  <joint name="j4" type="revolute">
+    <parent link="l3"/><child link="l4"/><origin xyz="0 0 0.1"/><axis xyz="0 0 1"/>
+    <limit lower="-1" upper="1" effort="1" velocity="1"/>
+    <mimic joint="j3"/>
+  </joint>
+  <joint name="j5" type="revolute">
+    <parent link="l4"/><child link="l5"/><origin xyz="0 0 0.1"/><axis xyz="0 0 1"/>
+    <limit lower="-1" upper="1" effort="1" velocity="1"/>
+    <mimic joint="j5"/>
+  </joint>
+</robot>

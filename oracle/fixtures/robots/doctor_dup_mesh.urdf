@@ -1,0 +1,32 @@
+<?xml version="1.0"?>
+<!-- Duplicate mesh basenames (A004): a/part.stl and b/part.stl are DIFFERENT
+     files sharing the basename `part.stl` -> one Warn naming both. Neither
+     resolves here, so each also raises its own A003 Error (expected; the dup
+     check keys on identity = resolved path when possible, raw string when
+     not). The resolvable-duplicate REPAIR path is exercised from a temp dir in
+     the repair tests. -->
+<robot name="doctor_dup_mesh">
+  <link name="base">
+    <inertial><origin xyz="0 0 0"/><mass value="1.0"/>
+      <inertia ixx="0.01" ixy="0" ixz="0" iyy="0.01" iyz="0" izz="0.01"/></inertial>
+  </link>
+  <link name="l1">
+    <inertial><origin xyz="0 0 0"/><mass value="0.5"/>
+      <inertia ixx="0.005" ixy="0" ixz="0" iyy="0.005" iyz="0" izz="0.005"/></inertial>
+    <collision><geometry><mesh filename="a/part.stl"/></geometry></collision>
+  </link>
+  <link name="l2">
+    <inertial><origin xyz="0 0 0"/><mass value="0.5"/>
+      <inertia ixx="0.005" ixy="0" ixz="0" iyy="0.005" iyz="0" izz="0.005"/></inertial>
+    <collision><geometry><mesh filename="b/part.stl"/></geometry></collision>
+  </link>
+
+  <joint name="j1" type="revolute">
+    <parent link="base"/><child link="l1"/><origin xyz="0 0 0.1"/><axis xyz="0 0 1"/>
+    <limit lower="-1" upper="1" effort="1" velocity="1"/>
+  </joint>
+  <joint name="j2" type="revolute">
+    <parent link="l1"/><child link="l2"/><origin xyz="0 0 0.1"/><axis xyz="0 1 0"/>
+    <limit lower="-1" upper="1" effort="1" velocity="1"/>
+  </joint>
+</robot>

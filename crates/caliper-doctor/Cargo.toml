@@ -1,0 +1,20 @@
+[package]
+name = "caliper-doctor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+description = "Asset doctor: diagnose and repair URDF robot descriptions (inertials, meshes, limits, axes)"
+keywords = ["robotics", "urdf", "lint", "inertia", "mesh"]
+categories = ["science::robotics"]
+
+[dependencies]
+caliper-spatial.workspace = true
+caliper-model.workspace = true
+nalgebra.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true

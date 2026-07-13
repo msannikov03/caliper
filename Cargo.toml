@@ -14,6 +14,7 @@ members = [
   "crates/caliper-trajopt",
   "crates/caliper-graph",
   "crates/caliper-calib",
+  "crates/caliper-doctor",
   # Optional MuJoCo seam. SAFE as a plain member: its `mujoco` feature is off
   # by default, so workspace builds/tests never link (or need) libmujoco —
   # only `--features mujoco` does (see crates/caliper-sim-mujoco/Cargo.toml).
@@ -62,6 +63,7 @@ caliper-planning   = { path = "crates/caliper-planning", version = "0.1.0" }
 caliper-trajopt    = { path = "crates/caliper-trajopt", version = "0.1.0" }
 caliper-graph      = { path = "crates/caliper-graph", version = "0.1.0" }
 caliper-calib      = { path = "crates/caliper-calib", version = "0.1.0" }
+caliper-doctor     = { path = "crates/caliper-doctor", version = "0.1.0" }
 caliper-sim-mujoco = { path = "crates/caliper-sim-mujoco", version = "0.1.0" }
 caliper            = { path = "crates/caliper", version = "0.1.0" }
 

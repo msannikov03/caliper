@@ -30,12 +30,17 @@
 //! writer/reader pair and swap atomically, so every edit yields a valid,
 //! lerobot-loadable dataset.
 //!
+//! Pre-train diagnostics (the "dataset doctor" — stale stats.json, dead
+//! joints, contradictory demos, coverage holes, frozen tails, dead cameras,
+//! double-records) live in [`analyze`].
+//!
 //! The **lerobot footgun** — forgetting `finalize()` and losing the parquet
 //! footer plus all episode metadata — is structurally impossible here: the
 //! writer auto-finalizes on `Drop` (footers flushed, buffered episode
 //! metadata written). An explicit [`DatasetWriter::finalize`] is still the
 //! right way to end a recording because it can report errors.
 
+pub mod analyze;
 pub mod edit;
 mod error;
 mod meta;
@@ -43,6 +48,7 @@ mod reader;
 mod stats;
 mod writer;
 
+pub use analyze::{AnalyzeOptions, DataReport, FeatureSummary, Finding, Severity, analyze};
 pub use error::Error;
 pub use meta::{FeatureInfo, Info, format_chunk_file_path};
 pub use reader::{DatasetReader, EpisodeData, EpisodeMeta};

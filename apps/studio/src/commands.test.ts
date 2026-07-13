@@ -45,6 +45,7 @@ function mkCtx(over: Partial<CommandCtx> = {}): CommandCtx {
       importGraph: noop,
       openDataset: noop,
       refreshDataset: noop,
+      showTour: noop,
     },
     ...over,
   };
@@ -189,6 +190,29 @@ describe("buildCommands", () => {
     MODE_TABS.forEach((t, i) => {
       if (t.id !== "graph") expect(byId(cmds, `mode.${t.id}`).hint).toBe(`⌘${i + 1}`);
     });
+  });
+
+  it("Show tour is always enabled — even with no robot and no dataset", () => {
+    const bare = buildCommands(
+      mkCtx({ robotLoaded: false, urdfPath: null, datasetLoaded: false, hasInertia: false }),
+    );
+    const tour = byId(bare, "help.tour");
+    expect(tour.enabled).toBe(true);
+    expect(tour.section).toBe("Help");
+  });
+
+  it("dispatches the tour action when run (and never another)", () => {
+    const calls: string[] = [];
+    const ctx = mkCtx();
+    ctx.actions.showTour = () => calls.push("tour");
+    byId(buildCommands(ctx), "help.tour").run();
+    expect(calls).toEqual(["tour"]);
+  });
+
+  it("filterCommands finds Show tour by prefix and subsequence", () => {
+    const cmds = buildCommands(mkCtx());
+    expect(filterCommands("show tour", cmds)[0].id).toBe("help.tour");
+    expect(filterCommands("tour", cmds).some((c) => c.id === "help.tour")).toBe(true);
   });
 });
 

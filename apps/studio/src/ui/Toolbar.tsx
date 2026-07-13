@@ -59,7 +59,12 @@ export function Toolbar({ version, onPalette }: { version: string; onPalette: ()
   return (
     <header className="topbar" data-tauri-drag-region>
       <span className="brand">Caliper Studio</span>
-      <button className="btn ghost" disabled={loading} onClick={() => void openUrdf()}>
+      <button
+        className="btn ghost"
+        data-tour="open"
+        disabled={loading}
+        onClick={() => void openUrdf()}
+      >
         Open URDF…
       </button>
       <select
@@ -99,7 +104,7 @@ export function Toolbar({ version, onPalette }: { version: string; onPalette: ()
       <span className="engine">
         {robot ? `· ${robot.name} · ` : ""}engine v{version}
       </span>
-      <button className="kbd-chip" title="Command palette (⌘K)" onClick={onPalette}>
+      <button className="kbd-chip" data-tour="palette" title="Command palette (⌘K)" onClick={onPalette}>
         ⌘K
       </button>
     </header>

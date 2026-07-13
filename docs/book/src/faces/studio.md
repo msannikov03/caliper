@@ -19,6 +19,12 @@ persistent 3D canvas (⌘1…⌘5, or the ⌘K command palette):
   plots, camera thumbnails, tags, delete/split/merge) — reachable with no
   robot loaded.
 
+On first launch a **six-step tour** points out the mode tabs, Open URDF… and
+⌘K. It is a pure frontend overlay: skippable at every step, it never blocks
+input, never touches the store or session resume, and never shows again once
+dismissed or finished (the `caliper.tourDone` localStorage flag). Replay it
+any time via ⌘K → *Show tour*.
+
 ## Doctors
 
 Both diagnostic engines are wired in (see [Doctors & trajectory

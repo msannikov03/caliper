@@ -198,6 +198,7 @@ describe("palette — dataset command gating", () => {
       importGraph: noop,
       openDataset: noop,
       refreshDataset: noop,
+      showTour: noop,
     },
     ...over,
   });

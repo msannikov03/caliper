@@ -12,6 +12,7 @@ import { buildCommands, filterCommands } from "../commands";
 import type { Command } from "../commands";
 import { hasContactEngine } from "../sim/props";
 import { openUrdf, selectRobot } from "./Toolbar";
+import { showTour } from "./Tour";
 import { openDatasetDialog } from "../data/DataMode";
 import { exportGraphToFile, fitGraphView, importGraphFromFile } from "../graph/GraphEditor";
 import "./palette.css";
@@ -66,6 +67,8 @@ export function Palette({ onClose }: { onClose: () => void }) {
         importGraph: () => void importGraphFromFile(),
         openDataset: () => void openDatasetDialog(),
         refreshDataset: () => void useStore.getState().refreshDataset(),
+        // runCmd closes the palette BEFORE running, so the tour lands on top
+        showTour,
       },
     });
     return filterCommands(query, all);

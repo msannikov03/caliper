@@ -7,6 +7,7 @@ import { PropsLayer } from "./three/PropsLayer";
 import { IkGizmo } from "./three/IkGizmo";
 import { Toolbar, openUrdf } from "./ui/Toolbar";
 import { Palette } from "./ui/Palette";
+import { TourOverlay } from "./ui/Tour";
 import { MODE_TABS, modeNeedsRobot } from "./commands";
 import { JointPanel } from "./ui/JointPanel";
 import { Hud } from "./ui/Hud";
@@ -36,6 +37,7 @@ function ModeTabs() {
         return (
           <button
             key={t.id}
+            data-tour={`tab-${t.id}`}
             disabled={disabled}
             title={noRobot ? "no robot loaded" : noInertia ? "no inertial data" : ""}
             className={mode === t.id ? "active" : ""}
@@ -171,6 +173,10 @@ export default function App() {
       </main>
       {/* overlay only — mounting/unmounting it never touches the GL Canvas */}
       {paletteOpen && <Palette onClose={() => setPaletteOpen(false)} />}
+      {/* first-run tour: another pure overlay (auto-opens once; ⌘K → "Show
+          tour" replays). It never blocks input and never touches the store,
+          so session resume proceeds underneath it untouched. */}
+      <TourOverlay />
     </div>
   );
 }

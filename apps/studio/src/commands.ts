@@ -7,7 +7,14 @@
 
 import type { StudioMode } from "./store";
 
-export type CommandSection = "Robot" | "Mode" | "Motion" | "Simulate" | "Graph" | "Data";
+export type CommandSection =
+  | "Robot"
+  | "Mode"
+  | "Motion"
+  | "Simulate"
+  | "Graph"
+  | "Data"
+  | "Help";
 
 /** Section order — build order, header order, and the ranking tiebreak. */
 const SECTION_ORDER: Record<CommandSection, number> = {
@@ -17,6 +24,7 @@ const SECTION_ORDER: Record<CommandSection, number> = {
   Simulate: 3,
   Graph: 4,
   Data: 5,
+  Help: 6,
 };
 
 export interface Command {
@@ -70,6 +78,7 @@ export interface CommandCtx {
     importGraph: () => void; // native open dialog → load_graph_file
     openDataset: () => void; // native directory dialog → dataset_open (+ Data mode)
     refreshDataset: () => void; // re-list the open dataset from disk
+    showTour: () => void; // replay the first-run tour (pure FE overlay)
   };
 }
 
@@ -317,6 +326,16 @@ export function buildCommands(ctx: CommandCtx): Command[] {
     section: "Data",
     enabled: datasetLoaded,
     run: actions.refreshDataset,
+  });
+
+  // ---- Help (never gated: the tour is a pure overlay, valid in any state) ----
+  cmds.push({
+    id: "help.tour",
+    title: "Show tour",
+    hint: "first-run walkthrough",
+    section: "Help",
+    enabled: true,
+    run: actions.showTour,
   });
 
   return cmds;

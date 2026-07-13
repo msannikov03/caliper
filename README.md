@@ -1,21 +1,90 @@
 # Caliper
 
-**A modern, open robotics engine — kinematics · IK · singularity · dynamics · motion · planning · collision · real-robot control · a Simulink-style dataflow studio. One Rust engine, three faces.**
-
-**Documentation: [msannikov03.github.io/caliper](https://msannikov03.github.io/caliper/)** — the full mdBook (concepts, faces, verification story), published from `docs/book/` on every push to main.
+**Download one file, and a robot is on your screen in under a minute — jog it,
+plan for it, simulate it, record a dataset, train a policy, and get a
+plain-English verdict on why it did or didn't work. No ROS workspace, no GPU,
+no cloud.** ¹
 
 Caliper is a single deterministic Rust engine for serial-arm robotics, exposed
 through three faces that share the exact same code:
 
-- **CLI** — `caliper fk | ik | analyze | move | plan | sim | record | graph …`
+- **CLI** — `caliper fetch | fk | ik | analyze | move | plan | sim | record | doctor | report | graph …`
 - **Python** — `import caliper` (built with [maturin](https://www.maturin.rs/)), scriptable like MATLAB/NumPy
 - **Studio** — *Caliper Studio*, a Tauri + React desktop app with a 3D scene and a Simulink-style dataflow graph editor
 
-The engine math is cross-validated against [Pinocchio](https://github.com/stack-of-tasks/pinocchio)
-and NumPy (residuals down to ~1e-9…1e-15), and the headless stack (engine + CLI +
-Python) has been through an independent first-principles re-derivation and a large
-multi-agent correctness/safety audit. See **[docs/VERIFICATION_REPORT.md](docs/VERIFICATION_REPORT.md)**
-for the honest trust map.
+**Start here → [Zero to moving in 10 minutes](docs/book/src/quickstart.md)** —
+one guided path through the whole loop on a real SO-101 description. Full
+documentation: **[msannikov03.github.io/caliper](https://msannikov03.github.io/caliper/)**
+(the mdBook published from `docs/book/` on every push to main).
+
+## Two fronts, one bet
+
+Robotics software today makes you choose between a datacenter and a junk
+drawer. Caliper's bet is that most arm work needs neither:
+
+| | GPU-sim platforms (Isaac Sim/Lab) | The duct-tape stack (ROS + MoveIt + URDF scripts + notebooks) | **Caliper** |
+|---|---|---|---|
+| Install | tens of GB + a driver matrix | a workspace, a distro pin, an env per tool | one signed `.dmg`, or `cargo build` / `maturin develop` |
+| Hardware floor | workstation-class RTX GPU | a Linux box you're afraid to update | a laptop — CPU only ([measured](docs/book/src/reference/lightweight.md)) |
+| Robot on screen | after the download and the launcher | after the launch files agree | under a minute ¹ |
+| The loop (load → plan → sim → record → train → judge) | sim + learning; bring your own everything else | five tools, five configs, five data formats | one engine, one artifact, three faces |
+| When it breaks | a stack trace from someone else's extension | silence, or a crash three tools downstream | a **doctor's report** naming the defect and the fix |
+| Trust story | closed components | "it ran on my machine" | [cross-validated to ~1e-9…1e-15](docs/VERIFICATION_REPORT.md), deterministic by construction |
+
+Lighter than the giants, more legible than the duct tape — and that second
+front is the one nobody ships: Caliper assumes your robot description is
+broken, your dataset is flawed, and your trained policy will do nothing on
+deploy, and instruments all three.
+
+## It tells you *why*
+
+The prevailing workflow in robot learning is: export a URDF from CAD, record
+some demos, and — as one practitioner put it — *everybody just starts training
+and hopes for the best*. Caliper replaces hope with reports:
+
+- **Asset doctor** (`caliper doctor`, `A001`–`A014`) — inertia a converter
+  dropped, meshes that don't resolve, limits that can't move: diagnosed in one
+  pass, mechanically repaired into a *copy* on request. Runs automatically on
+  every Studio load.
+- **Dataset doctor** (`caliper data doctor`, `D001`–`D015`) — variance
+  collapse, stale normalization stats, contradictory demos, dead cameras —
+  caught *before* the GPU bill, not after.
+- **Trajectory lint** (`caliper report`, `T001`–`T009`) — limit violations,
+  360° detours, jerk spikes, singular corridors, near-misses; `--strict` gates CI.
+- **Policy autopsy** (`caliper-learn autopsy`, `E`/`L`/`P` codes) — the trained
+  policy's post-mortem: is it a data problem, a model problem, or a deploy-loop
+  problem? One report, one verdict paragraph.
+
+Findings are data, not errors; every check has a stable code, a plain-English
+message, and a fix hint. See
+[Doctors](https://msannikov03.github.io/caliper/capabilities/doctors.html) and
+[Verdicts](https://msannikov03.github.io/caliper/capabilities/verdicts.html).
+
+## Measured, not claimed
+
+"Lightweight" ships with numbers or it doesn't ship: install size, cold-start
+time, RAM, record overhead — every figure (and every still-`TBD` cell) lives
+in **[Lightweight, measured](docs/book/src/reference/lightweight.md)**,
+produced by `scripts/measure_lightweight.sh` with machine + git-rev provenance
+stamped on. Current headline: the Studio `.dmg` is **10.4 MB** with the MuJoCo
+contact engine bundled.
+
+The engine math itself is cross-validated against
+[Pinocchio](https://github.com/stack-of-tasks/pinocchio) and NumPy (residuals
+down to ~1e-9…1e-15), and the headless stack (engine + CLI + Python) has been
+through an independent first-principles re-derivation and a large multi-agent
+correctness/safety audit. See
+**[docs/VERIFICATION_REPORT.md](docs/VERIFICATION_REPORT.md)** for the honest
+trust map.
+
+¹ **The honest footnotes.** The packaged app is macOS (Apple Silicon) today;
+Linux/Windows builds are unproven. The `.dmg` is signed but **not yet
+notarized** — first launch needs right-click → Open. "Real-robot control"
+means the control loop, safety monitor, teleop and recording stack run against
+*simulated* backends; the CAN/Dynamixel hardware codecs are feature-gated
+skeletons that have never driven a physical arm. And "under a minute" is a
+promise backed by the [metrics page](docs/book/src/reference/lightweight.md) —
+where a number is still `TBD`, the page says so instead of rounding hope.
 
 > **Status — all 9 phases (0–8) built, plus the hardening waves on top.**
 > Kinematics/IK/singularity, jerk-limited motion (S-curve MOVE_J/L/C + TOPP

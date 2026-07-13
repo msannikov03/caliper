@@ -1,0 +1,117 @@
+/* ============================================================
+   tour.css — the first-run tour overlay. Instrument styling from
+   the shared tokens (same family as the ⌘K palette). The root is
+   pointer-events: none so the tour never blocks the app — only
+   the card is interactive; the ring is pure decoration.
+   ============================================================ */
+
+.tour-root {
+  position: fixed;
+  inset: 0;
+  z-index: 70; /* above the ⌘K palette (60) — replaying from it must land on top */
+  pointer-events: none;
+}
+
+/* highlight ring around the current step's anchor */
+.tour-ring {
+  position: fixed;
+  border: 1.5px solid var(--accent);
+  border-radius: var(--r-lg);
+  box-shadow:
+    0 0 0 4px var(--accent-glow),
+    0 0 24px var(--accent-glow);
+  transition:
+    left 180ms ease,
+    top 180ms ease,
+    width 180ms ease,
+    height 180ms ease;
+}
+
+/* the instrument card, bottom-center so it never covers the toolbar/tabs */
+.tour-card {
+  pointer-events: auto;
+  position: fixed;
+  left: 50%;
+  bottom: 88px; /* clear of the playback transport */
+  transform: translateX(-50%);
+  width: 400px;
+  max-width: calc(100vw - 48px);
+  padding: 14px 16px 12px;
+  border: 1px solid var(--border-2);
+  border-radius: var(--r-lg);
+  background: linear-gradient(180deg, rgba(23, 27, 33, 0.96), rgba(16, 19, 24, 0.96));
+  backdrop-filter: blur(16px);
+  box-shadow: var(--e3);
+  font-family: var(--ui);
+}
+
+.tour-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  margin-bottom: 6px;
+}
+
+.tour-progress {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--faint);
+}
+
+.tour-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.tour-body {
+  margin: 0 0 12px;
+  font-size: 12.5px;
+  line-height: 1.55;
+  color: var(--muted);
+}
+
+.tour-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.tour-spacer {
+  flex: 1;
+}
+
+.tour-actions button {
+  font-family: var(--ui);
+  font-size: 12px;
+  padding: 5px 12px;
+  border-radius: var(--r);
+  border: 1px solid var(--border-2);
+  background: var(--raised);
+  color: var(--text);
+  cursor: pointer;
+}
+
+.tour-actions button:hover {
+  background: var(--raised-2);
+}
+
+.tour-skip {
+  border-color: transparent;
+  background: transparent;
+  color: var(--faint);
+}
+
+.tour-skip:hover {
+  color: var(--muted);
+  background: transparent;
+}
+
+.tour-next {
+  border-color: var(--accent-dim);
+  background: var(--accent-dim);
+}
+
+.tour-next:hover {
+  background: var(--accent);
+}

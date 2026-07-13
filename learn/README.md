@@ -71,6 +71,63 @@ path (`PolicyServer`) deserializes pickle over an open port (CVE-2026-25874); Ca
 loads weights as pure tensors (`safetensors.torch`, never `torch.load`) and refuses any
 checkpoint directory containing `.bin`/`.pt`/`.pth`/`.ckpt`/`.pkl` files.
 
+## The Policy Autopsy
+
+Everyone instruments training (loss curves, LR schedules) and nobody instruments the
+loop that actually fails: **dataset → checkpoint → closed-loop deploy**. A policy that
+"converged" and then does nothing on the robot dies somewhere in that loop — echo
+labels, stale normalization stats, a cadence mismatch, an action queue that can't fit
+the tick budget — and every one of those is invisible in the loss curve. The autopsy
+runs every diagnostic that applies (dataset doctor `D001`–`D015`, policy debugger
+`P001`–`P008`, seeded eval `E001`–`E003` with Wilson-95 CIs, latency profile
+`L001`–`L003`) and merges them into ONE report whose verdict leads with the most
+severe, most upstream cause:
+
+```python
+import caliper
+from caliper_learn import autopsy, reach_eval_task
+
+robot = caliper.Robot.from_urdf("arm.urdf")
+task = reach_eval_task(robot, "tool0", [0.4, 0.0, 0.3], tol=0.05, fps=50)
+rep = autopsy("runs/003000/pretrained_model", "data/demos", robot=robot, task=task)
+print(rep.verdict)  # e.g. "The dataset has 0 error(s) and 4 warning(s) (D001, D004, ...)"
+```
+
+Or from the terminal (`caliper-learn` is installed with the package; every subcommand
+takes `--json` and exits 1 on any error-severity finding, so CI can gate on it):
+
+```sh
+caliper-learn autopsy runs/003000/pretrained_model data/demos \
+    --urdf arm.urdf --frame tool0 --target 0.40 0.00 0.30
+caliper-learn debug runs/003000/pretrained_model --dataset data/demos --urdf arm.urdf
+```
+
+The pieces are usable standalone. **Seeded eval** — because training loss predicts
+nothing about closed-loop competence, and 3/5 successes is a coin flip, not "60%":
+
+```python
+from caliper_learn import EvalConfig, evaluate, render_text, sweep
+
+result = evaluate(policy, task, EvalConfig(n_episodes=20, base_seed=0))
+print(render_text(result))          # per-seed rows + Wilson-95 CI + findings
+sweep({"ckpt_1k": "runs/001000/pretrained_model",
+       "ckpt_3k": "runs/003000/pretrained_model"}, task)  # same seeds, ranked
+```
+
+**Latency profile** — the honest achievable rate is `1 / p95(tick)`, and for chunked
+policies the refill tick (the one that re-runs the network) is reported separately
+from the near-free queue pops:
+
+```python
+from caliper_learn import profile_rollout
+
+loop = caliper.ControlLoop(robot, dt=1 / 50, start=[0.0] * robot.ndof)
+print(profile_rollout(policy, loop, ticks=200, fps=50).render_text())
+```
+
+State-only observations this wave (image probes/eval land with the vision wave); the
+full finding catalog lives in the book: `docs/book/src/capabilities/verdicts.md`.
+
 ## ⚠️ Deferred: real GPU training
 
 Everything here is proven ONLY by **seeded CPU oracles** — a 2-sample overfit-smoke

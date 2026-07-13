@@ -12,13 +12,61 @@ DEPLOY leg (`hub` + `runner`): load lerobot-Hub-convention checkpoints —
 SAFETENSORS ONLY, in-process, no pickle, no network service — and drive them
 through Caliper's safety-monitored ControlLoop. `hub` lazily imports lerobot only
 when a Hub checkpoint is actually loaded; the core sidecar stays lerobot-free.
+
+W2 DIAGNOSTICS: `eval` (seeded closed-loop harness + checkpoint `sweep`),
+`profile` (deploy-loop latency, honest achievable Hz), `debugger`
+(P001..P008 — "is it a vision problem or a control problem"), `autopsy`
+(dataset doctor + debugger + eval + profile merged under one verdict), and the
+`caliper-learn` console script (`cli.main`). Heavy deps (mujoco, lerobot,
+safetensors reads) stay lazy inside those modules, matching the package rule.
 """
 
 __version__ = "0.1.0"
 
+from .autopsy import AutopsyReport, autopsy
 from .collect import collect_demos
 from .collect_sim import collect_camera_dataset
+from .debugger import (
+    ACTION_COLLAPSE,
+    ACTION_SATURATION,
+    CADENCE_MISMATCH,
+    CHUNK_CONFIG_ANOMALY,
+    DEAD_INPUT,
+    DOF_ACTION_COLLAPSE,
+    NONFINITE_ACTION,
+    NORMALIZATION_MISMATCH,
+    PolicyFinding,
+    analyze_policy,
+    render_policy_findings,
+)
+from .eval import (
+    ALL_EPISODES_FAILED,
+    SEED_LOTTERY,
+    ZERO_REWARD_SIGNAL,
+    EpisodeResult,
+    EvalConfig,
+    EvalFinding,
+    EvalResult,
+    EvalTask,
+    SweepEntry,
+    evaluate,
+    reach_eval_task,
+    render_text,
+    sweep,
+    to_json,
+    wilson_interval,
+)
 from .hub import CheckpointSecurityError, LoadedPolicy, load_lerobot_policy
+from .profile import (
+    BUDGET_EXCEEDED,
+    HIGH_JITTER,
+    INFERENCE_DOMINATES,
+    ChunkStats,
+    Finding,
+    LatencyReport,
+    StageStats,
+    profile_rollout,
+)
 from .runner import run_policy
 from .sim_camera import SimCameraScene
 from .vec_env import VecSimEnv, reach_task, rollout_random
@@ -34,5 +82,45 @@ __all__ = [
     "LoadedPolicy",
     "CheckpointSecurityError",
     "run_policy",
+    # eval harness
+    "EvalTask",
+    "EvalConfig",
+    "EvalResult",
+    "EpisodeResult",
+    "EvalFinding",
+    "SweepEntry",
+    "evaluate",
+    "sweep",
+    "reach_eval_task",
+    "render_text",
+    "to_json",
+    "wilson_interval",
+    "ALL_EPISODES_FAILED",
+    "SEED_LOTTERY",
+    "ZERO_REWARD_SIGNAL",
+    # latency profiler
+    "profile_rollout",
+    "LatencyReport",
+    "StageStats",
+    "ChunkStats",
+    "Finding",
+    "BUDGET_EXCEEDED",
+    "INFERENCE_DOMINATES",
+    "HIGH_JITTER",
+    # policy debugger
+    "analyze_policy",
+    "PolicyFinding",
+    "render_policy_findings",
+    "ACTION_COLLAPSE",
+    "DOF_ACTION_COLLAPSE",
+    "ACTION_SATURATION",
+    "NORMALIZATION_MISMATCH",
+    "CADENCE_MISMATCH",
+    "DEAD_INPUT",
+    "NONFINITE_ACTION",
+    "CHUNK_CONFIG_ANOMALY",
+    # autopsy
+    "autopsy",
+    "AutopsyReport",
     "__version__",
 ]

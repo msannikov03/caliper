@@ -11,5 +11,8 @@ requires-python = ">=3.11"
 # PyO3 wheel built via `maturin develop`, not a PyPI package.
 dependencies = ["torch", "numpy"]
 
+[project.scripts]
+caliper-learn = "caliper_learn.cli:main"
+
 [tool.hatch.build.targets.wheel]
 packages = ["caliper_learn"]

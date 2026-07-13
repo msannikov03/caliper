@@ -56,6 +56,7 @@ feature (vision arrives with the sim wave). Non-ACT types raise as well.
 from __future__ import annotations
 
 import json
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -287,7 +288,13 @@ def load_lerobot_policy(path_or_dir: str | Path, device: str = "cpu") -> LoadedP
     lr_config = PreTrainedConfig.from_pretrained(str(root))
     lr_config.device = device
     # strict=True: refuse silently-mismatched weights (default in lerobot is False).
-    policy = ACTPolicy.from_pretrained(str(root), config=lr_config, strict=True)
+    # lerobot prints "Loading weights from local directory" to STDOUT — redirect
+    # library chatter to stderr so machine output (e.g. `caliper-learn ... --json`
+    # piping stdout) stays pure.
+    import contextlib
+
+    with contextlib.redirect_stdout(sys.stderr):
+        policy = ACTPolicy.from_pretrained(str(root), config=lr_config, strict=True)
     policy.eval()
 
     # Processor pipelines: json + safetensors stats. Device overrides + transition

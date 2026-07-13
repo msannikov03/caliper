@@ -25,6 +25,10 @@ trust map is collected in the [verification chapter](../verification.md).
 - [Studio dataflow graph](./studio-graph.md) — the Phase-8 serde IR and
   deterministic executor.
 - [Learning sidecar](./learning.md) — the pure-PyTorch behavior-cloning package.
+- [Verdicts — eval, profiling & the Policy Autopsy](./verdicts.md) — the
+  seeded eval harness (`E001`–`E003`), the deploy-loop latency profiler
+  (`L001`–`L003`), the policy debugger (`P001`–`P008`), and the autopsy that
+  merges them under one verdict.
 
 For a single table of every capability against the face(s) that expose it —
 including honest gaps — see the [capability

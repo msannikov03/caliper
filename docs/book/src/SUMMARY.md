@@ -16,6 +16,7 @@
   - [Doctors & trajectory lint](./capabilities/doctors.md)
   - [Studio dataflow graph](./capabilities/studio-graph.md)
   - [Learning sidecar](./capabilities/learning.md)
+  - [Verdicts — eval, profiling & the Policy Autopsy](./capabilities/verdicts.md)
 
 - [The three faces](./faces/index.md)
   - [CLI](./faces/cli.md)

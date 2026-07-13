@@ -3,9 +3,10 @@
 Everything the system can do, capability by capability, against **where you
 can do it**. Compiled by reading the actual surfaces — the clap verb enum in
 `crates/caliper-cli/src/main.rs`, the typed Python surface in
-`crates/caliper-py/python/caliper/__init__.pyi`, and the Studio modes/store in
-`apps/studio/src` — not from memory. A ✗ is an honest gap: the engine can do
-it, that face does not expose it (yet).
+`crates/caliper-py/python/caliper/__init__.pyi`, the sidecar exports in
+`learn/caliper_learn/__init__.py` (+ its `caliper-learn` console script), and
+the Studio modes/store in `apps/studio/src` — not from memory. A ✗ is an
+honest gap: the engine can do it, that face does not expose it (yet).
 
 Faces: [CLI](../faces/cli.md) · [Python](../faces/python.md) ·
 [Studio](../faces/studio.md). Engine column links to the capability page.
@@ -39,7 +40,7 @@ Faces: [CLI](../faces/cli.md) · [Python](../faces/python.md) ·
 | MOVE_L (Cartesian line) | [`caliper-motion`](../capabilities/motion.md) | `move --target` | `Robot.move_l` | Motion mode (gizmo target) |
 | MOVE_C (circular arc via a point) | [`caliper-motion`](../capabilities/motion.md) | `move --target --via` | `Robot.move_c` | ✗ |
 | Waypoint retiming | [`caliper-motion`](../capabilities/motion.md) | ✗ | `Planner.plan_trajectory` (plan → retimed `Trajectory`) | ✗ |
-| Time-optimal (TOPP) retiming | [`caliper-motion`](../capabilities/motion.md) | `move --topp` | `Robot.retime_time_optimal` | ✗ |
+| Time-optimal (TOPP) retiming | [`caliper-motion`](../capabilities/motion.md) | `move --time-optimal` | `Robot.retime_time_optimal` | ✗ |
 | Named pose library | `caliper-motion::PoseLibrary` | ✗ | ✗ | Motion mode (save/plan-to/delete poses) |
 | **Trajectory lint** `T001`–`T007` | [`caliper-kinematics::lint_path`](../capabilities/doctors.md) | `report` | `lint_path` | ✗ |
 | **Collision lint** `T008`/`T009` | [CLI-side over `caliper-collision`](../capabilities/doctors.md) | `report --ground/--obstacle/--clearance [--strict]` | ✗ | ✗ |
@@ -82,6 +83,10 @@ Faces: [CLI](../faces/cli.md) · [Python](../faces/python.md) ·
 | lerobot calibration-file export | Python interop | ✗ | `export_lerobot_calibration` | ✗ |
 | robomimic HDF5 export | Python interop | ✗ | `export_robomimic_hdf5` | ✗ |
 | BC learning (BC-MLP / ACT-lite / DDPM) | [`learn/caliper_learn` sidecar](../capabilities/learning.md) | ✗ | separate `caliper_learn` package (on top of these bindings) | ✗ |
+| **Seeded policy eval** — Wilson-95, `E001`–`E003`, checkpoint `sweep` | [`caliper_learn.eval`](../capabilities/verdicts.md) | ✗ ³ (`caliper-learn eval`) | `evaluate` / `sweep` / `reach_eval_task` | ✗ ³ |
+| **Deploy-loop latency profile** — `L001`–`L003`, honest achievable Hz | [`caliper_learn.profile`](../capabilities/verdicts.md) | ✗ ³ (`caliper-learn profile`) | `profile_rollout` | ✗ ³ |
+| **Policy deploy debugger** `P001`–`P008` | [`caliper_learn.debugger`](../capabilities/verdicts.md) | ✗ ³ (`caliper-learn debug`) | `analyze_policy` | ✗ ³ |
+| **Policy Autopsy** — D+P+E+L under one verdict | [`caliper_learn.autopsy`](../capabilities/verdicts.md) | ✗ ³ (`caliper-learn autopsy`) | `autopsy` | ✗ ³ |
 
 ## Dataflow graph
 
@@ -104,3 +109,9 @@ UI control invokes them yet — counted as ✗ until a panel drives them.
 
 ² The safety monitor runs inside the control loop on these faces; only Python
 exposes it as a standalone object.
+
+³ Policy inference is Python-side (torch + the safetensors-only `hub` loader),
+so the Rust CLI and Studio cannot host these. The sidecar ships its own console
+face instead: **`caliper-learn debug|autopsy|eval|profile`** (each takes
+`--json`; exit code 1 on any error-severity finding) — see
+[Verdicts](../capabilities/verdicts.md).

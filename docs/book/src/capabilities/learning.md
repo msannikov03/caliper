@@ -44,6 +44,15 @@ These are documented because getting them wrong produces silently-wrong results:
   init, because the model is built before `fit` runs — call `seed_all(0)` before
   `build_policy`.
 
+## Diagnostics on top of the pipeline
+
+The sidecar also carries the W2 verdict stack — the seeded eval harness
+(`E001`–`E003`), the deploy-loop latency profiler (`L001`–`L003`), the policy
+deploy debugger (`P001`–`P008`), and the autopsy that merges them with the
+dataset doctor under a single verdict, plus the `caliper-learn` console
+script. They get their own chapter:
+[Verdicts — eval, profiling & the Policy Autopsy](verdicts.md).
+
 ## Honesty about verification
 
 Everything in the sidecar is proven **only by seeded CPU oracles** — a 2-sample

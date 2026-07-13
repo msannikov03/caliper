@@ -6,7 +6,9 @@ use caliper::hal::{
     LeaderFollowerSource, PhysicsSimBackend, Recorder, RobotBackend, SimBackend, replay_frame,
 };
 use caliper::ik::{IkOpts, analytic_ik_6r, ik};
-use caliper::kinematics::{JacFrame, Jacobian, SingularityParams, fk_frame, jacobian};
+use caliper::kinematics::{
+    JacFrame, Jacobian, LintSeverity, SingularityParams, fk_frame, jacobian,
+};
 use caliper::motion::{
     CartesianMoveOpts, MotionLimits, MotionLimitsConfig, move_c, move_j, move_l,
     retime_time_optimal,
@@ -309,7 +311,10 @@ enum Cmd {
     },
     /// Cycle-time + path-quality report for a jerk-limited MOVE_J (OLP table
     /// stakes): total/per-segment time, min/mean manipulability + min σ_min
-    /// along the path, per-joint limit margins, and vel/acc utilization.
+    /// along the path, per-joint limit margins, and vel/acc utilization —
+    /// plus a LINT section of typed findings (T001–T009: limit violations,
+    /// near-limit dwell, wrap-around detours, jerk spikes, singular
+    /// corridors, collisions and near-misses).
     Report {
         urdf: PathBuf,
         /// MOVE_J goal config (comma-separated, length = ndof). Repeat --goal
@@ -327,6 +332,21 @@ enum Cmd {
         /// Optional frame name; defaults to the tip frame.
         #[arg(long)]
         frame: Option<String>,
+        /// Solid ground half-space at z = <ground> for the collision lint.
+        #[arg(long, allow_hyphen_values = true)]
+        ground: Option<f64>,
+        /// Obstacle box for the collision lint: 6 numbers cx,cy,cz,hx,hy,hz.
+        #[arg(long, value_delimiter = ',', allow_hyphen_values = true)]
+        obstacle: Option<Vec<f64>>,
+        /// Clearance margin (m) for the near-miss lint (T009): warn when the
+        /// path passes within this distance of an obstacle or itself
+        /// (conservative boolean probe — collider pairs trip anywhere below
+        /// 2x this value, the ground below 1x). 0 disables the probe.
+        #[arg(long, default_value_t = 0.0)]
+        clearance: f64,
+        /// Exit non-zero when the lint reports any Error-severity finding.
+        #[arg(long)]
+        strict: bool,
         /// Machine-readable JSON instead of the table.
         #[arg(long)]
         json: bool,
@@ -372,6 +392,58 @@ enum Cmd {
     Graph {
         #[command(subcommand)]
         action: GraphCmd,
+    },
+    /// Diagnose (and optionally repair) a URDF / xacro robot description:
+    /// missing or implausible inertials, unresolvable meshes, duplicate mesh
+    /// basenames, missing colliders, unusable limits, bad axes, mimic
+    /// defects, xacro leftovers (stable codes A001–A014). Findings never
+    /// change the exit code — the report IS the product; a file that cannot
+    /// even be inspected errors out.
+    Doctor {
+        /// Path to a .urdf (or .xacro) file.
+        urdf: PathBuf,
+        /// Apply every mechanical repair (computed inertials, normalized
+        /// axes, deduped mesh basenames, conservative limits) and write a
+        /// repaired COPY — the input file is never modified.
+        #[arg(long)]
+        repair: bool,
+        /// Where to write the repaired copy (only with --repair). Defaults
+        /// to `<input>.repaired.urdf` next to the input, where relative mesh
+        /// references keep resolving.
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Uniform material density (kg/m^3) for computed inertials (only
+        /// with --repair). Default 1000 (water) — a sane mid-range for
+        /// printed/machined robot parts.
+        #[arg(long, default_value_t = 1000.0)]
+        density: f64,
+        /// Machine-readable JSON instead of the text report.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Dataset tooling for LeRobotDataset v3.0 roots.
+    /// (`record`/`replay` above stay top-level; new dataset-level commands
+    /// nest here, like `graph`.)
+    Data {
+        #[command(subcommand)]
+        action: DataCmd,
+    },
+}
+
+/// `caliper data`: dataset-level tooling.
+#[derive(Subcommand)]
+enum DataCmd {
+    /// Pre-training diagnostics over a LeRobotDataset v3.0: variance
+    /// collapse, stale stats, saturated/echo/tiny/contradictory actions,
+    /// coverage holes, corridor data, length/timestamp anomalies, frozen
+    /// tails, dead cameras, duplicate episodes (stable codes D001–D015).
+    /// Findings never change the exit code; an unreadable dataset errors out.
+    Doctor {
+        /// Dataset root directory (the one containing meta/ and data/).
+        root: PathBuf,
+        /// Machine-readable JSON instead of the text report.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -423,9 +495,15 @@ fn dataset_spec_v3(m: &caliper::model::Model, fps: u32) -> DatasetSpecV3 {
 fn resolve_frame(model: &caliper::model::Model, frame: &Option<String>) -> anyhow::Result<usize> {
     match frame {
         None => Ok(model.tip_frame()),
-        Some(name) => model
-            .frame_id(name)
-            .ok_or_else(|| anyhow::anyhow!("unknown frame `{name}`")),
+        Some(name) => model.frame_id(name).ok_or_else(|| {
+            let known: Vec<&str> = (0..model.frames.len())
+                .map(|f| model.frame_name(f))
+                .collect();
+            anyhow::anyhow!(
+                "unknown frame `{name}`; this robot's frames: [{}]",
+                known.join(", ")
+            )
+        }),
     }
 }
 
@@ -433,7 +511,11 @@ fn grav_vec(g: &Option<Vec<f64>>) -> anyhow::Result<Vector3<f64>> {
     match g {
         None => Ok(GRAVITY_EARTH),
         Some(v) => {
-            anyhow::ensure!(v.len() == 3, "--gravity needs 3 values x,y,z");
+            anyhow::ensure!(
+                v.len() == 3,
+                "--gravity needs 3 values x,y,z (m/s^2), got {}",
+                v.len()
+            );
             anyhow::ensure!(v.iter().all(|x| x.is_finite()), "--gravity must be finite");
             Ok(Vector3::new(v[0], v[1], v[2]))
         }
@@ -620,10 +702,15 @@ fn main() -> anyhow::Result<()> {
             let robot = caliper::model::Robot::from_urdf(&urdf)?;
             let m = &robot.model;
             let start = start.unwrap_or_else(|| vec![0.0; m.ndof]);
-            anyhow::ensure!(start.len() == m.ndof, "start needs {} values", m.ndof);
+            anyhow::ensure!(
+                start.len() == m.ndof,
+                "--start needs {} value(s) (one per joint), got {}",
+                m.ndof,
+                start.len()
+            );
             anyhow::ensure!(
                 dt.is_finite() && dt > 0.0,
-                "--dt must be a positive finite number"
+                "--dt must be a positive finite number of seconds, got {dt}"
             );
             anyhow::ensure!(
                 goal.is_some() ^ target.is_some(),
@@ -639,7 +726,12 @@ fn main() -> anyhow::Result<()> {
                     via.is_none(),
                     "--via applies to Cartesian --target (MOVE_C), not joint-space --goal"
                 );
-                anyhow::ensure!(goal.len() == m.ndof, "goal needs {} values", m.ndof);
+                anyhow::ensure!(
+                    goal.len() == m.ndof,
+                    "--goal needs {} value(s) (one per joint), got {}",
+                    m.ndof,
+                    goal.len()
+                );
                 anyhow::ensure!(
                     goal.iter().all(|x| x.is_finite()),
                     "goal contains a non-finite value"
@@ -659,7 +751,13 @@ fn main() -> anyhow::Result<()> {
                 let t = target.unwrap();
                 anyhow::ensure!(
                     t.len() == 12 && t.iter().all(|x| x.is_finite()),
-                    "target needs 12 finite values (9 row-major R then tx,ty,tz)"
+                    "--target needs 12 finite values (9 row-major R then tx,ty,tz); got {} value(s){}",
+                    t.len(),
+                    if t.iter().all(|x| x.is_finite()) {
+                        ""
+                    } else {
+                        ", including a non-finite (NaN/Inf)"
+                    }
                 );
                 let rot = Matrix3::new(t[0], t[1], t[2], t[3], t[4], t[5], t[6], t[7], t[8]);
                 let trans = Vector3::new(t[9], t[10], t[11]);
@@ -669,7 +767,8 @@ fn main() -> anyhow::Result<()> {
                 if let Some(v) = via {
                     anyhow::ensure!(
                         v.len() == 3 && v.iter().all(|x| x.is_finite()),
-                        "--via needs 3 finite values (tx,ty,tz)"
+                        "--via needs 3 finite values (tx,ty,tz in m), got {} value(s)",
+                        v.len()
                     );
                     let via_pt = Vector3::new(v[0], v[1], v[2]);
                     (move_c(m, f, &start, &via_pt, &goal_se3, &opts)?, "MOVE_C")
@@ -866,14 +965,27 @@ fn main() -> anyhow::Result<()> {
                 "model '{}' has no <inertial>; control needs dynamics",
                 robot.name
             );
-            anyhow::ensure!(goal.len() == m.ndof, "--goal needs {} values", m.ndof);
+            anyhow::ensure!(
+                goal.len() == m.ndof,
+                "--goal needs {} value(s) (one per joint), got {}",
+                m.ndof,
+                goal.len()
+            );
             let start = start.unwrap_or_else(|| vec![0.0; m.ndof]);
-            anyhow::ensure!(start.len() == m.ndof, "--start needs {} values", m.ndof);
+            anyhow::ensure!(
+                start.len() == m.ndof,
+                "--start needs {} value(s) (one per joint), got {}",
+                m.ndof,
+                start.len()
+            );
             anyhow::ensure!(
                 goal.iter().chain(&start).all(|x| x.is_finite()),
                 "goal/start must be finite"
             );
-            anyhow::ensure!(dt.is_finite() && dt > 0.0, "--dt must be > 0");
+            anyhow::ensure!(
+                dt.is_finite() && dt > 0.0,
+                "--dt must be a positive finite number of seconds, got {dt}"
+            );
             anyhow::ensure!(
                 kp.is_finite() && kd.is_finite(),
                 "--kp and --kd must be finite"
@@ -1330,14 +1442,26 @@ fn main() -> anyhow::Result<()> {
             start,
             samples,
             frame,
+            ground,
+            obstacle,
+            clearance,
+            strict,
             json,
         } => {
             let robot = caliper::model::Robot::from_urdf(&urdf)?;
             let m = &robot.model;
             let f = resolve_frame(m, &frame)?;
-            anyhow::ensure!(samples >= 2, "--samples must be >= 2");
+            anyhow::ensure!(
+                samples >= 2,
+                "--samples must be >= 2 (both endpoints of every segment), got {samples}"
+            );
             let start = start.unwrap_or_else(|| vec![0.0; m.ndof]);
-            anyhow::ensure!(start.len() == m.ndof, "--start needs {} values", m.ndof);
+            anyhow::ensure!(
+                start.len() == m.ndof,
+                "--start needs {} value(s) (one per joint), got {}",
+                m.ndof,
+                start.len()
+            );
             anyhow::ensure!(
                 start.iter().all(|x| x.is_finite()),
                 "--start contains a non-finite value"
@@ -1369,10 +1493,21 @@ fn main() -> anyhow::Result<()> {
             }
             let seg_durations: Vec<f64> = segments.iter().map(|t| t.duration()).collect();
             let rep = report::report_segments(m, f, &segments, samples, &limits);
+            // LINT: engine linter (T001–T007) + collision lint (T008/T009)
+            // over the same sampled rows the metrics fold.
+            anyhow::ensure!(
+                clearance.is_finite() && clearance >= 0.0,
+                "--clearance must be finite and >= 0 (meters), got {clearance}"
+            );
+            let scene = world_scene(ground, &obstacle)?;
+            let model = Arc::new(m.clone());
+            let rows = report::sample_segments(&segments, samples);
+            let lint = report::lint_rows(&model, f, &rows, &limits, &scene, clearance);
             if json {
                 let mut v = report::to_json(m, &rep, &seg_durations);
                 v["robot"] = serde_json::json!(robot.name);
                 v["frame"] = serde_json::json!(m.frame_name(f));
+                v["lint"] = report::lint_to_json(&lint);
                 println!("{}", serde_json::to_string_pretty(&v)?);
             } else {
                 println!(
@@ -1382,6 +1517,17 @@ fn main() -> anyhow::Result<()> {
                     segments.len()
                 );
                 report::print_table(m, &rep, &seg_durations);
+                report::print_lint(&lint);
+            }
+            let lint_errors = lint
+                .iter()
+                .filter(|x| x.severity == LintSeverity::Error)
+                .count();
+            if strict && lint_errors > 0 {
+                anyhow::bail!(
+                    "--strict: the lint reported {lint_errors} error-severity finding(s) \
+                     (see the lint section above)"
+                );
             }
         }
         Cmd::Mjcf {
@@ -1504,8 +1650,102 @@ fn main() -> anyhow::Result<()> {
                 }
             }
         },
+        Cmd::Doctor {
+            urdf,
+            repair,
+            out,
+            density,
+            json,
+        } => {
+            anyhow::ensure!(
+                repair || out.is_none(),
+                "--out only applies together with --repair"
+            );
+            let report = caliper_doctor::diagnose(&urdf)?;
+            if !repair {
+                if json {
+                    println!("{}", report.to_json());
+                } else {
+                    print!("{}", report.render_text());
+                }
+            } else {
+                anyhow::ensure!(
+                    density.is_finite() && density > 0.0,
+                    "--density must be finite and > 0 kg/m^3, got {density}"
+                );
+                let opts = caliper_doctor::RepairOpts {
+                    density,
+                    ..caliper_doctor::RepairOpts::all()
+                };
+                let outcome = caliper_doctor::repair(&urdf, &opts)?;
+                let out_path = out.unwrap_or_else(|| repaired_out_path(&urdf));
+                std::fs::write(&out_path, &outcome.repaired_urdf).map_err(|e| {
+                    anyhow::anyhow!("failed to write `{}`: {e}", out_path.display())
+                })?;
+                // The engine emits a copy PLAN for deduped meshes; performing
+                // the copies is the face's job.
+                for c in &outcome.mesh_copies {
+                    std::fs::copy(&c.from, &c.to).map_err(|e| {
+                        anyhow::anyhow!(
+                            "mesh copy `{}` -> `{}` failed: {e}",
+                            c.from.display(),
+                            c.to.display()
+                        )
+                    })?;
+                }
+                let after = caliper_doctor::diagnose(&out_path)?;
+                if json {
+                    let v = serde_json::json!({
+                        "report": report,
+                        "repair": {
+                            "out": out_path,
+                            "applied": outcome.applied,
+                            "skipped": outcome.skipped,
+                            "mesh_copies": outcome.mesh_copies,
+                        },
+                        "report_after": after,
+                    });
+                    println!("{}", serde_json::to_string_pretty(&v)?);
+                } else {
+                    print!("{}", report.render_text());
+                    println!("\nREPAIR -> {}", out_path.display());
+                    for a in &outcome.applied {
+                        println!("  applied [{}] {}: {}", a.code, a.target, a.detail);
+                    }
+                    for s in &outcome.skipped {
+                        println!("  skipped [{}] {}: {}", s.code, s.target, s.detail);
+                    }
+                    for c in &outcome.mesh_copies {
+                        println!("  copied  {} -> {}", c.from.display(), c.to.display());
+                    }
+                    println!("\nafter repair:");
+                    print!("{}", after.render_text());
+                }
+            }
+        }
+        Cmd::Data { action } => match action {
+            DataCmd::Doctor { root, json } => {
+                let report =
+                    caliper_dataset::analyze(&root, caliper_dataset::AnalyzeOptions::default())?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    print!("{}", report.render_text());
+                }
+            }
+        },
     }
     Ok(())
+}
+
+/// Default output path for `doctor --repair`: `<stem>.repaired.urdf` next to
+/// the input, so relative mesh references keep resolving.
+fn repaired_out_path(input: &std::path::Path) -> PathBuf {
+    let stem = input
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("robot");
+    input.with_file_name(format!("{stem}.repaired.urdf"))
 }
 
 /// Read + deserialize a `.caliper-graph.json` document.
@@ -1571,7 +1811,13 @@ fn world_scene(ground: Option<f64>, obstacle: &Option<Vec<f64>>) -> anyhow::Resu
 fn target_to_se3(t: &[f64]) -> anyhow::Result<Se3> {
     anyhow::ensure!(
         t.len() == 12 && t.iter().all(|x| x.is_finite()),
-        "target needs 12 finite values (9 row-major R then tx,ty,tz)"
+        "--target needs 12 finite values (9 row-major R then tx,ty,tz); got {} value(s){}",
+        t.len(),
+        if t.iter().all(|x| x.is_finite()) {
+            ""
+        } else {
+            ", including a non-finite (NaN/Inf)"
+        }
     );
     let rot = Matrix3::new(t[0], t[1], t[2], t[3], t[4], t[5], t[6], t[7], t[8]);
     let trans = Vector3::new(t[9], t[10], t[11]);

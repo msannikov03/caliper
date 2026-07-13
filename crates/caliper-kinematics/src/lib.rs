@@ -672,6 +672,390 @@ pub fn path_report(
     report
 }
 
+// ===== trajectory linter (typed findings layered on path_report) =====
+
+/// Severity of a lint [`Finding`]: `Error` = a hard limit is violated and the
+/// trajectory must not run; `Warning` = it runs but deserves a second look.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum LintSeverity {
+    Warning,
+    Error,
+}
+
+/// One typed trajectory-lint finding (stable code `T001`..). The message is
+/// self-contained (field, got-value, expected range/unit, location); `joint`,
+/// `time`, and `value` carry the same facts machine-readably so faces (CLI
+/// table, Studio) never parse the message text.
+#[derive(Clone, Debug)]
+pub struct Finding {
+    /// Stable lint code (`T001`..`T007`; `T008`+ reserved for face-side checks).
+    pub code: &'static str,
+    pub severity: LintSeverity,
+    /// Human message naming the field, the got-value, and the expected range.
+    pub message: String,
+    /// A concrete way out of the defect.
+    pub fix_hint: String,
+    /// Offending joint; `None` for whole-path findings (singular corridor).
+    pub joint: Option<usize>,
+    /// Sample time (s) where the defect is worst (or the corridor's worst point).
+    pub time: Option<f64>,
+    /// The offending measured value (margin, utilization, ratio, jerk, σ_min).
+    pub value: Option<f64>,
+}
+
+/// Per-joint motion limits the linter checks against — the caller's
+/// `MotionLimits` arrays, passed as slices exactly like [`path_report`]
+/// (caliper-kinematics has no trajectory/limit types of its own).
+#[derive(Clone, Copy, Debug)]
+pub struct LintLimits<'a> {
+    /// Per-joint |q̇| bound (rad/s | m/s).
+    pub vmax: &'a [f64],
+    /// Per-joint |q̈| bound (rad/s² | m/s²).
+    pub amax: &'a [f64],
+    /// Per-joint jerk bound (rad/s³ | m/s³); the jerk-spike check scales it.
+    pub jmax: &'a [f64],
+}
+
+/// Thresholds for [`lint_path`]. Defaults are metric-robot engineering
+/// choices, not physics — tune per cell.
+#[derive(Clone, Copy, Debug)]
+pub struct LintOptions {
+    /// T002/T003: flag utilization above `1 + utilization_tol` (a planned
+    /// S-curve legitimately grazes 100% between samples, so exact `> 1.0`
+    /// would false-positive on sampling slack).
+    pub utilization_tol: f64,
+    /// T004: "near" a position limit means within this margin (rad | m).
+    pub near_limit_margin: f64,
+    /// T004: flag when the near-limit dwell exceeds this fraction of samples.
+    pub near_limit_dwell_frac: f64,
+    /// T005: flag when a joint's total travel exceeds this multiple of its
+    /// net start→end change (the "360° detour").
+    pub travel_ratio_max: f64,
+    /// T005: ignore joints whose total travel is below this (rad | m) — a
+    /// tiny wiggle is noise, not a detour.
+    pub travel_min: f64,
+    /// T006: a jerk spike is a finite-difference jerk above this multiple of jmax.
+    pub jerk_spike_ratio: f64,
+    /// T007: σ_min below this marks a singular corridor (default matches
+    /// [`SingularityParams::default`]'s `eps_activate`).
+    pub sigma_min_threshold: f64,
+}
+impl Default for LintOptions {
+    fn default() -> Self {
+        Self {
+            utilization_tol: 1e-2,
+            near_limit_margin: 0.05,
+            near_limit_dwell_frac: 0.25,
+            travel_ratio_max: 3.0,
+            travel_min: 0.5,
+            jerk_spike_ratio: 1.5,
+            sigma_min_threshold: 1e-2,
+        }
+    }
+}
+
+/// Lint a sampled trajectory: run [`path_report`] and turn its folded metrics —
+/// plus per-sample passes for locations, dwell, travel, jerk, and the σ_min
+/// corridor — into typed [`Finding`]s:
+///
+/// - `T001` (Error): position limit violated (negative limit margin).
+/// - `T002` (Error): velocity utilization > 100% (+tolerance).
+/// - `T003` (Error): acceleration utilization > 100% (+tolerance).
+/// - `T004` (Warning): sustained dwell within `near_limit_margin` of a
+///   position limit for more than `near_limit_dwell_frac` of samples.
+/// - `T005` (Warning): total joint travel ≫ net start→end change — the
+///   wrap-around/360° detour, located at the peak excursion off the chord.
+/// - `T006` (Warning): finite-difference jerk (fd on `qdd`) above
+///   `jerk_spike_ratio × jmax`. Duplicate seam times (dt ≤ 0) are skipped;
+///   an infinite `jmax[i]` (e.g. TOPP output) disables the check for joint i.
+/// - `T007` (Warning): singular corridor — one finding per contiguous time
+///   window with σ_min below `sigma_min_threshold` (same per-sample SVD as
+///   [`path_report`] / [`Jacobian::analyze`]).
+///
+/// Pure and total like [`path_report`]: empty rows or a 0-DOF model lint clean.
+/// Findings are emitted in code order, so Errors always precede Warnings.
+pub fn lint_path(
+    model: &Model,
+    frame: usize,
+    rows: &PathRows,
+    limits: &LintLimits,
+    opts: &LintOptions,
+) -> Vec<Finding> {
+    let n = model.ndof;
+    debug_assert_eq!(limits.jmax.len(), n);
+    let mut out = Vec::new();
+    let ns = rows.times.len();
+    if ns == 0 || n == 0 {
+        return out;
+    }
+    let report = path_report(model, frame, rows, limits.vmax, limits.amax);
+
+    // Unit label per joint (position / velocity / accel / jerk order).
+    let unit = |i: usize, order: u32| -> &'static str {
+        match (model.kind[i], order) {
+            (JointKind::Revolute, 0) => "rad",
+            (JointKind::Revolute, 1) => "rad/s",
+            (JointKind::Revolute, 2) => "rad/s^2",
+            (JointKind::Revolute, _) => "rad/s^3",
+            (JointKind::Prismatic, 0) => "m",
+            (JointKind::Prismatic, 1) => "m/s",
+            (JointKind::Prismatic, 2) => "m/s^2",
+            (JointKind::Prismatic, _) => "m/s^3",
+        }
+    };
+
+    // Per-sample location pass: path_report keeps only the folded numbers, so
+    // recover WHERE each extreme happens (+ dwell counts, travel, σ per sample).
+    let mut t_margin = vec![rows.times[0]; n]; // time of the tightest margin
+    let mut t_vel = vec![rows.times[0]; n]; // time of max |q̇|
+    let mut t_acc = vec![rows.times[0]; n]; // time of max |q̈|
+    let mut max_qd = vec![0.0_f64; n];
+    let mut max_qdd = vec![0.0_f64; n];
+    let mut min_margin = vec![f64::INFINITY; n];
+    let mut near_count = vec![0_usize; n];
+    let mut travel = vec![0.0_f64; n];
+    let mut sigma = Vec::with_capacity(ns); // σ_min per sample
+    for (k, &t) in rows.times.iter().enumerate() {
+        let (_, j) = jacobian(model, &rows.q[k], frame, JacFrame::World);
+        let sv = Jacobian(j).singular_values();
+        sigma.push(if sv.is_empty() { 0.0 } else { sv[sv.len() - 1] });
+        for i in 0..n {
+            if let Some((lo, hi)) = model.limits[i] {
+                let margin = (rows.q[k][i] - lo).min(hi - rows.q[k][i]);
+                if margin < min_margin[i] {
+                    min_margin[i] = margin;
+                    t_margin[i] = t;
+                }
+                if margin < opts.near_limit_margin {
+                    near_count[i] += 1;
+                }
+            }
+            let qd = rows.qd[k][i].abs();
+            if qd > max_qd[i] {
+                max_qd[i] = qd;
+                t_vel[i] = t;
+            }
+            let qdd = rows.qdd[k][i].abs();
+            if qdd > max_qdd[i] {
+                max_qdd[i] = qdd;
+                t_acc[i] = t;
+            }
+            if k > 0 {
+                travel[i] += (rows.q[k][i] - rows.q[k - 1][i]).abs();
+            }
+        }
+    }
+    let last = ns - 1;
+
+    // T001 — position limit violated (negative margin). Error.
+    for (i, &t_marg) in t_margin.iter().enumerate().take(n) {
+        let margin = report.limit_margin[i];
+        if margin.is_finite() && margin < 0.0 {
+            // a finite margin exists only when the joint has limits
+            let (lo, hi) = model.limits[i].expect("finite margin implies limits");
+            out.push(Finding {
+                code: "T001",
+                severity: LintSeverity::Error,
+                message: format!(
+                    "joint {i} `{}`: position limit violated by {:.4} {} at t={:.3} s (limits [{lo:.4}, {hi:.4}])",
+                    model.joint_names[i],
+                    -margin,
+                    unit(i, 0),
+                    t_marg,
+                ),
+                fix_hint: "re-plan the segment endpoints (or pick another IK branch) so q stays inside the position limits".into(),
+                joint: Some(i),
+                time: Some(t_margin[i]),
+                value: Some(margin),
+            });
+        }
+    }
+
+    // T002 — velocity limit exceeded. Error.
+    for i in 0..n {
+        let util = report.vel_utilization[i];
+        if util > 1.0 + opts.utilization_tol {
+            out.push(Finding {
+                code: "T002",
+                severity: LintSeverity::Error,
+                message: format!(
+                    "joint {i} `{}`: velocity limit exceeded: max |qd| {:.4} {} vs vmax {:.4} ({:.1}% at t={:.3} s)",
+                    model.joint_names[i],
+                    max_qd[i],
+                    unit(i, 1),
+                    limits.vmax[i],
+                    util * 100.0,
+                    t_vel[i],
+                ),
+                fix_hint: "re-time the trajectory (retime_waypoints / longer segment time) or raise vmax".into(),
+                joint: Some(i),
+                time: Some(t_vel[i]),
+                value: Some(util),
+            });
+        }
+    }
+
+    // T003 — acceleration limit exceeded. Error.
+    for i in 0..n {
+        let util = report.acc_utilization[i];
+        if util > 1.0 + opts.utilization_tol {
+            out.push(Finding {
+                code: "T003",
+                severity: LintSeverity::Error,
+                message: format!(
+                    "joint {i} `{}`: acceleration limit exceeded: max |qdd| {:.4} {} vs amax {:.4} ({:.1}% at t={:.3} s)",
+                    model.joint_names[i],
+                    max_qdd[i],
+                    unit(i, 2),
+                    limits.amax[i],
+                    util * 100.0,
+                    t_acc[i],
+                ),
+                fix_hint: "re-time the trajectory with a longer duration or raise amax".into(),
+                joint: Some(i),
+                time: Some(t_acc[i]),
+                value: Some(util),
+            });
+        }
+    }
+
+    // T004 — sustained near-limit dwell. Warning (skipped when T001 already
+    // fired for the joint: a violation supersedes "close to the limit").
+    for i in 0..n {
+        let frac = near_count[i] as f64 / ns as f64;
+        if min_margin[i].is_finite() && min_margin[i] >= 0.0 && frac > opts.near_limit_dwell_frac {
+            out.push(Finding {
+                code: "T004",
+                severity: LintSeverity::Warning,
+                message: format!(
+                    "joint {i} `{}`: within {:.3} {} of a position limit for {:.1}% of samples (> {:.1}% allowed); tightest margin {:.4} at t={:.3} s",
+                    model.joint_names[i],
+                    opts.near_limit_margin,
+                    unit(i, 0),
+                    frac * 100.0,
+                    opts.near_limit_dwell_frac * 100.0,
+                    min_margin[i],
+                    t_margin[i],
+                ),
+                fix_hint: "re-seed IK (or shift the waypoints) away from the joint limit to keep escape headroom".into(),
+                joint: Some(i),
+                time: Some(t_margin[i]),
+                value: Some(frac),
+            });
+        }
+    }
+
+    // T005 — wrap-around detour: total travel ≫ net start→end change. Warning.
+    for (i, &trav) in travel.iter().enumerate().take(n) {
+        let net = (rows.q[last][i] - rows.q[0][i]).abs();
+        if trav > opts.travel_min && trav > opts.travel_ratio_max * net {
+            // locate the detour: peak excursion off the straight time-chord q0→qend
+            let (t0, t1) = (rows.times[0], rows.times[last]);
+            let span = t1 - t0;
+            let mut t_peak = t0;
+            let mut dev = -1.0_f64;
+            for (k, &t) in rows.times.iter().enumerate() {
+                let alpha = if span > 0.0 { (t - t0) / span } else { 0.0 };
+                let chord = rows.q[0][i] + alpha * (rows.q[last][i] - rows.q[0][i]);
+                let d = (rows.q[k][i] - chord).abs();
+                if d > dev {
+                    dev = d;
+                    t_peak = t;
+                }
+            }
+            let ratio = trav / net; // inf when the joint loops back exactly
+            out.push(Finding {
+                code: "T005",
+                severity: LintSeverity::Warning,
+                message: format!(
+                    "joint {i} `{}`: travels {:.4} {u} for a net change of {:.4} {u} (ratio {ratio:.1} > {:.1}) — wrap-around detour; peak excursion {dev:.4} {u} at t={t_peak:.3} s",
+                    model.joint_names[i],
+                    trav,
+                    net,
+                    opts.travel_ratio_max,
+                    u = unit(i, 0),
+                ),
+                fix_hint: "pick the IK branch (or unwound joint angle) nearest the previous waypoint before planning this segment".into(),
+                joint: Some(i),
+                time: Some(t_peak),
+                value: Some(ratio),
+            });
+        }
+    }
+
+    // T006 — jerk spikes: finite difference on qdd vs jerk_spike_ratio × jmax.
+    for i in 0..n {
+        let threshold = opts.jerk_spike_ratio * limits.jmax[i];
+        if !threshold.is_finite() {
+            continue; // jmax = inf (e.g. TOPP output): explicitly jerk-unlimited
+        }
+        let mut worst = 0.0_f64;
+        let mut t_worst = rows.times[0];
+        for k in 0..last {
+            let dt = rows.times[k + 1] - rows.times[k];
+            if dt <= 0.0 {
+                continue; // duplicate seam time on a concatenated clock
+            }
+            let jerk = ((rows.qdd[k + 1][i] - rows.qdd[k][i]) / dt).abs();
+            if jerk > worst {
+                worst = jerk;
+                t_worst = rows.times[k + 1];
+            }
+        }
+        if worst > threshold {
+            out.push(Finding {
+                code: "T006",
+                severity: LintSeverity::Warning,
+                message: format!(
+                    "joint {i} `{}`: jerk spike {worst:.4} {u} at t={t_worst:.3} s exceeds {:.1} x jmax = {threshold:.4} {u}",
+                    model.joint_names[i],
+                    opts.jerk_spike_ratio,
+                    u = unit(i, 3),
+                ),
+                fix_hint: "re-time with the jerk-limited S-curve (move_j / retime_waypoints) or blend the acceleration step over more samples".into(),
+                joint: Some(i),
+                time: Some(t_worst),
+                value: Some(worst),
+            });
+        }
+    }
+
+    // T007 — singular corridor: contiguous windows of σ_min below threshold.
+    let mut k = 0;
+    while k < ns {
+        if sigma[k] < opts.sigma_min_threshold {
+            let start = k;
+            let mut worst = sigma[k];
+            let mut t_worst = rows.times[k];
+            while k < ns && sigma[k] < opts.sigma_min_threshold {
+                if sigma[k] < worst {
+                    worst = sigma[k];
+                    t_worst = rows.times[k];
+                }
+                k += 1;
+            }
+            out.push(Finding {
+                code: "T007",
+                severity: LintSeverity::Warning,
+                message: format!(
+                    "singular corridor: σ_min falls to {worst:.4e} (< {:.4e}) between t={:.3} s and t={:.3} s (worst at t={t_worst:.3} s)",
+                    opts.sigma_min_threshold,
+                    rows.times[start],
+                    rows.times[k - 1],
+                ),
+                fix_hint: "re-pose the path away from the singular region (see `analyze` escape_direction) or accept DLS damping through it".into(),
+                joint: None,
+                time: Some(t_worst),
+                value: Some(worst),
+            });
+        } else {
+            k += 1;
+        }
+    }
+
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1155,6 +1539,248 @@ mod tests {
         let rep = path_report(&m, m.tip_frame(), &rows, &[0.0, 3.0], &[10.0, 10.0]);
         assert!(rep.vel_utilization[0].is_infinite());
         assert!(rep.vel_utilization[1].is_finite());
+    }
+
+    // ===== lint_path =====
+
+    /// Zero rows for `n` joints at the given `q` samples (lint fixtures that
+    /// only exercise position-based checks).
+    fn zero_rows(times: Vec<f64>, q: Vec<Vec<f64>>) -> Rows {
+        let n = q[0].len();
+        let z = vec![vec![0.0; n]; q.len()];
+        (times, q, z.clone(), z)
+    }
+
+    fn lint_toy(rows: &Rows, vmax: &[f64], amax: &[f64], jmax: &[f64]) -> Vec<Finding> {
+        let m = toy();
+        let pr = PathRows {
+            times: &rows.0,
+            q: &rows.1,
+            qd: &rows.2,
+            qdd: &rows.3,
+        };
+        let limits = LintLimits { vmax, amax, jmax };
+        lint_path(&m, m.tip_frame(), &pr, &limits, &LintOptions::default())
+    }
+
+    /// A well-behaved path on toy.urdf (small motion, far from every limit,
+    /// never singular — a planar 2R with nonzero link lengths has σ_min > 0
+    /// everywhere) lints completely clean. The negative control for T001–T007.
+    #[test]
+    fn lint_clean_path_zero_findings() {
+        let rows = (
+            vec![0.0, 0.5, 1.0],
+            vec![vec![0.0, 0.0], vec![0.1, -0.1], vec![0.2, -0.2]],
+            vec![vec![0.0, 0.0], vec![0.3, 0.3], vec![0.0, 0.0]],
+            vec![vec![0.0, 0.0], vec![0.5, 0.5], vec![0.0, 0.0]],
+        );
+        let f = lint_toy(&rows, &[3.0, 3.0], &[10.0, 10.0], &[50.0, 50.0]);
+        assert!(f.is_empty(), "clean path must lint clean, got {f:?}");
+    }
+
+    /// T001 positive: q beyond the +3.14 limit. Ground truth: margin
+    /// 3.14 − 3.3 = −0.16, tightest at every sample (t = first sample).
+    #[test]
+    // 3.14 below is toy.urdf's literal joint limit, not an approximation of π.
+    #[allow(clippy::approx_constant)]
+    fn lint_flags_position_limit_violation() {
+        let rows = zero_rows(vec![0.0, 1.0], vec![vec![0.0, 3.3], vec![0.0, 3.3]]);
+        let f = lint_toy(&rows, &[3.0, 3.0], &[10.0, 10.0], &[50.0, 50.0]);
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(f[0].code, "T001");
+        assert_eq!(f[0].severity, LintSeverity::Error);
+        assert_eq!(f[0].joint, Some(1));
+        assert!((f[0].value.unwrap() - (3.14 - 3.3)).abs() < 1e-12);
+        assert!(f[0].message.contains("j2"), "{}", f[0].message);
+    }
+
+    /// T002 positive: |q̇| = 4 vs vmax = 3 ⇒ utilization exactly 4/3 at t=1.
+    #[test]
+    fn lint_flags_velocity_limit() {
+        let rows = (
+            vec![0.0, 1.0],
+            vec![vec![0.0, 0.0], vec![0.1, 0.0]],
+            vec![vec![0.0, 0.0], vec![4.0, 0.0]],
+            vec![vec![0.0, 0.0], vec![0.0, 0.0]],
+        );
+        let f = lint_toy(&rows, &[3.0, 3.0], &[10.0, 10.0], &[50.0, 50.0]);
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(f[0].code, "T002");
+        assert_eq!(f[0].severity, LintSeverity::Error);
+        assert_eq!(f[0].joint, Some(0));
+        assert_eq!(f[0].time, Some(1.0));
+        assert!((f[0].value.unwrap() - 4.0 / 3.0).abs() < 1e-15);
+    }
+
+    /// T003 positive: |q̈| = 45 vs amax = 10 ⇒ utilization exactly 4.5. jmax is
+    /// generous (threshold 1.5·200 = 300 > fd jerk 45), so no T006 rides along.
+    #[test]
+    fn lint_flags_acceleration_limit() {
+        let rows = (
+            vec![0.0, 1.0],
+            vec![vec![0.0, 0.0], vec![0.1, 0.0]],
+            vec![vec![0.0, 0.0], vec![0.0, 0.0]],
+            vec![vec![0.0, 0.0], vec![0.0, 45.0]],
+        );
+        let f = lint_toy(&rows, &[3.0, 3.0], &[10.0, 10.0], &[200.0, 200.0]);
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(f[0].code, "T003");
+        assert_eq!(f[0].severity, LintSeverity::Error);
+        assert_eq!(f[0].joint, Some(1));
+        assert!((f[0].value.unwrap() - 4.5).abs() < 1e-15);
+    }
+
+    /// T004 positive: joint 0 parks at 3.10, margin 3.14 − 3.10 = 0.04 <
+    /// near_limit_margin (0.05) for 3/3 samples ⇒ dwell fraction exactly 1.
+    #[test]
+    fn lint_flags_near_limit_dwell() {
+        let rows = zero_rows(
+            vec![0.0, 1.0, 2.0],
+            vec![vec![3.10, 0.0], vec![3.10, 0.0], vec![3.10, 0.0]],
+        );
+        let f = lint_toy(&rows, &[3.0, 3.0], &[10.0, 10.0], &[50.0, 50.0]);
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(f[0].code, "T004");
+        assert_eq!(f[0].severity, LintSeverity::Warning);
+        assert_eq!(f[0].joint, Some(0));
+        assert!((f[0].value.unwrap() - 1.0).abs() < 1e-15);
+    }
+
+    /// T005 positive: joint 0 runs 0 → 2 → 0.1. Ground truth: travel
+    /// 2 + 1.9 = 3.9, net 0.1 ⇒ ratio 39 > 3; the chord 0→0.1 puts the peak
+    /// excursion at the middle sample (t = 1).
+    #[test]
+    fn lint_flags_travel_detour() {
+        let rows = zero_rows(
+            vec![0.0, 1.0, 2.0],
+            vec![vec![0.0, 0.0], vec![2.0, 0.0], vec![0.1, 0.0]],
+        );
+        let f = lint_toy(&rows, &[3.0, 3.0], &[10.0, 10.0], &[50.0, 50.0]);
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(f[0].code, "T005");
+        assert_eq!(f[0].severity, LintSeverity::Warning);
+        assert_eq!(f[0].joint, Some(0));
+        assert_eq!(f[0].time, Some(1.0));
+        assert!((f[0].value.unwrap() - 39.0).abs() < 1e-9);
+    }
+
+    /// T006 positive: qdd steps 0 → 5 over dt = 0.1 ⇒ fd jerk exactly 50,
+    /// above 1.5 × jmax = 15, landing at the second sample (t = 0.1).
+    #[test]
+    fn lint_flags_jerk_spike() {
+        let rows = (
+            vec![0.0, 0.1, 0.2],
+            vec![vec![0.0, 0.0], vec![0.01, 0.0], vec![0.02, 0.0]],
+            vec![vec![0.0, 0.0], vec![0.0, 0.0], vec![0.0, 0.0]],
+            vec![vec![0.0, 0.0], vec![5.0, 0.0], vec![0.0, 0.0]],
+        );
+        let f = lint_toy(&rows, &[3.0, 3.0], &[10.0, 10.0], &[10.0, 10.0]);
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(f[0].code, "T006");
+        assert_eq!(f[0].severity, LintSeverity::Warning);
+        assert_eq!(f[0].joint, Some(0));
+        assert_eq!(f[0].time, Some(0.1));
+        assert!((f[0].value.unwrap() - 50.0).abs() < 1e-9);
+    }
+
+    /// T007 positive on showcase6: the all-zeros home is wrist-singular
+    /// (σ_min < 1e-6, pinned by the CLI report test) while the generic config
+    /// has σ_min ≥ eps_activate (pinned by `free_analyze_matches_...` via
+    /// `kind == None`). One contiguous window around the singular sample, and
+    /// the reported σ_min cross-checks against `analyze` exactly. jmax = ∞
+    /// (TOPP-style) exercises the jerk-check opt-out.
+    #[test]
+    fn lint_flags_singular_corridor() {
+        let m = load("showcase6.urdf");
+        let f = m.tip_frame();
+        let generic = vec![0.3, -0.4, 0.6, 0.2, -0.5, 0.1];
+        let home = vec![0.0; 6];
+        let p = SingularityParams::default();
+        // fixture preconditions (self-diagnosing, both pinned elsewhere)
+        assert!(analyze(&m, &generic, f, &p).sigma_min > 1e-2);
+        assert!(analyze(&m, &home, f, &p).sigma_min < 1e-2);
+        let (times, q) = (
+            vec![0.0, 1.0, 2.0],
+            vec![generic.clone(), home.clone(), generic.clone()],
+        );
+        let z = vec![vec![0.0; 6]; 3];
+        let rows = PathRows {
+            times: &times,
+            q: &q,
+            qd: &z,
+            qdd: &z,
+        };
+        let limits = LintLimits {
+            vmax: &[10.0; 6],
+            amax: &[10.0; 6],
+            jmax: &[f64::INFINITY; 6],
+        };
+        // disable dwell/detour so the test pins the corridor check alone
+        // (showcase6's exact limit values are not this test's business)
+        let opts = LintOptions {
+            near_limit_dwell_frac: 1.1,
+            travel_min: 100.0,
+            ..LintOptions::default()
+        };
+        let findings = lint_path(&m, f, &rows, &limits, &opts);
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        let c = &findings[0];
+        assert_eq!(c.code, "T007");
+        assert_eq!(c.severity, LintSeverity::Warning);
+        assert_eq!(c.joint, None);
+        assert_eq!(c.time, Some(1.0));
+        // numeric cross-check: the corridor's worst σ_min IS analyze's σ_min
+        let want = analyze(&m, &home, f, &p).sigma_min;
+        assert!((c.value.unwrap() - want).abs() < 1e-12);
+
+        // two disjoint singular windows ⇒ two T007 findings
+        let q2 = vec![home.clone(), generic.clone(), home];
+        let rows2 = PathRows {
+            times: &times,
+            q: &q2,
+            qd: &z,
+            qdd: &z,
+        };
+        let findings2 = lint_path(&m, f, &rows2, &limits, &opts);
+        assert_eq!(findings2.len(), 2, "{findings2:?}");
+        assert!(findings2.iter().all(|x| x.code == "T007"));
+        assert_eq!(findings2[0].time, Some(0.0));
+        assert_eq!(findings2[1].time, Some(2.0));
+    }
+
+    /// Total on degenerate inputs: empty rows and a 0-DOF model lint clean.
+    #[test]
+    fn lint_empty_and_zero_dof() {
+        let m = toy();
+        let empty = PathRows {
+            times: &[],
+            q: &[],
+            qd: &[],
+            qdd: &[],
+        };
+        let limits = LintLimits {
+            vmax: &[3.0, 3.0],
+            amax: &[10.0, 10.0],
+            jmax: &[50.0, 50.0],
+        };
+        assert!(lint_path(&m, m.tip_frame(), &empty, &limits, &LintOptions::default()).is_empty());
+
+        let m0 = load("fixed_only.urdf");
+        assert_eq!(m0.ndof, 0);
+        let times = [0.0, 1.0];
+        let q: Vec<Vec<f64>> = vec![vec![], vec![]];
+        let rows = PathRows {
+            times: &times,
+            q: &q,
+            qd: &q,
+            qdd: &q,
+        };
+        let l0 = LintLimits {
+            vmax: &[],
+            amax: &[],
+            jmax: &[],
+        };
+        assert!(lint_path(&m0, m0.tip_frame(), &rows, &l0, &LintOptions::default()).is_empty());
     }
 }
 

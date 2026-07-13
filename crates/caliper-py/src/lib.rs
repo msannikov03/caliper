@@ -376,9 +376,10 @@ impl Robot {
             )));
         }
         if via.len() != 3 {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                "via must be [x, y, z]",
-            ));
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "via must be [x, y, z] (3 values, m), got {} value(s)",
+                via.len()
+            )));
         }
         finite_or_err("q_start", &q_start)?;
         finite_or_err("via", &via)?;
@@ -422,9 +423,9 @@ impl Robot {
             finite_or_err("waypoints", w)?;
         }
         if !dt.is_finite() || dt <= 0.0 {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                "dt must be finite and > 0",
-            ));
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "dt must be a finite number of seconds > 0, got {dt}"
+            )));
         }
         let mut lim = match (vmax, amax) {
             (None, None) => motion_limits(model, None)?,
@@ -449,10 +450,15 @@ impl Robot {
                     jmax: vec![],
                 }
             }
-            _ => {
-                return Err(pyo3::exceptions::PyValueError::new_err(
-                    "pass both vmax and amax, or neither",
-                ));
+            (v, _) => {
+                let got = if v.is_some() {
+                    "only vmax"
+                } else {
+                    "only amax"
+                };
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "pass both vmax and amax, or neither (got {got}); the pair replaces the model limits together"
+                )));
             }
         };
         // TOPP is jerk-unlimited; report that honestly through Trajectory.jerk_limit.
@@ -754,9 +760,12 @@ impl MotionLimits {
     #[new]
     fn new(vel: Vec<f64>, accel: Vec<f64>, jerk: Vec<f64>) -> PyResult<Self> {
         if vel.len() != accel.len() || vel.len() != jerk.len() {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                "vel/accel/jerk length mismatch",
-            ));
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "vel/accel/jerk must all have one value per joint, got lengths {}/{}/{}",
+                vel.len(),
+                accel.len(),
+                jerk.len()
+            )));
         }
         // Unlike other entry points, the engine never re-validates these — a
         // non-finite or non-positive limit makes planning produce an inf/NaN
@@ -969,9 +978,15 @@ fn se3_from_pose_or_legacy12(label: &str, pose: &PoseInput) -> PyResult<Se3> {
 /// `plan_to_pose` still accepts this form (via [`se3_from_pose_or_legacy12`]).
 fn se3_from_12(t: &[f64]) -> PyResult<Se3> {
     if t.len() != 12 || !t.iter().all(|x| x.is_finite()) {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "target needs 12 finite values (9 row-major R then tx,ty,tz)",
-        ));
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "target needs 12 finite values (9 row-major R then tx,ty,tz); got {} value(s){}",
+            t.len(),
+            if t.iter().all(|x| x.is_finite()) {
+                ""
+            } else {
+                ", including a non-finite (NaN/Inf)"
+            }
+        )));
     }
     let rot = Matrix3::new(t[0], t[1], t[2], t[3], t[4], t[5], t[6], t[7], t[8]);
     Ok(Se3::from_parts(
@@ -999,9 +1014,9 @@ impl Simulator {
         substeps: usize,
     ) -> PyResult<Self> {
         if !(damping.is_finite() && damping >= 0.0) {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                "damping must be finite and >= 0 (negative damping injects energy)",
-            ));
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "damping must be finite and >= 0 (negative damping injects energy), got {damping}"
+            )));
         }
         let model = std::sync::Arc::new(robot.inner.model.clone());
         let mut inner = dynamics::Simulator::new(model).map_err(dyn_err)?;
@@ -1048,10 +1063,14 @@ impl Simulator {
         self.inner.set_gravity(Vector3::new(g[0], g[1], g[2]));
     }
     fn set_damping(&mut self, d: Vec<f64>) -> PyResult<()> {
-        if d.iter().any(|x| !x.is_finite() || *x < 0.0) {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                "damping must be finite and >= 0 (negative damping injects energy)",
-            ));
+        if let Some((i, bad)) = d
+            .iter()
+            .enumerate()
+            .find(|(_, x)| !x.is_finite() || **x < 0.0)
+        {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "damping must be finite and >= 0 (negative damping injects energy); damping[{i}] = {bad}"
+            )));
         }
         self.inner.set_damping(&d).map_err(dyn_err)
     }
@@ -1158,9 +1177,9 @@ impl ControlLoop {
         // A negative kp drives away from the goal; a non-finite gain makes tau NaN
         // and propagates NaN through the backend. Reject before building Gains.
         if !kp.is_finite() || kp < 0.0 || !kd.is_finite() || kd < 0.0 {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                "kp/kd must be finite and >= 0",
-            ));
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "kp/kd must be finite and >= 0, got kp={kp}, kd={kd}"
+            )));
         }
         let model = Arc::new(m.clone());
         let mut backend = PhysicsSimBackend::new(model.clone()).map_err(hal_err)?;
@@ -1474,7 +1493,7 @@ impl RecorderV3 {
         self.check_open()?;
         if self.task.is_some() {
             return Err(pyo3::exceptions::PyValueError::new_err(
-                "episode already open",
+                "episode already open; call finalize_episode() before start_episode()",
             ));
         }
         self.task = Some(task.to_string());
@@ -1494,7 +1513,9 @@ impl RecorderV3 {
         finite_or_err("state", &state)?;
         finite_or_err("action", &action)?;
         if self.task.is_none() {
-            return Err(pyo3::exceptions::PyValueError::new_err("no open episode"));
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "no open episode; call start_episode(task) before append()",
+            ));
         }
         let images = images.unwrap_or_default();
         let image_refs: Vec<(&str, &[u8])> = images
@@ -1513,10 +1534,11 @@ impl RecorderV3 {
         })
     }
     fn finalize_episode(&mut self) -> PyResult<()> {
-        let task = self
-            .task
-            .take()
-            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("no open episode"))?;
+        let task = self.task.take().ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err(
+                "no open episode; call start_episode(task) before finalize_episode()",
+            )
+        })?;
         self.with_writer(|w| w.save_episode(&task))
     }
     /// Finalize the dataset (writes meta/) and return its path. Consumes the recorder.
@@ -1739,7 +1761,11 @@ impl SafetyMonitor {
     #[pyo3(signature = (robot, q0, dt=1e-3))]
     fn new(robot: &Robot, q0: Vec<f64>, dt: f64) -> PyResult<Self> {
         if q0.len() != robot.inner.model.ndof {
-            return Err(pyo3::exceptions::PyValueError::new_err("q0 length != ndof"));
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "q0 has length {}, expected ndof={} (one value per joint)",
+                q0.len(),
+                robot.inner.model.ndof
+            )));
         }
         finite_or_err("q0", &q0)?;
         let cfg = SafetyConfig::from_model(&robot.inner.model);
@@ -1805,9 +1831,11 @@ impl LeaderFollower {
     /// Move the leader to `lead`, step the follower once, return the follower q.
     fn step(&mut self, lead: Vec<f64>) -> PyResult<Vec<f64>> {
         if lead.len() != self.ndof {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                "lead length != ndof",
-            ));
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "lead has length {}, expected ndof={} (one value per joint)",
+                lead.len(),
+                self.ndof
+            )));
         }
         finite_or_err("lead", &lead)?;
         self.src
@@ -1928,9 +1956,9 @@ impl Planner {
         // dt flows into retime (nsteps = total/dt) and the local sampling cast
         // below; a non-finite or non-positive dt overflows the step count.
         if !dt.is_finite() || dt <= 0.0 {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                "dt must be finite and > 0",
-            ));
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "dt must be a finite number of seconds > 0, got {dt}"
+            )));
         }
         let limits = EngineLimits::from_model(&self.model, &MotionLimitsConfig::default())
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
@@ -2327,6 +2355,299 @@ fn model_to_mjcf(
     Ok(doc.xml)
 }
 
+// ===== Asset doctor / dataset doctor / trajectory lint (module functions) =====
+
+fn doc_err(e: caliper_doctor::DoctorError) -> PyErr {
+    pyo3::exceptions::PyValueError::new_err(e.to_string())
+}
+
+/// Lowercase severity tag for the asset-doctor dicts.
+fn doctor_severity_str(s: caliper_doctor::Severity) -> &'static str {
+    match s {
+        caliper_doctor::Severity::Error => "error",
+        caliper_doctor::Severity::Warn => "warn",
+        caliper_doctor::Severity::Info => "info",
+    }
+}
+
+/// [`caliper_doctor::DoctorReport`] → the report dict (findings + counts).
+fn doctor_report_dict<'py>(
+    py: Python<'py>,
+    rep: &caliper_doctor::DoctorReport,
+) -> PyResult<Bound<'py, PyDict>> {
+    let d = PyDict::new(py);
+    let findings = PyList::empty(py);
+    for f in &rep.findings {
+        let fd = PyDict::new(py);
+        fd.set_item("code", &f.code)?;
+        fd.set_item("severity", doctor_severity_str(f.severity))?;
+        fd.set_item("message", &f.message)?;
+        fd.set_item("fix_hint", f.fix_hint.as_deref())?;
+        fd.set_item("auto_fixable", f.auto_fixable)?;
+        findings.append(fd)?;
+    }
+    d.set_item("findings", findings)?;
+    d.set_item("errors", rep.errors)?;
+    d.set_item("warnings", rep.warnings)?;
+    d.set_item("infos", rep.infos)?;
+    d.set_item("clean", rep.is_clean())?;
+    Ok(d)
+}
+
+/// One applied/skipped repair as a `{code, target, detail}` dict.
+fn repair_action_dict<'py>(
+    py: Python<'py>,
+    a: &caliper_doctor::RepairAction,
+) -> PyResult<Bound<'py, PyDict>> {
+    let d = PyDict::new(py);
+    d.set_item("code", &a.code)?;
+    d.set_item("target", &a.target)?;
+    d.set_item("detail", &a.detail)?;
+    Ok(d)
+}
+
+/// Diagnose (and optionally repair) the URDF / xacro robot description at
+/// `path`: missing or implausible inertials, unresolvable meshes, duplicate
+/// mesh basenames, missing colliders, unusable limits, bad axes, mimic
+/// defects, xacro leftovers (stable codes A001–A014).
+///
+/// Returns a dict `{findings, errors, warnings, infos, clean, repair}` where
+/// each finding is `{code, severity ("error"|"warn"|"info"), message,
+/// fix_hint, auto_fixable}`. Findings are data, never exceptions; a
+/// `ValueError` means the file could not even be inspected.
+///
+/// With `repair=True` every mechanical repair is applied (computed inertials
+/// at `density` kg/m^3, normalized axes, deduped mesh basenames, conservative
+/// limits) and the repaired COPY is written to `out` (default:
+/// `<input>.repaired.urdf` next to the input, where relative mesh references
+/// keep resolving) — the input file is never modified. `repair` is then the
+/// dict `{out, applied, skipped, mesh_copies}`; without `repair=True` it is
+/// `None`. The reported findings always describe the ORIGINAL file —
+/// re-run `doctor(out)` to verify the repaired copy.
+#[pyfunction]
+#[pyo3(signature = (path, repair=false, out=None, density=1000.0))]
+fn doctor(
+    py: Python<'_>,
+    path: &str,
+    repair: bool,
+    out: Option<String>,
+    density: f64,
+) -> PyResult<Py<PyDict>> {
+    let p = std::path::Path::new(path);
+    let report = caliper_doctor::diagnose(p).map_err(doc_err)?;
+    let d = doctor_report_dict(py, &report)?;
+    if !repair {
+        if out.is_some() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "out only applies together with repair=True",
+            ));
+        }
+        d.set_item("repair", py.None())?;
+        return Ok(d.into());
+    }
+    if !(density.is_finite() && density > 0.0) {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "density must be finite and > 0 kg/m^3, got {density}"
+        )));
+    }
+    let opts = caliper_doctor::RepairOpts {
+        density,
+        ..caliper_doctor::RepairOpts::all()
+    };
+    let outcome = caliper_doctor::repair(p, &opts).map_err(doc_err)?;
+    let out_path = match out {
+        Some(s) => std::path::PathBuf::from(s),
+        None => {
+            let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("robot");
+            p.with_file_name(format!("{stem}.repaired.urdf"))
+        }
+    };
+    std::fs::write(&out_path, &outcome.repaired_urdf).map_err(|e| {
+        pyo3::exceptions::PyValueError::new_err(format!(
+            "failed to write `{}`: {e}",
+            out_path.display()
+        ))
+    })?;
+    // The engine emits a copy PLAN for deduped meshes; performing the copies
+    // is the face's job.
+    let copies = PyList::empty(py);
+    for c in &outcome.mesh_copies {
+        std::fs::copy(&c.from, &c.to).map_err(|e| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "mesh copy `{}` -> `{}` failed: {e}",
+                c.from.display(),
+                c.to.display()
+            ))
+        })?;
+        let cd = PyDict::new(py);
+        cd.set_item("from", c.from.to_string_lossy())?;
+        cd.set_item("to", c.to.to_string_lossy())?;
+        copies.append(cd)?;
+    }
+    let applied = PyList::empty(py);
+    for a in &outcome.applied {
+        applied.append(repair_action_dict(py, a)?)?;
+    }
+    let skipped = PyList::empty(py);
+    for s in &outcome.skipped {
+        skipped.append(repair_action_dict(py, s)?)?;
+    }
+    let rd = PyDict::new(py);
+    rd.set_item("out", out_path.to_string_lossy())?;
+    rd.set_item("applied", applied)?;
+    rd.set_item("skipped", skipped)?;
+    rd.set_item("mesh_copies", copies)?;
+    d.set_item("repair", rd)?;
+    Ok(d.into())
+}
+
+/// Pre-training diagnostics over the LeRobotDataset v3.0 at `root`: variance
+/// collapse, stale stats, saturated/echo/tiny/contradictory actions, coverage
+/// holes, corridor-shaped data, length/timestamp anomalies, frozen tails,
+/// dead cameras, duplicate episodes (stable codes D001–D015, engineering
+/// default thresholds — a healthy dataset reports zero findings).
+///
+/// Returns `{root, total_episodes, total_frames, fps, features, findings,
+/// clean}`; each finding is `{code, severity ("error"|"warning"|"info"),
+/// feature, episode, dof, message, fix_hint}` (anchors are None when the
+/// finding is dataset-wide), and `features` maps every float32 vector feature
+/// to its recomputed `{dim, mean, std, min, max, bin_occupancy}`. Findings
+/// are data, never exceptions; a `ValueError` means the dataset itself could
+/// not be read. Deterministic: repeated runs return the same dict.
+#[pyfunction]
+fn data_doctor(py: Python<'_>, root: &str) -> PyResult<Py<PyDict>> {
+    let rep = caliper_dataset::analyze(root, caliper_dataset::AnalyzeOptions::default())
+        .map_err(ds_err)?;
+    let d = PyDict::new(py);
+    d.set_item("root", &rep.root)?;
+    d.set_item("total_episodes", rep.total_episodes)?;
+    d.set_item("total_frames", rep.total_frames)?;
+    d.set_item("fps", rep.fps)?;
+    let feats = PyDict::new(py);
+    for (name, s) in &rep.features {
+        let fd = PyDict::new(py);
+        fd.set_item("dim", s.dim)?;
+        fd.set_item("mean", s.mean.clone())?;
+        fd.set_item("std", s.std.clone())?;
+        fd.set_item("min", s.min.clone())?;
+        fd.set_item("max", s.max.clone())?;
+        fd.set_item("bin_occupancy", s.bin_occupancy.clone())?;
+        feats.set_item(name, fd)?;
+    }
+    d.set_item("features", feats)?;
+    let findings = PyList::empty(py);
+    for f in &rep.findings {
+        let fd = PyDict::new(py);
+        fd.set_item("code", &f.code)?;
+        fd.set_item("severity", f.severity.to_string())?;
+        fd.set_item("feature", f.feature.as_deref())?;
+        fd.set_item("episode", f.episode)?;
+        fd.set_item("dof", f.dof)?;
+        fd.set_item("message", &f.message)?;
+        fd.set_item("fix_hint", &f.fix_hint)?;
+        findings.append(fd)?;
+    }
+    d.set_item("findings", findings)?;
+    d.set_item("clean", rep.findings.is_empty())?;
+    Ok(d.into())
+}
+
+/// Lint a sampled trajectory against `robot`'s limits: typed findings T001
+/// (position limit violated), T002/T003 (velocity/acceleration utilization
+/// over 100%), T004 (sustained near-limit dwell), T005 (wrap-around detour),
+/// T006 (jerk spikes), T007 (singular corridor) — engineering-default
+/// thresholds, one Jacobian SVD per sample.
+///
+/// `times`/`q`/`qd`/`qdd` are parallel per-sample rows, exactly the shape
+/// `Trajectory.sample_uniform(dt)` returns (`times` non-decreasing, each row
+/// length ndof). `limits` defaults to the model's own `MotionLimits`;
+/// `frame` (default = tip) anchors the singularity check.
+///
+/// Returns a list of finding dicts `{code, severity ("error"|"warning"),
+/// message, fix_hint, joint, time, value}`, errors first; an empty list means
+/// the trajectory lints clean. Collision linting is CLI-side
+/// (`caliper report`) — use `CollisionModel.query` for scripted checks.
+#[pyfunction]
+#[pyo3(signature = (robot, times, q, qd, qdd, limits=None, frame=None))]
+#[allow(clippy::too_many_arguments)]
+fn lint_path(
+    py: Python<'_>,
+    robot: &Robot,
+    times: Vec<f64>,
+    q: Vec<Vec<f64>>,
+    qd: Vec<Vec<f64>>,
+    qdd: Vec<Vec<f64>>,
+    limits: Option<MotionLimits>,
+    frame: Option<&str>,
+) -> PyResult<Py<PyList>> {
+    let model = &robot.inner.model;
+    let ns = times.len();
+    if q.len() != ns || qd.len() != ns || qdd.len() != ns {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "times/q/qd/qdd must have one row per sample, got lengths {ns}/{}/{}/{}",
+            q.len(),
+            qd.len(),
+            qdd.len()
+        )));
+    }
+    finite_or_err("times", &times)?;
+    if times.windows(2).any(|w| w[1] < w[0]) {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "times must be non-decreasing (the linter finite-differences on a monotone clock)",
+        ));
+    }
+    for (label, rows) in [("q", &q), ("qd", &qd), ("qdd", &qdd)] {
+        for (k, row) in rows.iter().enumerate() {
+            if row.len() != model.ndof {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "{label}[{k}] has length {}, expected ndof={}",
+                    row.len(),
+                    model.ndof
+                )));
+            }
+            finite_or_err(label, row)?;
+        }
+    }
+    let f = resolve_frame(model, frame)?;
+    let lim = motion_limits(model, limits)?;
+    let rows = caliper::kinematics::PathRows {
+        times: &times,
+        q: &q,
+        qd: &qd,
+        qdd: &qdd,
+    };
+    let findings = caliper::kinematics::lint_path(
+        model,
+        f,
+        &rows,
+        &caliper::kinematics::LintLimits {
+            vmax: &lim.vmax,
+            amax: &lim.amax,
+            jmax: &lim.jmax,
+        },
+        &caliper::kinematics::LintOptions::default(),
+    );
+    let out = PyList::empty(py);
+    for fnd in findings {
+        let fd = PyDict::new(py);
+        fd.set_item("code", fnd.code)?;
+        fd.set_item(
+            "severity",
+            match fnd.severity {
+                caliper::kinematics::LintSeverity::Error => "error",
+                caliper::kinematics::LintSeverity::Warning => "warning",
+            },
+        )?;
+        fd.set_item("message", fnd.message)?;
+        fd.set_item("fix_hint", fnd.fix_hint)?;
+        fd.set_item("joint", fnd.joint)?;
+        fd.set_item("time", fnd.time)?;
+        fd.set_item("value", fnd.value)?;
+        out.append(fd)?;
+    }
+    Ok(out.into())
+}
+
 #[pymodule]
 fn _caliper(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", caliper::VERSION)?;
@@ -2342,6 +2663,9 @@ fn _caliper(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(dataset_merge_episodes, m)?)?;
     m.add_function(wrap_pyfunction!(dataset_read_tags, m)?)?;
     m.add_function(wrap_pyfunction!(dataset_write_tags, m)?)?;
+    m.add_function(wrap_pyfunction!(doctor, m)?)?;
+    m.add_function(wrap_pyfunction!(data_doctor, m)?)?;
+    m.add_function(wrap_pyfunction!(lint_path, m)?)?;
     m.add_class::<Robot>()?;
     m.add_class::<Trajectory>()?;
     m.add_class::<MotionLimits>()?;

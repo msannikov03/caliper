@@ -133,6 +133,69 @@ def dataset_write_tags(root: str, tags: dict[int, list[str]]) -> None:
     """Write the caliper tags sidecar (episodes with empty tag lists omitted)."""
     ...
 
+def doctor(
+    path: str,
+    repair: bool = ...,
+    out: Optional[str] = ...,
+    density: float = ...,
+) -> dict[str, Any]:
+    """Diagnose (and optionally repair) a URDF / xacro robot description.
+
+    Runs the asset doctor (stable codes A001-A014: missing/implausible
+    inertials, unresolvable meshes, duplicate mesh basenames, missing
+    colliders, unusable limits, bad axes, mimic defects, xacro leftovers).
+    Returns `{findings, errors, warnings, infos, clean, repair}`; each
+    finding is `{code, severity ("error"|"warn"|"info"), message, fix_hint,
+    auto_fixable}`. Findings are data — `ValueError` only when the file
+    cannot even be inspected.
+
+    With `repair=True`, applies every mechanical repair (computed inertials
+    at `density` kg/m^3, normalized axes, deduped mesh basenames,
+    conservative limits) and writes a repaired COPY to `out` (default
+    `<input>.repaired.urdf` next to the input); the input file is never
+    modified. `repair` in the result is then `{out, applied, skipped,
+    mesh_copies}` (else None); the findings always describe the ORIGINAL
+    file — re-run `doctor(out)` to verify the copy.
+    """
+    ...
+
+def data_doctor(root: str) -> dict[str, Any]:
+    """Pre-training diagnostics over a LeRobotDataset v3.0 at `root`.
+
+    Runs the dataset doctor (stable codes D001-D015: variance collapse,
+    stale stats, saturated/echo/tiny/contradictory actions, coverage holes,
+    corridor data, length/timestamp anomalies, frozen tails, dead cameras,
+    duplicate episodes). Returns `{root, total_episodes, total_frames, fps,
+    features, findings, clean}`; each finding is `{code, severity
+    ("error"|"warning"|"info"), feature, episode, dof, message, fix_hint}`
+    and `features` maps every float32 vector feature to its recomputed
+    `{dim, mean, std, min, max, bin_occupancy}`. Deterministic; a healthy
+    dataset reports zero findings. `ValueError` only when the dataset
+    itself cannot be read.
+    """
+    ...
+
+def lint_path(
+    robot: "Robot",
+    times: _Vec,
+    q: Sequence[_Vec],
+    qd: Sequence[_Vec],
+    qdd: Sequence[_Vec],
+    limits: Optional["MotionLimits"] = ...,
+    frame: Optional[str] = ...,
+) -> list[dict[str, Any]]:
+    """Lint a sampled trajectory against the robot's limits.
+
+    Typed findings T001-T007 (position/velocity/acceleration violations,
+    near-limit dwell, wrap-around detours, jerk spikes, singular corridors).
+    `times`/`q`/`qd`/`qdd` are parallel per-sample rows, exactly what
+    `Trajectory.sample_uniform(dt)` returns; `limits` defaults to the
+    model's own MotionLimits. Returns finding dicts `{code, severity
+    ("error"|"warning"), message, fix_hint, joint, time, value}` errors
+    first; `[]` means the trajectory lints clean.
+    """
+    ...
+
 # --- Pure-Python interop exporters, re-exported from `caliper/interop.py` —
 # --- NOT from `lib.rs` (the "mirror lib.rs exactly" rule covers Rust only).
 

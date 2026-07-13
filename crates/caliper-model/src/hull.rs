@@ -467,7 +467,10 @@ mod tests {
         let t = std::time::Instant::now();
         let hull = convex_hull(&pts);
         let dt = t.elapsed();
-        assert!(dt.as_secs_f64() < 1.0, "hull build too slow: {dt:?}");
+        // 3 s: the guarded regression is effectively-infinite (pre-cap so101
+        // hung >31 s); a loose bound stays meaningful while tolerating debug
+        // builds on a machine busy with a parallel gate sweep (observed 1.5 s).
+        assert!(dt.as_secs_f64() < 3.0, "hull build too slow: {dt:?}");
         assert!(
             hull.len() <= MAX_HULL_INPUT,
             "hull not bounded: {} > {MAX_HULL_INPUT}",

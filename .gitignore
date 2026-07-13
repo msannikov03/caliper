@@ -22,3 +22,6 @@ docs/book/book/
 
 # libmujoco staged for bundling into the Studio .app (scripts/bundle_mujoco.sh)
 apps/studio/src-tauri/vendor/
+
+# mujoco drops a runtime log in cwd during tests
+MUJOCO_LOG.TXT

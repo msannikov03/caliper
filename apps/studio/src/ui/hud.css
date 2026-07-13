@@ -80,3 +80,47 @@
   flex-direction: column;
   gap: 4px;
 }
+
+/* --- asset-doctor findings inside the error banner --- */
+.hud.err {
+  pointer-events: auto; /* the Repair button must be clickable */
+  max-width: 480px;
+}
+.doctor-findings {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 3px;
+}
+.doctor-findings .df-row {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+}
+.doctor-findings .df-code {
+  flex: none;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--faint);
+}
+.doctor-findings .df-msg {
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--muted);
+  word-break: break-word;
+}
+.doctor-findings .df-more {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--faint);
+}
+.doctor-findings .df-repair {
+  align-self: flex-start;
+  margin-top: 4px;
+  font-size: 11px;
+  padding: 3px 10px;
+}
+.hud .repaired-note {
+  font-size: 10.5px;
+  color: var(--warn);
+}

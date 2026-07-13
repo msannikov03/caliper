@@ -2,9 +2,40 @@
 
 *Caliper Studio* is the desktop face: a **Tauri** (Rust backend) + **React**
 (frontend, with react-three-fiber for the 3D scene, @xyflow/react for the node
-graph, and uplot for scopes) application. It has two modes: a **3D scene** and a
-Simulink-style **Graph** tab backed by the [dataflow
-graph](../capabilities/studio-graph.md).
+graph, and uplot for scopes/plots) application. Five modes share one
+persistent 3D canvas (⌘1…⌘5, or the ⌘K command palette):
+
+- **Jog** — live FK, per-joint sliders, IK tip gizmo, singularity HUD +
+  manipulability ellipsoid.
+- **Motion** — jerk-limited MOVE_J / MOVE_L planning, named poses, playback
+  transport.
+- **Simulate** — gravity drop, computed-torque drive-to-goal, RRT plan,
+  collision check, dynamics readout; MuJoCo contact sim in `--features
+  mujoco` builds ([contact simulation](../capabilities/contact-sim.md)).
+- **Graph** — the Simulink-style dataflow editor backed by the
+  [dataflow graph](../capabilities/studio-graph.md) (run/validate,
+  save/load, file import/export, live scopes).
+- **Data** — a LeRobotDataset v3.0 browser/editor (episode table, per-channel
+  plots, camera thumbnails, tags, delete/split/merge) — reachable with no
+  robot loaded.
+
+## Doctors
+
+Both diagnostic engines are wired in (see [Doctors & trajectory
+lint](../capabilities/doctors.md)):
+
+- **Asset doctor** — every robot load is diagnosed in the background. When a
+  load *fails*, or succeeds with Error-severity findings (e.g. a silently
+  dropped collision mesh), the findings appear in the error-banner area with
+  severity chips. If any finding is mechanically fixable, a **Repair &
+  reload** button runs the repair, writes a sibling `<stem>.repaired.urdf`
+  (the input file is never modified), and loads that copy — the HUD then
+  labels the session as running on a repaired copy.
+- **Dataset doctor** — the **Doctor** button in Data mode streams the open
+  dataset through every `D001`–`D015` check and lists the findings; a finding
+  that names an episode is clickable and jumps the episode table to it, so a
+  bad take can be split or deleted on the spot. Structural edits clear the
+  report (it described the pre-edit bytes).
 
 ## Launch
 

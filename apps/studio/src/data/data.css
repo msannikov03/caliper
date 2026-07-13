@@ -415,3 +415,89 @@
   height: 2px;
   border-radius: 1px;
 }
+
+/* ---- dataset-doctor findings panel (left side, under the banner) ---- */
+.data-doctor {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  border-bottom: 1px solid var(--hairline);
+  max-height: 40%;
+}
+.data-doctor .dd-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 12px 5px;
+}
+.data-doctor .dd-sum {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--muted);
+}
+.data-doctor .dd-close {
+  margin-left: auto;
+  background: none;
+  border: none;
+  color: var(--faint);
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 1;
+  padding: 0 2px;
+}
+.data-doctor .dd-close:hover {
+  color: var(--text);
+}
+.data-doctor .dd-list {
+  overflow-y: auto;
+  padding: 0 8px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.data-doctor .dd-row {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 3px 4px;
+  border-radius: var(--r-sm);
+  text-align: left;
+  background: none;
+  border: none;
+  color: inherit;
+  font: inherit;
+}
+.data-doctor .dd-row.jump {
+  cursor: pointer;
+}
+.data-doctor .dd-row.jump:hover {
+  background: var(--raised);
+}
+.data-doctor .dd-code {
+  flex: none;
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--faint);
+}
+.data-doctor .dd-msg {
+  flex: 1;
+  min-width: 0;
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--muted);
+  word-break: break-word;
+}
+.data-doctor .dd-refs {
+  flex: none;
+  display: flex;
+  gap: 4px;
+}
+.data-doctor .dd-ref {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  color: var(--faint);
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-sm);
+  padding: 0 4px;
+  white-space: nowrap;
+}

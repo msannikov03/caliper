@@ -48,6 +48,7 @@ serde_json = "1"
 caliper = { workspace = true }
 caliper-collision = { workspace = true }
 caliper-dataset = { workspace = true }
+caliper-doctor = { workspace = true }
 caliper-sim-mujoco = { workspace = true, optional = true }
 nalgebra = { workspace = true }
 

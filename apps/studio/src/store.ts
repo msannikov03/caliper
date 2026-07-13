@@ -16,6 +16,7 @@ import { defaultParams, outPortType, inPortTypes, PORT_COLORS, NODE_SPECS } from
 import { serializeGraph, parseGraph } from "./graph/serialize";
 import { hasContactEngine, withProp } from "./sim/props";
 import type { PropKind, PropTrack, SimProp } from "./sim/props";
+import type { DataDoctorReport, DoctorReport } from "./doctor/doctor";
 
 // ---- wire types: mirror the serde structs in src-tauri/src/lib.rs exactly ----
 
@@ -219,6 +220,21 @@ export interface StudioState {
   ikOk: boolean | null;
   ikResidual: number | null;
 
+  // asset doctor (urdf_doctor) — rides the error banner area. `doctor` holds
+  // findings for `doctorPath` when a load FAILED or the diagnosis found
+  // Errors; a clean/warn-only diagnosis of a loaded robot stays silent.
+  doctor: DoctorReport | null;
+  doctorPath: string | null;
+  repairing: boolean;
+  /** original URDF path when the CURRENT robot is a doctor-repaired copy. */
+  repairedFrom: string | null;
+  /** Diagnose `path` (best-effort; a doctor failure never masks the load
+   *  error). Keeps the report when the load failed or Errors were found. */
+  _diagnoseUrdf: (path: string, failedLoad: boolean) => Promise<void>;
+  /** Run every mechanical repair on `doctorPath`, then load the repaired
+   *  SIBLING copy (the input file is never modified). */
+  repairAndReload: () => Promise<void>;
+
   // internal: monotonic request id so older FK replies can't clobber newer ones
   _reqId: number;
   // independent guard for analyze() so a slow SVD can't gate the FK frame
@@ -353,6 +369,17 @@ export interface StudioState {
   mergeDatasetEpisodes: (first: number, second: number) => Promise<void>;
   /** Replace one episode's sidecar tags (empty list clears them). */
   setDatasetTags: (episode: number, tags: string[]) => Promise<void>;
+
+  // dataset doctor (dataset_doctor) — pre-training diagnostics panel in Data
+  // mode. Any structural edit / refresh clears the report (it is a snapshot
+  // of the bytes it ran on).
+  dataDoctor: DataDoctorReport | null;
+  dataDoctorLoading: boolean;
+  /** Run the dataset doctor over the open dataset (streams every episode —
+   *  seconds on a large dataset, hence the separate loading flag). */
+  runDataDoctor: () => Promise<void>;
+  /** Dismiss the doctor findings panel. */
+  clearDataDoctor: () => void;
 }
 
 export const useStore = create<StudioState>((set, get) => ({
@@ -364,6 +391,10 @@ export const useStore = create<StudioState>((set, get) => ({
   error: null,
   ikOk: null,
   ikResidual: null,
+  doctor: null,
+  doctorPath: null,
+  repairing: false,
+  repairedFrom: null,
   _reqId: 0,
   _analyzeReqId: 0,
   traj: null,
@@ -397,6 +428,8 @@ export const useStore = create<StudioState>((set, get) => ({
   datasetSeries: null,
   _datasetSeriesCache: {},
   _datasetReqId: 0,
+  dataDoctor: null,
+  dataDoctorLoading: false,
 
   async loadFixtures() {
     try {
@@ -462,8 +495,16 @@ export const useStore = create<StudioState>((set, get) => ({
   },
 
   async loadRobot(path) {
-    // urdfPath is set up-front so Reload can re-attempt a failed load
-    set({ loading: true, error: null, urdfPath: path });
+    // urdfPath is set up-front so Reload can re-attempt a failed load; any
+    // doctor verdict describes a previous file, so it clears with the error
+    set({
+      loading: true,
+      error: null,
+      urdfPath: path,
+      doctor: null,
+      doctorPath: null,
+      repairedFrom: null,
+    });
     try {
       const robot = await invoke<RobotInfo>("robot_info", { path });
       stopClock();
@@ -499,10 +540,48 @@ export const useStore = create<StudioState>((set, get) => ({
       void invoke<string[]>("sim_engines")
         .then((simEngines) => set({ simEngines }))
         .catch(() => set({ simEngines: ["builtin"] }));
+      // background diagnosis: a load can SUCCEED while the doctor still finds
+      // Errors (e.g. an unresolvable collision mesh = a silently dropped
+      // collider) — those surface in the banner area; clean/warn stays quiet
+      void get()._diagnoseUrdf(path, false);
     } catch (e) {
       set({ error: String(e), robot: null });
+      // the load failed — ask the doctor WHY (best-effort, async)
+      void get()._diagnoseUrdf(path, true);
     } finally {
       set({ loading: false });
+    }
+  },
+
+  async _diagnoseUrdf(path, failedLoad) {
+    try {
+      const rep = await invoke<DoctorReport>("urdf_doctor", { path, repair: false });
+      if (get().urdfPath !== path) return; // a newer load superseded us
+      if (failedLoad || rep.errors > 0) set({ doctor: rep, doctorPath: path });
+    } catch {
+      // diagnosis is best-effort: the plain load error (if any) stands
+    }
+  },
+
+  async repairAndReload() {
+    const path = get().doctorPath;
+    if (!path || get().repairing || get().loading) return;
+    set({ repairing: true });
+    try {
+      // repair writes a SIBLING <stem>.repaired.urdf — the input is untouched
+      const rep = await invoke<DoctorReport>("urdf_doctor", { path, repair: true });
+      const out = rep.repair?.out;
+      if (!out) {
+        set({ error: "repair produced no output file" });
+        return;
+      }
+      await get().loadRobot(out);
+      // label the loaded robot as a repaired copy (loadRobot cleared the flag)
+      if (get().robot && !get().error) set({ repairedFrom: path });
+    } catch (e) {
+      set({ error: String(e) });
+    } finally {
+      set({ repairing: false });
     }
   },
 
@@ -1110,6 +1189,25 @@ export const useStore = create<StudioState>((set, get) => ({
       set({ datasetError: String(e) });
     }
   },
+
+  async runDataDoctor() {
+    const ds = get().dataset;
+    if (!ds || get().dataDoctorLoading) return;
+    set({ dataDoctorLoading: true, datasetError: null });
+    try {
+      const dataDoctor = await invoke<DataDoctorReport>("dataset_doctor", { path: ds.path });
+      // stale-guard: any adopt (open/refresh/edit) swapped the summary object
+      // out from under us — the report described the OLD bytes, drop it
+      if (get().dataset === ds) set({ dataDoctor });
+    } catch (e) {
+      set({ datasetError: String(e) });
+    } finally {
+      set({ dataDoctorLoading: false });
+    }
+  },
+  clearDataDoctor() {
+    set({ dataDoctor: null });
+  },
 }));
 
 /// The active playback clip: a baked sim rollout takes precedence over a motion traj.
@@ -1136,6 +1234,8 @@ function adoptDatasetSummary(
     datasetSeries: null,
     _datasetSeriesCache: {},
     _datasetReqId: get()._datasetReqId + 1,
+    // the doctor report described the pre-edit bytes — force a fresh run
+    dataDoctor: null,
   });
   if (select !== null && select >= 0 && select < summary.episodes.length) {
     void get().selectDatasetEpisode(select);

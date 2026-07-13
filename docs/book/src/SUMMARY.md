@@ -13,6 +13,7 @@
   - [Collision](./capabilities/collision.md)
   - [Control & safety](./capabilities/control-safety.md)
   - [Calibration](./capabilities/calibration.md)
+  - [Doctors & trajectory lint](./capabilities/doctors.md)
   - [Studio dataflow graph](./capabilities/studio-graph.md)
   - [Learning sidecar](./capabilities/learning.md)
 
@@ -21,5 +22,6 @@
   - [Python (maturin)](./faces/python.md)
   - [Studio (desktop app)](./faces/studio.md)
 
+- [Capability matrix](./reference/capability-matrix.md)
 - [Verification](./verification.md)
 - [License plan](./license.md)

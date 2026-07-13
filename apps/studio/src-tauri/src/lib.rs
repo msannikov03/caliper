@@ -2741,6 +2741,202 @@ fn dataset_set_tags(
     )
 }
 
+// ----- doctors (asset + dataset diagnostics; the engine checks live in
+// ----- caliper-doctor / caliper-dataset::analyze — this is pure wiring) -----
+
+/// One asset-doctor finding, webview-shaped (severity as the lowercase string
+/// the Python face also uses, so the FE never matches on enum variant names).
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DoctorFindingDto {
+    /// Stable check code, `A001`…`A014`.
+    code: String,
+    /// `"error"` | `"warn"` | `"info"`.
+    severity: String,
+    message: String,
+    fix_hint: Option<String>,
+    /// A `RepairOpts` flag fixes this mechanically (`urdf_doctor` repair=true).
+    auto_fixable: bool,
+}
+
+/// What a `repair: true` run did. The repaired copy is a SIBLING file — the
+/// input URDF is never modified; feed `out` back into `robot_info` to load it.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RepairDto {
+    /// Path of the repaired copy (`<stem>.repaired.urdf` next to the input).
+    out: String,
+    /// Human lines `"[code] target: detail"` for each applied repair.
+    applied: Vec<String>,
+    /// Requested repairs that could NOT be performed, with reasons.
+    skipped: Vec<String>,
+}
+
+/// `urdf_doctor` result: the diagnosis of the INPUT file (findings sorted
+/// most-severe-first by the engine) plus, with `repair: true`, the repair
+/// outcome and a re-diagnosis of the repaired copy.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UrdfDoctorDto {
+    findings: Vec<DoctorFindingDto>,
+    errors: usize,
+    warnings: usize,
+    infos: usize,
+    /// `None` unless `repair: true` was requested (and produced a copy).
+    repair: Option<RepairDto>,
+    /// Findings still present in the repaired copy (`None` without repair).
+    after: Option<Vec<DoctorFindingDto>>,
+}
+
+fn doctor_findings_dto(report: &caliper_doctor::DoctorReport) -> Vec<DoctorFindingDto> {
+    report
+        .findings
+        .iter()
+        .map(|f| DoctorFindingDto {
+            code: f.code.clone(),
+            severity: match f.severity {
+                caliper_doctor::Severity::Error => "error",
+                caliper_doctor::Severity::Warn => "warn",
+                caliper_doctor::Severity::Info => "info",
+            }
+            .to_string(),
+            message: f.message.clone(),
+            fix_hint: f.fix_hint.clone(),
+            auto_fixable: f.auto_fixable,
+        })
+        .collect()
+}
+
+/// Default output path for a repair: `<stem>.repaired.urdf` next to the input,
+/// so relative mesh references keep resolving (same rule as the CLI verb).
+fn repaired_out_path(input: &Path) -> PathBuf {
+    let stem = input
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("robot");
+    input.with_file_name(format!("{stem}.repaired.urdf"))
+}
+
+fn urdf_doctor_impl(path: &str, repair: bool) -> Result<UrdfDoctorDto, String> {
+    let p = Path::new(path);
+    if !ext_ok(p) {
+        return Err("only .urdf or .xacro files are supported".into());
+    }
+    let report = caliper_doctor::diagnose(p).map_err(|e| e.to_string())?;
+    let mut dto = UrdfDoctorDto {
+        findings: doctor_findings_dto(&report),
+        errors: report.errors,
+        warnings: report.warnings,
+        infos: report.infos,
+        repair: None,
+        after: None,
+    };
+    if repair {
+        // Every mechanical repair, engine defaults (density 1000 kg/m³ — see
+        // the docs' density caveat). The engine only emits the repaired TEXT
+        // and a mesh-copy PLAN; the file writes are this face's job.
+        let outcome = caliper_doctor::repair(p, &caliper_doctor::RepairOpts::all())
+            .map_err(|e| e.to_string())?;
+        let out_path = repaired_out_path(p);
+        std::fs::write(&out_path, &outcome.repaired_urdf)
+            .map_err(|e| format!("failed to write `{}`: {e}", out_path.display()))?;
+        for c in &outcome.mesh_copies {
+            std::fs::copy(&c.from, &c.to).map_err(|e| {
+                format!(
+                    "mesh copy `{}` -> `{}` failed: {e}",
+                    c.from.display(),
+                    c.to.display()
+                )
+            })?;
+        }
+        let line =
+            |a: &caliper_doctor::RepairAction| format!("[{}] {}: {}", a.code, a.target, a.detail);
+        let after = caliper_doctor::diagnose(&out_path).map_err(|e| e.to_string())?;
+        dto.repair = Some(RepairDto {
+            out: out_path.to_string_lossy().into_owned(),
+            applied: outcome.applied.iter().map(line).collect(),
+            skipped: outcome.skipped.iter().map(line).collect(),
+        });
+        dto.after = Some(doctor_findings_dto(&after));
+    }
+    Ok(dto)
+}
+
+/// Diagnose (and optionally repair) a URDF/xacro robot description via the
+/// asset doctor (stable codes A001–A014). Findings are DATA — the command only
+/// errors when the file cannot even be inspected (or a repair write fails).
+#[tauri::command]
+fn urdf_doctor(path: String, repair: bool) -> Result<UrdfDoctorDto, String> {
+    logged("urdf_doctor", urdf_doctor_impl(&path, repair))
+}
+
+/// One dataset-doctor finding. `episode`/`dof` are the machine-readable refs
+/// the Data panel uses to jump to the row concerned.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DataFindingDto {
+    /// Stable check code, `D001`…`D015`.
+    code: String,
+    /// `"error"` | `"warning"` | `"info"`.
+    severity: String,
+    feature: Option<String>,
+    episode: Option<i64>,
+    dof: Option<usize>,
+    message: String,
+    fix_hint: String,
+}
+
+/// `dataset_doctor` result: header facts + findings sorted most-severe-first
+/// (the engine's order). A healthy dataset reports zero findings.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DataDoctorDto {
+    total_episodes: usize,
+    total_frames: u64,
+    fps: u32,
+    errors: usize,
+    warnings: usize,
+    infos: usize,
+    findings: Vec<DataFindingDto>,
+}
+
+fn dataset_doctor_impl(path: &str) -> Result<DataDoctorDto, String> {
+    let root = dataset_dir(path)?;
+    let report = caliper_dataset::analyze(&root, caliper_dataset::AnalyzeOptions::default())
+        .map_err(|e| e.to_string())?;
+    let count =
+        |s: caliper_dataset::Severity| report.findings.iter().filter(|f| f.severity == s).count();
+    Ok(DataDoctorDto {
+        total_episodes: report.total_episodes,
+        total_frames: report.total_frames,
+        fps: report.fps,
+        errors: count(caliper_dataset::Severity::Error),
+        warnings: count(caliper_dataset::Severity::Warning),
+        infos: count(caliper_dataset::Severity::Info),
+        findings: report
+            .findings
+            .iter()
+            .map(|f| DataFindingDto {
+                code: f.code.clone(),
+                severity: f.severity.to_string(),
+                feature: f.feature.clone(),
+                episode: f.episode,
+                dof: f.dof,
+                message: f.message.clone(),
+                fix_hint: f.fix_hint.clone(),
+            })
+            .collect(),
+    })
+}
+
+/// Pre-training diagnostics over the open LeRobotDataset v3.0 (stable codes
+/// D001–D015): two streaming passes over every episode, so expect seconds —
+/// not milliseconds — on a large dataset. Deterministic (seeded subsampling).
+#[tauri::command]
+fn dataset_doctor(path: String) -> Result<DataDoctorDto, String> {
+    logged("dataset_doctor", dataset_doctor_impl(&path))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Panic hook FIRST — before the Builder ever runs — so even a panic during
@@ -2836,7 +3032,9 @@ pub fn run() {
             dataset_delete_episodes,
             dataset_split_episode,
             dataset_merge_episodes,
-            dataset_set_tags
+            dataset_set_tags,
+            urdf_doctor,
+            dataset_doctor
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -3392,5 +3590,178 @@ mod tests {
         assert_eq!(thumb_picks(10, 1), vec![0]);
         assert_eq!(thumb_picks(10, 0), vec![0]); // count floors at 1
         assert!(thumb_picks(0, 8).is_empty());
+    }
+
+    // ----- doctors (command wiring; the checks themselves are tested in
+    // ----- caliper-doctor / caliper-dataset — here: positive + negative
+    // ----- through the SAME impl the webview invokes) -----
+
+    /// Negative: the doctor's all-healthy fixture reports ZERO findings.
+    #[test]
+    fn urdf_doctor_clean_fixture_is_clean() {
+        let p = fixture("doctor_clean.urdf");
+        let dto = urdf_doctor_impl(p.to_str().unwrap(), false).unwrap();
+        assert!(
+            dto.findings.is_empty(),
+            "unexpected: {:?}",
+            dto.findings[0].message
+        );
+        assert_eq!((dto.errors, dto.warnings, dto.infos), (0, 0, 0));
+        assert!(dto.repair.is_none() && dto.after.is_none());
+    }
+
+    /// Positive: a load-breaking fixture surfaces Error findings (A003:
+    /// unresolvable collision mesh = a silently dropped collider), lowercase
+    /// severities on the wire, most-severe-first.
+    #[test]
+    fn urdf_doctor_surfaces_errors_on_broken_fixture() {
+        let p = fixture("doctor_mesh_missing.urdf");
+        let dto = urdf_doctor_impl(p.to_str().unwrap(), false).unwrap();
+        assert!(dto.errors > 0);
+        assert!(dto.findings.iter().any(|f| f.code == "A003"));
+        assert!(dto
+            .findings
+            .iter()
+            .all(|f| matches!(f.severity.as_str(), "error" | "warn" | "info")));
+        assert_eq!(
+            dto.findings[0].severity, "error",
+            "sorted most-severe-first"
+        );
+    }
+
+    /// The extension gate matches robot_info's (no arbitrary-file probing).
+    #[test]
+    fn urdf_doctor_rejects_non_urdf_paths() {
+        assert!(urdf_doctor_impl("/etc/passwd", false).is_err());
+    }
+
+    /// Repair round-trip through the command impl: a URDF with three
+    /// auto-fixable defects (A001 missing inertial, A007 no limits, A009
+    /// non-unit axis) yields a SIBLING repaired copy that re-diagnoses clean
+    /// and loads with full inertia; the input file is untouched. Numeric
+    /// ground truth: a 0.1 m box collider at the default density 1000 kg/m³
+    /// must come back as EXACTLY 1 kg (0.1³ · 1000).
+    #[test]
+    fn urdf_doctor_repair_produces_clean_loadable_copy() {
+        let dir = std::env::temp_dir().join(format!("studio_doctor_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let urdf = dir.join("repairme.urdf");
+        let text = r#"<?xml version="1.0"?>
+<robot name="repairme">
+  <link name="base">
+    <inertial><origin xyz="0 0 0"/><mass value="2.0"/>
+      <inertia ixx="0.02" ixy="0" ixz="0" iyy="0.02" iyz="0" izz="0.02"/></inertial>
+  </link>
+  <link name="l1">
+    <collision><origin xyz="0 0 0"/><geometry><box size="0.1 0.1 0.1"/></geometry></collision>
+  </link>
+  <joint name="j1" type="revolute">
+    <parent link="base"/><child link="l1"/>
+    <origin xyz="0 0 0.1"/><axis xyz="0 0 2"/>
+  </joint>
+</robot>
+"#;
+        std::fs::write(&urdf, text).unwrap();
+
+        let dto = urdf_doctor_impl(urdf.to_str().unwrap(), true).unwrap();
+        // the diagnosis describes the ORIGINAL file
+        assert!(dto.findings.iter().any(|f| f.code == "A001"));
+        assert!(dto.findings.iter().any(|f| f.code == "A007"));
+        assert!(dto.findings.iter().any(|f| f.code == "A009"));
+        assert!(dto.findings.iter().filter(|f| f.auto_fixable).count() >= 3);
+        let rep = dto.repair.expect("repair outcome present");
+        assert!(rep.skipped.is_empty(), "skipped: {:?}", rep.skipped);
+        assert_eq!(rep.out, repaired_out_path(&urdf).to_string_lossy());
+        // the repaired copy re-diagnoses CLEAN…
+        let after = dto.after.expect("after-repair findings present");
+        assert!(after.is_empty(), "residual: {:?}", after[0].message);
+        // …and actually compiles with real inertia of the analytic mass
+        let m = Model::from_urdf(Path::new(&rep.out)).expect("repaired copy loads");
+        assert!(m.has_inertia);
+        assert!(
+            (m.inertia[0].mass() - 1.0).abs() < 1e-9,
+            "mass {}",
+            m.inertia[0].mass()
+        );
+        // the input file was never modified
+        assert_eq!(std::fs::read_to_string(&urdf).unwrap(), text);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // dataset-doctor fixtures, crafted with the caliper-dataset writer the
+    // same way its own doctor tests do
+    fn write_dataset(tag: &str, freeze_dof: bool) -> PathBuf {
+        use caliper_dataset::{DatasetSpec, DatasetWriter, FeatureSpec};
+        let dir =
+            std::env::temp_dir().join(format!("studio_data_doctor_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let spec = DatasetSpec::new(
+            50,
+            "test_bot",
+            vec![
+                FeatureSpec::vector("observation.state", 2, Some(vec!["j1".into(), "j2".into()])),
+                FeatureSpec::vector("action", 2, None),
+            ],
+        );
+        let mut w = DatasetWriter::create(&dir, spec).unwrap();
+        // deterministic splitmix-style noise, as in the engine's doctor tests
+        let mut seed = 11u64;
+        let mut noise = move || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((seed >> 11) as f64 / (1u64 << 53) as f64) * 2.0 - 1.0
+        };
+        for (ep, len) in [38usize, 39, 40, 41, 42, 43].into_iter().enumerate() {
+            for _ in 0..len {
+                let s = [noise(), if freeze_dof { 0.25 } else { noise() }];
+                // smooth, non-echo, decorrelated action labels
+                let a = [0.6 * s[0] + 0.25 * s[1], 0.6 * s[1] - 0.25 * s[0]];
+                w.add_frame(&[("observation.state", &s), ("action", &a)])
+                    .unwrap();
+            }
+            w.save_episode(if ep % 2 == 0 { "wave" } else { "reach" })
+                .unwrap();
+        }
+        w.finalize().unwrap()
+    }
+
+    /// Negative: a healthy teleop-style dataset is a clean bill of health.
+    #[test]
+    fn dataset_doctor_clean_dataset_reports_nothing() {
+        let root = write_dataset("clean", false);
+        let dto = dataset_doctor_impl(root.to_str().unwrap()).unwrap();
+        assert_eq!(dto.total_episodes, 6);
+        assert_eq!(dto.fps, 50);
+        assert!(
+            dto.findings.is_empty(),
+            "unexpected: {}",
+            dto.findings[0].message
+        );
+        assert_eq!((dto.errors, dto.warnings, dto.infos), (0, 0, 0));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Positive: a dof frozen across the whole dataset comes back as D001
+    /// with the machine-readable feature + dof refs the Data panel jumps on.
+    #[test]
+    fn dataset_doctor_flags_frozen_dof_with_refs() {
+        let root = write_dataset("frozen", true);
+        let dto = dataset_doctor_impl(root.to_str().unwrap()).unwrap();
+        let d1 = dto
+            .findings
+            .iter()
+            .find(|f| f.code == "D001" && f.feature.as_deref() == Some("observation.state"))
+            .expect("D001 on observation.state");
+        assert_eq!(d1.dof, Some(1), "the frozen dof is j2");
+        assert_eq!(d1.severity, "warning");
+        assert!(dto.warnings > 0);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// An unreadable root is an Err (the report is never fabricated).
+    #[test]
+    fn dataset_doctor_rejects_missing_root() {
+        assert!(dataset_doctor_impl("/definitely/not/a/dataset").is_err());
     }
 }

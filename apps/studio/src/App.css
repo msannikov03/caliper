@@ -1332,3 +1332,36 @@ input[type="range"] {
   border-radius: var(--r-sm);
   padding: 2px;
 }
+
+/* ============================================================
+   10 · SEVERITY CHIPS — shared by the asset-doctor banner (Hud)
+   and the dataset-doctor panel (Data mode). Fixed-width mono
+   chips so finding rows column-align.
+   ============================================================ */
+.sev-chip {
+  flex: none;
+  display: inline-block;
+  min-width: 34px;
+  padding: 1px 5px;
+  border-radius: var(--r-sm);
+  font-family: var(--mono);
+  font-size: 9.5px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-align: center;
+}
+.sev-chip.sev-error {
+  color: var(--singular);
+  background: rgba(255, 92, 108, 0.14);
+  border: 1px solid rgba(255, 92, 108, 0.3);
+}
+.sev-chip.sev-warn {
+  color: var(--warn);
+  background: rgba(245, 183, 89, 0.12);
+  border: 1px solid rgba(245, 183, 89, 0.28);
+}
+.sev-chip.sev-info {
+  color: var(--ax-z);
+  background: rgba(110, 155, 255, 0.12);
+  border: 1px solid rgba(110, 155, 255, 0.26);
+}

@@ -16,6 +16,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { useStore } from "../store";
 import type { DatasetEpisodeSeries, DatasetSummary } from "../store";
+import { doctorSummary, findingEpisode, findingRefs, sevClass, sevLabel } from "../doctor/doctor";
 import { EpisodeChart } from "./EpisodeChart";
 import {
   addTag,
@@ -42,6 +43,59 @@ export async function openDatasetDialog(): Promise<void> {
   const st = useStore.getState();
   if (st.mode !== "data") st.setMode("data");
   await useStore.getState().openDataset(picked);
+}
+
+/** Dataset-doctor findings panel: severity-chipped rows with machine refs;
+ *  a row carrying a valid episode ref jumps the table selection to it. The
+ *  jump/ref/summary logic is pure (doctor.ts, vitest-covered). */
+function DataDoctorPanel({ ds }: { ds: DatasetSummary }) {
+  const dd = useStore((s) => s.dataDoctor);
+  const clear = useStore((s) => s.clearDataDoctor);
+  const selectEpisode = useStore((s) => s.selectDatasetEpisode);
+  if (!dd) return null;
+
+  return (
+    <div className="data-doctor">
+      <div className="dd-head">
+        <span className="eyebrow accent">Doctor</span>
+        <span className="dd-sum">{doctorSummary(dd.errors, dd.warnings, dd.infos)}</span>
+        <button className="dd-close" aria-label="dismiss doctor report" onClick={clear}>
+          ×
+        </button>
+      </div>
+      <div className="dd-list">
+        {dd.findings.length === 0 && (
+          <div className="data-empty">
+            No problems found — {dd.totalEpisodes} episodes / {dd.totalFrames} frames look
+            healthy for training.
+          </div>
+        )}
+        {dd.findings.map((f, i) => {
+          const jump = findingEpisode(f, ds.episodes.length);
+          return (
+            <button
+              key={`${f.code}-${i}`}
+              className={`dd-row${jump !== null ? " jump" : ""}`}
+              disabled={jump === null}
+              title={f.fixHint}
+              onClick={() => jump !== null && void selectEpisode(jump)}
+            >
+              <span className={`sev-chip ${sevClass(f.severity)}`}>{sevLabel(f.severity)}</span>
+              <span className="dd-code">{f.code}</span>
+              <span className="dd-msg">{f.message}</span>
+              <span className="dd-refs">
+                {findingRefs(f).map((r) => (
+                  <span className="dd-ref" key={r}>
+                    {r}
+                  </span>
+                ))}
+              </span>
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
 }
 
 function DatasetInfo({ ds }: { ds: DatasetSummary }) {
@@ -428,6 +482,8 @@ export function DataMode() {
   const series = useStore((s) => s.datasetSeries);
   const selectEpisode = useStore((s) => s.selectDatasetEpisode);
   const refreshDataset = useStore((s) => s.refreshDataset);
+  const doctorLoading = useStore((s) => s.dataDoctorLoading);
+  const runDataDoctor = useStore((s) => s.runDataDoctor);
 
   return (
     <div className="data-root">
@@ -445,10 +501,19 @@ export function DataMode() {
           >
             Refresh
           </button>
+          <button
+            className="btn ghost"
+            disabled={!ds || loading || doctorLoading}
+            title="pre-training diagnostics (streams every episode)"
+            onClick={() => void runDataDoctor()}
+          >
+            {doctorLoading ? "Doctor…" : "Doctor"}
+          </button>
         </div>
         {error && <div className="data-banner">{error}</div>}
         {ds ? (
           <>
+            <DataDoctorPanel ds={ds} />
             <DatasetInfo ds={ds} />
             <EpisodeTable ds={ds} sel={sel} onSelect={(i) => void selectEpisode(i)} />
           </>

@@ -19,6 +19,13 @@ trust map is collected in the [verification chapter](../verification.md).
 - [Control & safety](./control-safety.md) — the backend contract, the
   computed-torque control loop, the safety monitor, teleop, dataset record.
 - [Calibration](./calibration.md) — joint-offset (zero) calibration.
+- [Doctors & trajectory lint](./doctors.md) — the asset doctor
+  (`A001`–`A014`, with mechanical repair), the dataset doctor (`D001`–`D015`),
+  and the trajectory lint (`T001`–`T009`).
 - [Studio dataflow graph](./studio-graph.md) — the Phase-8 serde IR and
   deterministic executor.
 - [Learning sidecar](./learning.md) — the pure-PyTorch behavior-cloning package.
+
+For a single table of every capability against the face(s) that expose it —
+including honest gaps — see the [capability
+matrix](../reference/capability-matrix.md).

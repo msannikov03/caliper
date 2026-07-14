@@ -317,6 +317,7 @@ fn box_prop_settles_on_plane() {
             quat: None,
             mass: 0.2,
             rgba: Some([0.8, 0.2, 0.2, 1.0]),
+            material: None,
         }],
         ..Default::default()
     };
@@ -367,6 +368,7 @@ fn prop_pose_determinism() {
             quat: None,
             mass: 0.1,
             rgba: None,
+            material: None,
         }],
         ..Default::default()
     };

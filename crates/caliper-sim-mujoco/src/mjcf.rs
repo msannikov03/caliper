@@ -18,6 +18,8 @@
 //! | joint limits | `range` on each `<joint>` (radians / meters) |
 //! | primitive colliders (box/sphere/cylinder/capsule) | one `<geom>` each, always |
 //! | mesh colliders ([`CollisionShape::ConvexHull`]) | SKIPPED by default (counted in [`MjcfDocument::skipped_hull_colliders`]); with [`MjcfOptions::export_hull_meshes`] each hull becomes an inline-vertex `<asset><mesh vertex="…">` + `<geom type="mesh">` — MuJoCo convex-hulls vertex-only meshes natively |
+//! | contact materials ([`ContactMaterial`]) | opt-in `solref`/`solimp`/`friction` attributes on every emitted geom ([`MjcfOptions::default_material`], [`PropSpec::material`]); `None` = MuJoCo defaults, no attributes |
+//! | convex decomposition ([`ColliderDecomposer`]) | opt-in seam: a decomposer splits each exported hull into pieces, one `<mesh>`+`<geom>` per piece; [`NaiveDecomposer`] = identity (one piece, byte-identical output) |
 //! | visuals ([`caliper_model::VisualShape`]) | NOT exported — render meshes stay in Studio; MuJoCo sees collision geometry only |
 //! | joint `<dynamics damping>` | NOT translated (caliper does not parse it); the uniform [`MjcfOptions::joint_damping`] knob instead |
 //! | actuators | none by default (torque via `qfrc_applied`); opt-in `<position>` servos ([`Actuation::PositionServo`]) |
@@ -64,6 +66,171 @@ pub enum PropShape {
     Cylinder { r: f64, h: f64 },
 }
 
+/// A contact material: the three MuJoCo per-geom solver knobs bundled behind
+/// names, because raw `solref`/`solimp` are a dark art (stiff contacts jitter
+/// or explode, soft ones penetrate — the exact failure modes
+/// `caliper_sim_mujoco::lint` detects).
+///
+/// # MuJoCo semantics (Modeling → Solver parameters)
+/// - `solref = (timeconst, dampratio)` — the contact behaves like a virtual
+///   mass-spring-damper: `timeconst` (s) is how fast penetration is pushed
+///   out (MuJoCo requires `timeconst >= 2 * timestep` for the discretization
+///   to be stable — the linter's first suggested fix), `dampratio` `1.0` =
+///   critically damped (no bounce from the SOLVER itself; restitution still
+///   comes from the impedance profile). We use the positive
+///   `(timeconst, dampratio)` form only — MuJoCo's negative
+///   "direct stiffness/damping" form is not modeled here.
+/// - `solimp = (dmin, dmax, width)` — constraint impedance (how "hard" the
+///   contact is, in `(0, 1)`) ramps from `dmin` at zero penetration to `dmax`
+///   at penetration `width` (m). High `dmin`/`dmax` ≈ rigid (sub-mm
+///   penetration); low values + wide `width` = visible squish. MuJoCo's
+///   optional 4th/5th parameters (midpoint, power) are left at their
+///   defaults.
+/// - `friction = (slide, torsion, roll)` — tangential Coulomb coefficient
+///   (dimensionless), torsional (m) and rolling (m) coefficients.
+///
+/// When both geoms of a contact pair carry parameters, MuJoCo mixes
+/// `solref`/`solimp` by `solmix` weight (default: plain average) and takes
+/// the element-wise MAXIMUM of the two `friction` vectors — so giving BOTH
+/// sides the same preset makes the pair behave exactly as that preset.
+///
+/// # Where the preset numbers come from
+/// Baseline: MuJoCo geom defaults are `solref=(0.02, 1.0)`,
+/// `solimp=(0.9, 0.95, 0.001)`, `friction=(1.0, 0.005, 0.0001)`. Each preset
+/// moves only the knobs its physical intuition justifies (sliding-friction
+/// coefficients are standard dry-contact handbook ranges); everything is
+/// critically damped (`dampratio = 1.0`) because bounce should come from
+/// material softness, not solver ringing.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ContactMaterial {
+    /// Idealized hard contact: `solref=(0.002, 1.0)` — the stiffest timeconst
+    /// that still satisfies `timeconst >= 2h` at the default `h = 1 ms`;
+    /// `solimp=(0.95, 0.99, 0.001)` — near-unit impedance, penetration
+    /// resolved within 1 mm; `friction=(1.0, 0.005, 0.0001)` — MuJoCo's
+    /// default friction (rigidity says nothing about surface chemistry).
+    Rigid,
+    /// Compliant and grippy: `solref=(0.01, 1.0)` — 10 ms recovery, visibly
+    /// softer than Rigid but still snappy; `solimp=(0.9, 0.95, 0.001)` —
+    /// MuJoCo's default (medium-hard) impedance; `friction=(1.2, 0.01,
+    /// 0.0002)` — dry rubber slides at μ ≈ 1.0–1.5 and its contact patch
+    /// deforms, so torsional/rolling resistance doubles vs the default.
+    Rubber,
+    /// Very soft and dissipative: `solref=(0.04, 1.0)` — 40 ms recovery, the
+    /// contact yields for several frames; `solimp=(0.5, 0.8, 0.01)` — low
+    /// impedance ramping over a full centimeter = visible squish under load;
+    /// `friction=(0.8, 0.005, 0.0001)` — slightly below default slide.
+    Foam,
+    /// Hard and slick: `solref=(0.002, 1.0)` and `solimp=(0.95, 0.99, 0.001)`
+    /// as Rigid (steel IS the canonical rigid body at robot force scales);
+    /// `friction=(0.4, 0.005, 0.0001)` — dry steel-on-steel slides at
+    /// μ ≈ 0.4.
+    Steel,
+    /// Moderately hard: `solref=(0.005, 1.0)` — between Rigid and Rubber;
+    /// `solimp=(0.9, 0.95, 0.002)` — default impedance over a 2 mm ramp
+    /// (grain crush); `friction=(0.45, 0.005, 0.0001)` — dry wood-on-wood
+    /// slides at μ ≈ 0.35–0.5.
+    Wood,
+    /// Raw passthrough for the user who knows the dark art. Validated at
+    /// generation time: positive finite `solref`, `solimp` `d` values in
+    /// `(0, 1)` with `dmin <= dmax` and `width > 0`, non-negative finite
+    /// friction.
+    Custom {
+        /// `(timeconst, dampratio)` — see the enum docs.
+        solref: (f64, f64),
+        /// `(dmin, dmax, width)` — see the enum docs.
+        solimp: (f64, f64, f64),
+        /// `(slide, torsion, roll)` — see the enum docs.
+        friction: (f64, f64, f64),
+    },
+}
+
+impl ContactMaterial {
+    /// `(timeconst, dampratio)` this material emits.
+    pub fn solref(&self) -> (f64, f64) {
+        match *self {
+            Self::Rigid | Self::Steel => (0.002, 1.0),
+            Self::Rubber => (0.01, 1.0),
+            Self::Foam => (0.04, 1.0),
+            Self::Wood => (0.005, 1.0),
+            Self::Custom { solref, .. } => solref,
+        }
+    }
+
+    /// `(dmin, dmax, width)` this material emits.
+    pub fn solimp(&self) -> (f64, f64, f64) {
+        match *self {
+            Self::Rigid | Self::Steel => (0.95, 0.99, 0.001),
+            Self::Rubber => (0.9, 0.95, 0.001),
+            Self::Foam => (0.5, 0.8, 0.01),
+            Self::Wood => (0.9, 0.95, 0.002),
+            Self::Custom { solimp, .. } => solimp,
+        }
+    }
+
+    /// `(slide, torsion, roll)` this material emits.
+    pub fn friction(&self) -> (f64, f64, f64) {
+        match *self {
+            Self::Rigid => (1.0, 0.005, 0.0001),
+            Self::Foam => (0.8, 0.005, 0.0001),
+            Self::Rubber => (1.2, 0.01, 0.0002),
+            Self::Steel => (0.4, 0.005, 0.0001),
+            Self::Wood => (0.45, 0.005, 0.0001),
+            Self::Custom { friction, .. } => friction,
+        }
+    }
+
+    /// Reject a bad `Custom` BEFORE the MuJoCo compiler sees it (presets are
+    /// correct by construction). `what` names the geom/prop for the error.
+    fn validate(&self, what: &str) -> Result<(), MujocoError> {
+        let (tc, dr) = self.solref();
+        let (dmin, dmax, width) = self.solimp();
+        let (fs, ft, fr) = self.friction();
+        let bad = |msg: String| Err(MujocoError::Mjcf(format!("material on {what}: {msg}")));
+        if !(tc.is_finite() && tc > 0.0 && dr.is_finite() && dr > 0.0) {
+            return bad(format!(
+                "solref (timeconst, dampratio) must be finite and > 0, got ({tc}, {dr})"
+            ));
+        }
+        let imp_ok = |d: f64| d.is_finite() && d > 0.0 && d < 1.0;
+        if !(imp_ok(dmin) && imp_ok(dmax) && dmin <= dmax && width.is_finite() && width > 0.0) {
+            return bad(format!(
+                "solimp needs 0 < dmin <= dmax < 1 and width > 0, got ({dmin}, {dmax}, {width})"
+            ));
+        }
+        if !(fs.is_finite()
+            && fs >= 0.0
+            && ft.is_finite()
+            && ft >= 0.0
+            && fr.is_finite()
+            && fr >= 0.0)
+        {
+            return bad(format!(
+                "friction (slide, torsion, roll) must be finite and >= 0, got ({fs}, {ft}, {fr})"
+            ));
+        }
+        Ok(())
+    }
+
+    /// ` solref="…" solimp="…" friction="…"` (leading space; appended to a
+    /// `<geom>` attribute list).
+    fn geom_attrs(&self) -> String {
+        let (tc, dr) = self.solref();
+        let (dmin, dmax, width) = self.solimp();
+        let (fs, ft, fr) = self.friction();
+        format!(
+            " solref=\"{} {}\" solimp=\"{} {} {}\" friction=\"{} {} {}\"",
+            f(tc),
+            f(dr),
+            f(dmin),
+            f(dmax),
+            f(width),
+            f(fs),
+            f(ft),
+            f(fr)
+        )
+    }
+}
+
 /// A free-floating rigid body dropped into the world: one `<freejoint>`, an
 /// explicit COM `<inertial>` derived analytically from `mass` + the uniform
 /// primitive, and one collision geom. The MJCF body is named
@@ -81,6 +248,56 @@ pub struct PropSpec {
     pub mass: f64,
     /// Geom `rgba` in [0,1]; `None` leaves the MuJoCo default.
     pub rgba: Option<[f32; 4]>,
+    /// Contact material for THIS prop's geom; overrides
+    /// [`MjcfOptions::default_material`]. `None` = inherit the default
+    /// material (or MuJoCo defaults if there is none).
+    pub material: Option<ContactMaterial>,
+}
+
+/// One convex piece of a decomposed collider, in the collider's own frame
+/// (same frame as the input hull points).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ConvexPiece {
+    /// Vertices of the piece; MuJoCo convex-hulls them, so >= 4 non-coplanar
+    /// points are required (enforced at emission, exactly like plain hulls).
+    pub points: Vec<Point3<f64>>,
+}
+
+/// The convex-decomposition SEAM: split one convex-hull collider into
+/// several convex pieces so concave geometry (mugs, brackets, grippers) stops
+/// colliding as its fat convex hull.
+///
+/// This crate deliberately ships NO real decomposition algorithm — the
+/// intended future implementation is CoACD (Wei et al., SIGGRAPH 2022,
+/// `github.com/SarahWeiii/CoACD`), plugged in from a heavier crate or an FFI
+/// wrapper WITHOUT touching the generator: implement this trait, hand it to
+/// [`MjcfOptions::hull_decomposer`], and every exported hull becomes one
+/// `<mesh>` asset + `<geom>` per returned piece.
+///
+/// Contract:
+/// - MUST be deterministic (pure function of the input points) — the
+///   generator's "fixed options ⇒ fixed document" guarantee extends through
+///   this seam. Seed any internal randomness from the input, never from time.
+/// - Every returned piece needs >= 4 finite vertices, and the return must be
+///   non-empty; violations fail generation loudly.
+pub trait ColliderDecomposer: std::fmt::Debug + Send + Sync {
+    /// Decompose one collider's hull points into convex pieces.
+    fn decompose(&self, hull_points: &[Point3<f64>]) -> Vec<ConvexPiece>;
+}
+
+/// The identity decomposer: the single existing hull back, unchanged. With
+/// this (or no decomposer at all) the generated document is byte-identical to
+/// the pre-seam output — it exists so plumbing can be exercised end-to-end
+/// before a real decomposer (CoACD) lands.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct NaiveDecomposer;
+
+impl ColliderDecomposer for NaiveDecomposer {
+    fn decompose(&self, hull_points: &[Point3<f64>]) -> Vec<ConvexPiece> {
+        vec![ConvexPiece {
+            points: hull_points.to_vec(),
+        }]
+    }
 }
 
 /// Options for [`mjcf_from_model`]. `Default` = torque-driven, Earth gravity,
@@ -123,6 +340,19 @@ pub struct MjcfOptions {
     /// when ON, `skipped_hull_colliders` drops to 0. A hull with fewer than
     /// 4 vertices is rejected loudly (MuJoCo's hull needs a 3D simplex).
     pub export_hull_meshes: bool,
+    /// Contact material stamped on EVERY emitted geom that has no more
+    /// specific material: robot colliders, the ground plane, and props whose
+    /// [`PropSpec::material`] is `None`. `None` (the default) emits no
+    /// `solref`/`solimp`/`friction` attributes at all — plain MuJoCo
+    /// defaults, byte-identical to the pre-material output.
+    pub default_material: Option<ContactMaterial>,
+    /// Convex-decomposition seam, consulted ONLY for hulls actually exported
+    /// (i.e. when [`export_hull_meshes`](Self::export_hull_meshes) is on):
+    /// each hull's points are decomposed and every piece becomes its own
+    /// `<mesh>` asset + `<geom>`. `None` (the default) = one piece per hull,
+    /// exactly like [`NaiveDecomposer`]. See [`ColliderDecomposer`] for the
+    /// determinism contract and the CoACD pointer.
+    pub hull_decomposer: Option<std::sync::Arc<dyn ColliderDecomposer>>,
 }
 
 impl Default for MjcfOptions {
@@ -136,6 +366,8 @@ impl Default for MjcfOptions {
             extra_worldbody_xml: None,
             props: Vec::new(),
             export_hull_meshes: false,
+            default_material: None,
+            hull_decomposer: None,
         }
     }
 }
@@ -187,6 +419,10 @@ pub fn mjcf_from_model(m: &Model, opt: &MjcfOptions) -> Result<MjcfDocument, Muj
         )));
     }
 
+    if let Some(mat) = &opt.default_material {
+        mat.validate("MjcfOptions::default_material")?;
+    }
+
     // Props: validate everything and lock the name map BEFORE emitting a byte.
     let mut prop_bodies: Vec<(String, String)> = Vec::with_capacity(opt.props.len());
     {
@@ -212,29 +448,52 @@ pub fn mjcf_from_model(m: &Model, opt: &MjcfOptions) -> Result<MjcfDocument, Muj
     let mut body_geoms: Vec<Vec<String>> = vec![Vec::new(); m.ndof];
     let mut hull_assets: Vec<String> = Vec::new();
     let mut skipped_hull_colliders = 0usize;
+    let robot_mat = material_attrs(opt.default_material.as_ref());
     for (gi, g) in m.collision.iter().enumerate() {
         let frame = &m.frames[g.frame];
         let pose = frame.offset.compose(&g.origin);
         let name = format!("col{gi}_{}", sanitize(&frame.name));
-        let emitted = match geom_xml(&name, &pose, &g.shape) {
-            Some(x) => Some(x),
+        let mut emitted: Vec<String> = Vec::new();
+        match geom_xml(&name, &pose, &g.shape, &robot_mat) {
+            Some(x) => emitted.push(x),
             None if opt.export_hull_meshes => {
                 let CollisionShape::ConvexHull { points } = &g.shape else {
                     unreachable!("geom_xml returns None only for ConvexHull");
                 };
-                let mesh_name = format!("mesh_{name}");
-                hull_assets.push(hull_mesh_asset(&mesh_name, points)?);
-                Some(format!(
-                    "<geom name=\"{name}\" type=\"mesh\" mesh=\"{mesh_name}\" {}/>",
-                    pose_attrs(&pose)
-                ))
+                // Decomposition seam: no decomposer = one piece (the hull
+                // itself). A single piece keeps the pre-seam names, so the
+                // identity path (None / NaiveDecomposer) is byte-identical.
+                let pieces = match &opt.hull_decomposer {
+                    Some(d) => d.decompose(points),
+                    None => vec![ConvexPiece {
+                        points: points.clone(),
+                    }],
+                };
+                if pieces.is_empty() {
+                    return Err(MujocoError::Mjcf(format!(
+                        "decomposer returned no pieces for hull collider `{name}`"
+                    )));
+                }
+                let multi = pieces.len() > 1;
+                for (k, piece) in pieces.iter().enumerate() {
+                    let gname = if multi {
+                        format!("{name}_p{k}")
+                    } else {
+                        name.clone()
+                    };
+                    let mesh_name = format!("mesh_{gname}");
+                    hull_assets.push(hull_mesh_asset(&mesh_name, &piece.points)?);
+                    emitted.push(format!(
+                        "<geom name=\"{gname}\" type=\"mesh\" mesh=\"{mesh_name}\"{robot_mat} {}/>",
+                        pose_attrs(&pose)
+                    ));
+                }
             }
             None => {
                 skipped_hull_colliders += 1;
-                None
             }
-        };
-        if let Some(x) = emitted {
+        }
+        for x in emitted {
             match frame.anchor {
                 Some(j) => body_geoms[j].push(x),
                 None => world_geoms.push(x),
@@ -279,7 +538,7 @@ pub fn mjcf_from_model(m: &Model, opt: &MjcfOptions) -> Result<MjcfDocument, Muj
         }
         let _ = writeln!(
             xml,
-            "    <geom name=\"caliper_ground\" type=\"plane\" pos=\"0 0 {}\" size=\"5 5 0.1\"/>",
+            "    <geom name=\"caliper_ground\" type=\"plane\" pos=\"0 0 {}\" size=\"5 5 0.1\"{robot_mat}/>",
             f(z)
         );
     }
@@ -323,9 +582,11 @@ pub fn mjcf_from_model(m: &Model, opt: &MjcfOptions) -> Result<MjcfDocument, Muj
             .rgba
             .map(|c| format!(" rgba=\"{:?} {:?} {:?} {:?}\"", c[0], c[1], c[2], c[3]))
             .unwrap_or_default();
+        // Per-prop material wins over the document default.
+        let mat = material_attrs(p.material.as_ref().or(opt.default_material.as_ref()));
         let _ = writeln!(
             xml,
-            "      <geom name=\"{body}_geom\" {}{rgba}/>",
+            "      <geom name=\"{body}_geom\" {}{mat}{rgba}/>",
             prop_geom_attrs(&p.shape)
         );
         let _ = writeln!(xml, "    </body>");
@@ -437,7 +698,16 @@ fn validate_prop(p: &PropSpec) -> Result<(), MujocoError> {
             p.name
         )));
     }
+    if let Some(mat) = &p.material {
+        mat.validate(&format!("prop `{}`", p.name))?;
+    }
     Ok(())
+}
+
+/// ` solref=… solimp=… friction=…` for a resolved material; empty for `None`
+/// (MuJoCo defaults, no attributes — the pre-material output byte-for-byte).
+fn material_attrs(mat: Option<&ContactMaterial>) -> String {
+    mat.map(ContactMaterial::geom_attrs).unwrap_or_default()
 }
 
 /// Principal moments about the COM of a uniform-density primitive (kg·m²).
@@ -550,8 +820,9 @@ fn emit_body(
 
 /// Primitive collider → MJCF `<geom>`; `None` for `ConvexHull` — the caller
 /// either exports it as a mesh asset ([`MjcfOptions::export_hull_meshes`]) or
-/// COUNTS it as skipped, never drops it silently.
-fn geom_xml(name: &str, pose: &Se3, shape: &CollisionShape) -> Option<String> {
+/// COUNTS it as skipped, never drops it silently. `mat` is a pre-rendered
+/// [`material_attrs`] string (empty or leading-space attributes).
+fn geom_xml(name: &str, pose: &Se3, shape: &CollisionShape, mat: &str) -> Option<String> {
     let body = match shape {
         CollisionShape::Box { half } => format!(
             "type=\"box\" size=\"{} {} {}\"",
@@ -575,7 +846,7 @@ fn geom_xml(name: &str, pose: &Se3, shape: &CollisionShape) -> Option<String> {
         CollisionShape::ConvexHull { .. } => return None,
     };
     Some(format!(
-        "<geom name=\"{name}\" {body} {}/>",
+        "<geom name=\"{name}\" {body}{mat} {}/>",
         pose_attrs(pose)
     ))
 }
@@ -767,6 +1038,7 @@ mod tests {
                     quat: None,
                     mass: 0.3,
                     rgba: Some([0.8, 0.2, 0.2, 1.0]),
+                    material: None,
                 },
                 PropSpec {
                     name: "ball".into(),
@@ -775,6 +1047,7 @@ mod tests {
                     quat: Some([1.0, 0.0, 0.0, 0.0]),
                     mass: 0.1,
                     rgba: None,
+                    material: None,
                 },
                 PropSpec {
                     name: "can".into(),
@@ -783,6 +1056,7 @@ mod tests {
                     quat: None,
                     mass: 0.2,
                     rgba: None,
+                    material: None,
                 },
             ],
             ..Default::default()
@@ -835,6 +1109,7 @@ mod tests {
             quat,
             mass,
             rgba: None,
+            material: None,
         };
         let sphere = PropShape::Sphere { r: 0.05 };
         let cases: Vec<Vec<PropSpec>> = vec![
@@ -996,6 +1271,7 @@ mod tests {
                 quat: None,
                 mass: 0.1,
                 rgba: None,
+                material: None,
             }],
             ..Default::default()
         };
@@ -1043,5 +1319,361 @@ mod tests {
         ] {
             assert!(mjcf_from_model(&m, &opt).is_err(), "accepted {opt:?}");
         }
+    }
+
+    // ---- contact materials ----
+
+    /// Each preset stamps its EXACT attribute set on every emitted geom —
+    /// the numbers here are the documented derivations, spelled out so a
+    /// preset can never drift silently.
+    #[test]
+    fn material_presets_emit_exact_attributes() {
+        let m = model("collide_arm.urdf"); // 3 box colliders
+        for (mat, attrs) in [
+            (
+                ContactMaterial::Rigid,
+                " solref=\"0.002 1.0\" solimp=\"0.95 0.99 0.001\" friction=\"1.0 0.005 0.0001\"",
+            ),
+            (
+                ContactMaterial::Rubber,
+                " solref=\"0.01 1.0\" solimp=\"0.9 0.95 0.001\" friction=\"1.2 0.01 0.0002\"",
+            ),
+            (
+                ContactMaterial::Foam,
+                " solref=\"0.04 1.0\" solimp=\"0.5 0.8 0.01\" friction=\"0.8 0.005 0.0001\"",
+            ),
+            (
+                ContactMaterial::Steel,
+                " solref=\"0.002 1.0\" solimp=\"0.95 0.99 0.001\" friction=\"0.4 0.005 0.0001\"",
+            ),
+            (
+                ContactMaterial::Wood,
+                " solref=\"0.005 1.0\" solimp=\"0.9 0.95 0.002\" friction=\"0.45 0.005 0.0001\"",
+            ),
+        ] {
+            let opt = MjcfOptions {
+                ground_plane: Some(0.0),
+                default_material: Some(mat),
+                ..Default::default()
+            };
+            let doc = mjcf_from_model(&m, &opt).unwrap();
+            let x = &doc.xml;
+            // every geom (3 colliders + the ground plane) carries the full set
+            assert_eq!(
+                x.matches(attrs).count(),
+                4,
+                "{mat:?}: expected `{attrs}` on all 4 geoms in:\n{x}"
+            );
+            assert_eq!(x.matches("solref=").count(), 4, "{mat:?}");
+            // determinism: same options, same document
+            assert_eq!(mjcf_from_model(&m, &opt).unwrap().xml, doc.xml);
+        }
+    }
+
+    #[test]
+    fn custom_material_passes_through_verbatim() {
+        let m = model("collide_arm.urdf");
+        let opt = MjcfOptions {
+            default_material: Some(ContactMaterial::Custom {
+                solref: (0.025, 0.7),
+                solimp: (0.6, 0.85, 0.003),
+                friction: (0.33, 0.007, 0.00025),
+            }),
+            ..Default::default()
+        };
+        let x = mjcf_from_model(&m, &opt).unwrap().xml;
+        assert_eq!(
+            x.matches(
+                " solref=\"0.025 0.7\" solimp=\"0.6 0.85 0.003\" friction=\"0.33 0.007 0.00025\""
+            )
+            .count(),
+            3,
+            "{x}"
+        );
+    }
+
+    /// No material anywhere = MuJoCo defaults: not a single solver attribute
+    /// in the document (byte-compatible with the pre-material generator).
+    #[test]
+    fn no_material_emits_no_attributes() {
+        let m = model("collide_arm.urdf");
+        let opt = MjcfOptions {
+            ground_plane: Some(0.0),
+            ..Default::default()
+        };
+        let x = mjcf_from_model(&m, &opt).unwrap().xml;
+        for a in ["solref", "solimp", "friction"] {
+            assert!(!x.contains(a), "unexpected `{a}` in:\n{x}");
+        }
+    }
+
+    /// A prop's own material beats the document default; a prop WITHOUT one
+    /// inherits the default.
+    #[test]
+    fn prop_material_overrides_default() {
+        let m = model("dyn_pendulum2.urdf");
+        let sphere = |name: &str, material: Option<ContactMaterial>| PropSpec {
+            name: name.into(),
+            shape: PropShape::Sphere { r: 0.05 },
+            pos: [0.5, 0.0, 0.3],
+            quat: None,
+            mass: 0.1,
+            rgba: None,
+            material,
+        };
+        let opt = MjcfOptions {
+            ground_plane: Some(0.0),
+            default_material: Some(ContactMaterial::Foam),
+            props: vec![
+                sphere("soft", None),
+                sphere("hard", Some(ContactMaterial::Steel)),
+            ],
+            ..Default::default()
+        };
+        let x = mjcf_from_model(&m, &opt).unwrap().xml;
+        // `geom_named` matches the exact geom `name=`; props are emitted as
+        // `<prop>_geom`, the ground plane as the bare `caliper_ground`.
+        let geom_named = |name: &str| {
+            x.lines()
+                .find(|l| l.contains(&format!("name=\"{name}\"")) && l.contains("<geom"))
+                .unwrap_or_else(|| panic!("no geom line for {name} in:\n{x}"))
+                .to_string()
+        };
+        assert!(
+            geom_named("prop_soft_geom").contains("solref=\"0.04 1.0\""),
+            "{x}"
+        );
+        assert!(
+            geom_named("prop_hard_geom").contains("solref=\"0.002 1.0\""),
+            "{x}"
+        );
+        assert!(
+            geom_named("prop_hard_geom").contains("friction=\"0.4 0.005 0.0001\""),
+            "{x}"
+        );
+        // the ground plane inherits the default (Foam)
+        assert!(
+            geom_named("caliper_ground").contains("solimp=\"0.5 0.8 0.01\""),
+            "{x}"
+        );
+    }
+
+    #[test]
+    fn bad_custom_material_rejected() {
+        let m = model("dyn_pendulum2.urdf");
+        let with =
+            |solref: (f64, f64), solimp: (f64, f64, f64), friction: (f64, f64, f64)| MjcfOptions {
+                default_material: Some(ContactMaterial::Custom {
+                    solref,
+                    solimp,
+                    friction,
+                }),
+                ..Default::default()
+            };
+        let ok_ref = (0.02, 1.0);
+        let ok_imp = (0.9, 0.95, 0.001);
+        let ok_fric = (1.0, 0.005, 0.0001);
+        for opt in [
+            with((0.0, 1.0), ok_imp, ok_fric),           // zero timeconst
+            with((f64::NAN, 1.0), ok_imp, ok_fric),      // NaN timeconst
+            with((0.02, 0.0), ok_imp, ok_fric),          // zero dampratio
+            with(ok_ref, (0.0, 0.95, 0.001), ok_fric),   // dmin out of (0,1)
+            with(ok_ref, (0.9, 1.0, 0.001), ok_fric),    // dmax out of (0,1)
+            with(ok_ref, (0.95, 0.9, 0.001), ok_fric),   // dmin > dmax
+            with(ok_ref, (0.9, 0.95, 0.0), ok_fric),     // zero width
+            with(ok_ref, ok_imp, (-0.1, 0.005, 0.0001)), // negative slide
+            with(ok_ref, ok_imp, (1.0, f64::INFINITY, 0.0001)), // inf torsion
+        ] {
+            assert!(mjcf_from_model(&m, &opt).is_err(), "accepted {opt:?}");
+        }
+        // the same bad material on a PROP is rejected too
+        let opt = MjcfOptions {
+            props: vec![PropSpec {
+                name: "p".into(),
+                shape: PropShape::Sphere { r: 0.05 },
+                pos: [0.0, 0.0, 0.5],
+                quat: None,
+                mass: 0.1,
+                rgba: None,
+                material: Some(ContactMaterial::Custom {
+                    solref: (-0.01, 1.0),
+                    solimp: ok_imp,
+                    friction: ok_fric,
+                }),
+            }],
+            ..Default::default()
+        };
+        assert!(
+            mjcf_from_model(&m, &opt).is_err(),
+            "accepted bad prop material"
+        );
+    }
+
+    // ---- convex decomposition seam ----
+
+    /// Temp URDF whose only collider is the shared unit-cube STL → a
+    /// ConvexHull collider (8 corners at ±0.5). `tag` keeps per-test temp
+    /// files distinct.
+    fn hull_model(tag: &str) -> Model {
+        let stl = format!(
+            "{}/../../oracle/fixtures/robots/unit_cube.stl",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let urdf = format!(
+            r#"<?xml version="1.0"?>
+<robot name="hullbot">
+  <link name="base"/>
+  <link name="l1">
+    <inertial><origin xyz="0 0 0.1" rpy="0 0 0"/><mass value="0.5"/>
+      <inertia ixx="0.004" ixy="0" ixz="0" iyy="0.004" iyz="0" izz="0.001"/></inertial>
+    <collision><origin xyz="0 0 0.2" rpy="0 0 0"/>
+      <geometry><mesh filename="{stl}"/></geometry></collision>
+  </link>
+  <joint name="j1" type="revolute">
+    <parent link="base"/><child link="l1"/>
+    <origin xyz="0 0 0.1" rpy="0 0 0"/><axis xyz="0 1 0"/>
+    <limit lower="-3.14" upper="3.14" effort="10" velocity="2"/>
+  </joint>
+</robot>"#
+        );
+        let path = std::env::temp_dir().join(format!(
+            "caliper_mjcf_decomp_{tag}_{}.urdf",
+            std::process::id()
+        ));
+        std::fs::write(&path, urdf).unwrap();
+        Model::from_urdf(&path).unwrap()
+    }
+
+    /// The identity decomposer changes NOTHING: document byte-identical to a
+    /// plain hull export with no decomposer at all.
+    #[test]
+    fn naive_decomposer_is_identity() {
+        let m = hull_model("naive");
+        let plain = MjcfOptions {
+            export_hull_meshes: true,
+            ..Default::default()
+        };
+        let naive = MjcfOptions {
+            export_hull_meshes: true,
+            hull_decomposer: Some(Arc::new(NaiveDecomposer)),
+            ..Default::default()
+        };
+        let a = mjcf_from_model(&m, &plain).unwrap();
+        let b = mjcf_from_model(&m, &naive).unwrap();
+        assert_eq!(a.xml, b.xml, "NaiveDecomposer must be a byte-level no-op");
+        assert_eq!(b.skipped_hull_colliders, 0);
+        assert_eq!(b.geom_count, 1);
+    }
+
+    /// A multi-piece decomposer emits one `<mesh>` asset + one `<geom>` per
+    /// piece, with `_p{k}` suffixes; counts follow the pieces.
+    #[test]
+    fn multi_piece_decomposer_emits_per_piece() {
+        /// Splits the cube hull into its bottom and top halves (4 corners
+        /// each — passes the generator's >= 4-vertex gate; this is a
+        /// STRING-level test, MuJoCo never loads it) — a deterministic pure
+        /// function of the input, per the trait contract.
+        #[derive(Debug)]
+        struct SplitZ;
+        impl ColliderDecomposer for SplitZ {
+            fn decompose(&self, hull_points: &[Point3<f64>]) -> Vec<ConvexPiece> {
+                let (lo, hi): (Vec<_>, Vec<_>) =
+                    hull_points.iter().copied().partition(|p| p.z < 0.0);
+                vec![ConvexPiece { points: lo }, ConvexPiece { points: hi }]
+            }
+        }
+        let m = hull_model("split");
+        let opt = MjcfOptions {
+            export_hull_meshes: true,
+            hull_decomposer: Some(Arc::new(SplitZ)),
+            ..Default::default()
+        };
+        let doc = mjcf_from_model(&m, &opt).unwrap();
+        let x = &doc.xml;
+        assert_eq!(doc.skipped_hull_colliders, 0);
+        assert_eq!(doc.geom_count, 2, "{x}");
+        assert_eq!(x.matches("<mesh name=").count(), 2, "{x}");
+        assert!(
+            x.contains("<mesh name=\"mesh_col0_l1_p0\" vertex=\""),
+            "{x}"
+        );
+        assert!(
+            x.contains("<mesh name=\"mesh_col0_l1_p1\" vertex=\""),
+            "{x}"
+        );
+        assert!(
+            x.contains("<geom name=\"col0_l1_p0\" type=\"mesh\" mesh=\"mesh_col0_l1_p0\""),
+            "{x}"
+        );
+        assert!(
+            x.contains("<geom name=\"col0_l1_p1\" type=\"mesh\" mesh=\"mesh_col0_l1_p1\""),
+            "{x}"
+        );
+        // both pieces share the collider's pose
+        assert_eq!(x.matches("pos=\"0.0 0.0 0.2\"").count(), 2, "{x}");
+        // determinism through the seam: same options, same document
+        assert_eq!(mjcf_from_model(&m, &opt).unwrap().xml, doc.xml);
+        // materials stamp decomposed pieces like any other geom
+        let with_mat = MjcfOptions {
+            default_material: Some(ContactMaterial::Rubber),
+            ..opt.clone()
+        };
+        let xm = mjcf_from_model(&m, &with_mat).unwrap().xml;
+        assert_eq!(xm.matches("solref=\"0.01 1.0\"").count(), 2, "{xm}");
+    }
+
+    /// Bad decomposer output fails generation loudly: empty piece lists and
+    /// sub-simplex pieces are both rejected.
+    #[test]
+    fn bad_decomposer_output_rejected() {
+        #[derive(Debug)]
+        struct Empty;
+        impl ColliderDecomposer for Empty {
+            fn decompose(&self, _: &[Point3<f64>]) -> Vec<ConvexPiece> {
+                Vec::new()
+            }
+        }
+        #[derive(Debug)]
+        struct Degenerate;
+        impl ColliderDecomposer for Degenerate {
+            fn decompose(&self, hull_points: &[Point3<f64>]) -> Vec<ConvexPiece> {
+                vec![ConvexPiece {
+                    points: hull_points[..3].to_vec(), // 3 < 4: no 3D simplex
+                }]
+            }
+        }
+        let m = hull_model("bad");
+        for d in [
+            Arc::new(Empty) as Arc<dyn ColliderDecomposer>,
+            Arc::new(Degenerate),
+        ] {
+            let opt = MjcfOptions {
+                export_hull_meshes: true,
+                hull_decomposer: Some(d),
+                ..Default::default()
+            };
+            assert!(mjcf_from_model(&m, &opt).is_err(), "accepted bad pieces");
+        }
+    }
+
+    /// With `export_hull_meshes` OFF the decomposer is never consulted: the
+    /// hull stays skipped-and-counted exactly as before.
+    #[test]
+    fn decomposer_ignored_when_hulls_not_exported() {
+        #[derive(Debug)]
+        struct Panics;
+        impl ColliderDecomposer for Panics {
+            fn decompose(&self, _: &[Point3<f64>]) -> Vec<ConvexPiece> {
+                panic!("decomposer must not run when hulls are not exported");
+            }
+        }
+        let m = hull_model("off");
+        let opt = MjcfOptions {
+            hull_decomposer: Some(Arc::new(Panics)),
+            ..Default::default()
+        };
+        let doc = mjcf_from_model(&m, &opt).unwrap();
+        assert_eq!(doc.skipped_hull_colliders, 1);
+        assert!(!doc.xml.contains("<asset>"));
     }
 }

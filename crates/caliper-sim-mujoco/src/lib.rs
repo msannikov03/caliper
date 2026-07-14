@@ -15,6 +15,12 @@
 //!    `ControlLoop`/`SafetyMonitor`/teleop/recording stack drives a contact
 //!    sim unchanged.
 //!
+//! Plus [`lint`] — the contact STABILITY LINTER: the pure trace classifier is
+//! always compiled; the rollout entry (`lint::lint_contact_stability`) needs
+//! feature `mujoco`. Contact tuning itself lives in
+//! [`mjcf::ContactMaterial`] (named `solref`/`solimp`/`friction` presets),
+//! and the convex-decomposition seam in [`mjcf::ColliderDecomposer`].
+//!
 //! # Scope (honest)
 //! - Fixed-base articulated trees of 1-dof joints (hinge/slide) only — plus
 //!   free-floating primitive PROPS ([`mjcf::MjcfOptions::props`]): each is a
@@ -43,6 +49,7 @@
 //! (see `scripts/fetch_mujoco.sh`) before `cargo build --features mujoco`, and
 //! have `DYLD_LIBRARY_PATH`/`LD_LIBRARY_PATH` include it at run time.
 
+pub mod lint;
 pub mod mjcf;
 
 #[cfg(feature = "mujoco")]

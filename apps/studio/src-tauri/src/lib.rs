@@ -1622,6 +1622,9 @@ fn prop_spec(p: &PropDto) -> Result<caliper_sim_mujoco::mjcf::PropSpec, String> 
         quat: p.quat,
         mass: p.mass.unwrap_or(0.1),
         rgba: p.rgba,
+        // Studio props use MuJoCo's default contact params; the material-preset
+        // UI (W4 ContactMaterial) is not wired to the Studio prop editor yet.
+        material: None,
     })
 }
 

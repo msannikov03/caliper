@@ -18,7 +18,8 @@ Faces: [CLI](../faces/cli.md) · [Python](../faces/python.md) ·
 | Load URDF / xacro, summarize structure | `caliper-model` ([architecture](../architecture.md)) | `load` | `Robot.from_urdf`, `.name/.ndof/.joint_names/.joint_limits/.frame_names/.tip_frame/.has_inertia` | Open URDF… / samples / recents, ⌘O |
 | **Asset doctor** — diagnose `A001`–`A014` | [`caliper-doctor`](../capabilities/doctors.md) | `doctor` | `doctor(path)` | automatic on every load (error-banner findings) |
 | **Asset repair** — repaired copy, never in-place | [`caliper-doctor`](../capabilities/doctors.md) | `doctor --repair [--density] [--out]` | `doctor(path, repair=True, density=…)` | **Repair & reload** button |
-| MJCF (MuJoCo XML) export | [`caliper-sim-mujoco::mjcf`](../capabilities/contact-sim.md) | `mjcf` | `model_to_mjcf` | ✗ |
+| MJCF (MuJoCo XML) export (+ hull-mesh assets) | [`caliper-sim-mujoco::mjcf`](../capabilities/contact-sim.md) | `mjcf` (`--hull-meshes`) | `model_to_mjcf` | ✗ |
+| **Robot zoo** — fetch a vendored real URDF | `caliper-cli::zoo` | `fetch <name>` / `fetch --list` | ✗ | ✗ |
 
 ## Kinematics & analysis
 
@@ -53,6 +54,9 @@ Faces: [CLI](../faces/cli.md) · [Python](../faces/python.md) ·
 | RNEA / CRBA / forward dynamics / gravity | [`caliper-dynamics`](../capabilities/dynamics.md) | `dyn` | `Robot.rnea` / `crba` / `forward_dynamics` / `gravity_torque` | ✗ ¹ |
 | Passive/forced time-stepped simulation | [`caliper-dynamics::Simulator`](../capabilities/dynamics.md) | `sim` | `Simulator` (step/rollout/energy) | Simulate: gravity drop |
 | MuJoCo contact simulation (props, ground) | [`caliper-sim-mujoco`](../capabilities/contact-sim.md) | ✗ (use `mjcf` + MuJoCo) | ✗ | Simulate: contact drop / hold / drive-to (mujoco builds) |
+| **Contact material presets** (`Rigid`/`Rubber`/`Foam`/`Steel`/`Wood`/`Custom`) | [`caliper-sim-mujoco::mjcf`](./../capabilities/data-factory.md) | via `mjcf` scene | ✗ | ✗ |
+| **Contact stability linter** `C001`–`C003` | [`caliper-sim-mujoco::lint`](../capabilities/data-factory.md) | ✗ | ✗ | ✗ (engine-only, mujoco feature) |
+| Convex-decomposition seam (identity impl) | [`caliper-sim-mujoco`](../capabilities/data-factory.md) | ✗ | ✗ | ✗ |
 
 ## Collision & planning
 
@@ -87,6 +91,11 @@ Faces: [CLI](../faces/cli.md) · [Python](../faces/python.md) ·
 | **Deploy-loop latency profile** — `L001`–`L003`, honest achievable Hz | [`caliper_learn.profile`](../capabilities/verdicts.md) | ✗ ³ (`caliper-learn profile`) | `profile_rollout` | ✗ ³ |
 | **Policy deploy debugger** `P001`–`P008` | [`caliper_learn.debugger`](../capabilities/verdicts.md) | ✗ ³ (`caliper-learn debug`) | `analyze_policy` | ✗ ³ |
 | **Policy Autopsy** — D+P+E+L under one verdict | [`caliper_learn.autopsy`](../capabilities/verdicts.md) | ✗ ³ (`caliper-learn autopsy`) | `autopsy` | ✗ ³ |
+| **Domain randomization** (CI-diffable seeded draws) | [`caliper_learn.randomize`](../capabilities/data-factory.md) | ✗ | `RandomizationSpec` / `sample` / `apply_to_mjcf` / `apply_to_env` / `VecSimEnv(randomization=)` | ✗ |
+| **Coverage generator** (doctor→generator loop) | [`caliper_learn.coverage_gen`](../capabilities/data-factory.md) | ✗ ³ (`caliper-learn coverage`) | `generate_coverage` | ✗ |
+| Vectorized sim env (gym-vector semantics) | [`caliper_learn.vec_env`](../capabilities/learning.md) | ✗ | `VecSimEnv` / `reach_task` / `rollout_random` | ✗ |
+| Sim-camera collector (offscreen → image dataset) | [`caliper_learn.sim_camera`](../capabilities/learning.md) | ✗ | `SimCameraScene` / `collect_camera_dataset` | ✗ |
+| **MP4 video features** (dtype `video`, lerobot-exact) | [`caliper_learn.video`](../capabilities/data-factory.md) | ✗ | `encode_episode_video` / `VideoRecorder` / `attach_video_metadata` / `available` | ✗ |
 
 ## Dataflow graph
 
@@ -100,7 +109,9 @@ Faces: [CLI](../faces/cli.md) · [Python](../faces/python.md) ·
 
 | Capability | Engine | CLI | Python | Studio |
 |---|---|---|---|---|
-| Engine version / build info | `caliper::VERSION` | `info` | `version()` | toolbar readout |
+| Engine version / build info | `caliper::VERSION` | `info` / `--version` | `version()` / `__version__` | toolbar readout |
+| First-run guided tour | — (frontend) | ✗ | ✗ | 6-step overlay + palette "Show tour" |
+| Lightweight benchmark harness | — (scripts) | `scripts/measure_lightweight.sh` | ✗ | ✗ |
 
 ---
 

@@ -46,6 +46,22 @@ not releases); from `0.1.0` on, every release gets a proper entry.
 - Benchmark harness `scripts/measure_lightweight.sh` (+ tests) and three new
   book pages: *Lightweight, measured*, *Stability contract*, *Headless CI
   recipe*. This changelog.
+- **Robot zoo**: `caliper fetch <name>` / `--list` materializes a vendored real
+  URDF (Panda / SO-101 / SO-100 / Gen3 lite) with license attribution; each
+  entry's expected doctor-error set is documented and test-pinned.
+- **Studio first-run tour** (dismissible 6-step overlay + palette "Show tour")
+  and a *Zero to moving in 10 minutes* quickstart with commands verified
+  against the real surfaces.
+- **Data factory** (`caliper_learn`): domain randomization (`RandomizationSpec`,
+  CI-diffable seeded draws, `VecSimEnv(randomization=)`), a coverage generator
+  closing the dataset-doctor → generator loop (`caliper-learn coverage`), and
+  MP4 **video** dataset features (`caliper_learn.video`, lerobot-exact encode,
+  real round-trip).
+- **Contact materials** (`Rigid`/`Rubber`/`Foam`/`Steel`/`Wood`/`Custom`
+  presets), a contact **stability linter** (`C001`–`C003` with concrete fixes),
+  and a convex-decomposition seam (identity impl) — `caliper-sim-mujoco`.
+- Build-program audit page and Data-factory chapter; capability matrix updated
+  for the zoo, materials, randomization, coverage, and video.
 
 ### Changed
 - `caliper record` default dataset format is **v3.0** (was v2.1); the legacy

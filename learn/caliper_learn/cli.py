@@ -11,6 +11,9 @@ Subcommands (each takes `--json` for machine output; human text otherwise):
       seeded closed-loop evaluation with Wilson-95 aggregates.
 - `caliper-learn profile CKPT --urdf PATH`
       deploy-loop latency profile (honest achievable Hz).
+- `caliper-learn coverage ROOT OUT --urdf PATH`
+      the doctor→generator loop: replay ROOT + targeted planner episodes
+      into OUT, report the before/after bin-occupancy delta (D007).
 
 Exit code: 1 when any error-severity finding was reported, else 0 — so CI can
 gate on "the doctor found something red" without parsing output. Heavy deps
@@ -136,6 +139,21 @@ def _cmd_profile(args) -> int:
     return 1 if _has_error(f.severity for f in report.findings) else 0
 
 
+def _cmd_coverage(args) -> int:
+    from .coverage_gen import generate_coverage
+
+    rep = generate_coverage(
+        args.dataset_root,
+        _robot(args.urdf),
+        args.out_root,
+        episodes=args.episodes,
+        seed=args.seed,
+        bins=args.bins,
+    )
+    print(rep.to_json(indent=2) if args.json else rep.render_text())
+    return 1 if rep.error_findings_after else 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="caliper-learn",
@@ -171,6 +189,19 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--fps", type=int, default=50)
     p.add_argument("--json", action="store_true")
     p.set_defaults(fn=_cmd_profile)
+
+    p = sub.add_parser(
+        "coverage",
+        help="doctor→generator loop: fill D007 coverage holes with targeted episodes",
+    )
+    p.add_argument("dataset_root", help="input LeRobotDataset v3.0 root (never mutated)")
+    p.add_argument("out_root", help="output dataset root (input replay + new episodes)")
+    p.add_argument("--urdf", required=True, help="the dataset's robot URDF")
+    p.add_argument("-n", "--episodes", type=int, default=4, help="targeted episodes to add")
+    p.add_argument("--seed", type=int, default=0, help="base seed (episode k = seed + k)")
+    p.add_argument("--bins", type=int, default=20, help="histogram bins per dof for targeting")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=_cmd_coverage)
 
     return parser
 

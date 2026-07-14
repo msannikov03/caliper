@@ -42,6 +42,20 @@ Design notes (read before touching):
   handles scale linearly with N, and rendering is serial. Keep N small
   (2-8) for image observations; state-only scales much further.
 
+- `randomization=RandomizationSpec(...)` (see `randomize.py`) draws per-env
+  parameters at every reset, seeded from THAT env's stream (drawn before the
+  qpos jitter, so a fixed seed reproduces both). Runtime fields (gains,
+  spawn, camera) are applied in place. MODEL-level fields (mass, damping,
+  friction, gravity) break the one-shared-MjModel design above — each such
+  env gets its OWN MjModel recompiled from the randomized MJCF at every
+  reset. The honest cost: N × the model memory (the very thing the shared
+  design avoids) plus an XML parse + compile per reset (~ms for a small
+  arm). That is the price of physics randomization; state-only N stays cheap
+  because MjData is still tiny. The current draws are `info["randomization"]`
+  on every step (plain diffable dicts, index-aligned with envs). Camera
+  jitter moves the RENDER scene's camera only; mass/damping do not affect
+  rendering, so scenes are not rebuilt.
+
 - API mirrors `gymnasium.vector` semantics WITHOUT importing gymnasium:
   `reset() -> obs`, `step(actions) -> (obs, reward, terminated, truncated,
   info)`, same-step auto-reset (a done env returns its RESET observation;
@@ -58,6 +72,7 @@ from typing import Callable, Optional
 import numpy as np
 
 from .collect import _bounds
+from .randomize import RandomizationSpec, apply_to_env, apply_to_mjcf, sample
 
 # User hooks: (qpos copy, qvel copy, env index) -> reward / done.
 RewardFn = Callable[[np.ndarray, np.ndarray, int], float]
@@ -90,6 +105,7 @@ class VecSimEnv:
         max_episode_steps: int | None = None,
         timestep: float = 1e-3,
         joint_damping: float = 0.0,
+        randomization: RandomizationSpec | None = None,
     ):
         import caliper  # lazy runtime dep (built via maturin)
         import mujoco  # lazy: keep caliper_learn importable without mujoco
@@ -135,6 +151,16 @@ class VecSimEnv:
                 "(exporter emits one hinge/slide per joint; this should not happen)"
             )
         self._data = [mujoco.MjData(self.model) for _ in range(self.num_envs)]
+
+        # Domain randomization (see the module doc for the memory tradeoff):
+        # _models[i] is the shared base model until a MODEL-level draw
+        # replaces it with that env's own recompiled copy at reset.
+        self._rand = randomization
+        self._base_xml = xml
+        self._models = [self.model] * self.num_envs
+        self._draws: list[Optional[dict]] = [None] * self.num_envs
+        self._kp = np.full(self.num_envs, self.kp, dtype=np.float64)
+        self._kd = np.full(self.num_envs, self.kd, dtype=np.float64)
 
         # Per-joint sampling bounds (URDF limits; unbounded -> ±pi), midpoints.
         self._bounds = _bounds(robot)
@@ -207,17 +233,19 @@ class VecSimEnv:
 
         nv = self.model.nv
         m_dense = np.zeros((nv, nv), dtype=np.float64)
-        for i, d in enumerate(self._data):
+        for i in range(self.num_envs):
+            d, m = self._data[i], self._models[i]
             target = acts[i]
             for _ in range(self._substeps):
                 # Computed torque: unit-inertia error dynamics via the mass
                 # matrix (see the module doc — a bare PD explodes on
                 # low-inertia links). qM/qfrc_bias are valid from the
-                # preceding mj_step/mj_forward on this data.
-                a_des = self.kp * (target - d.qpos) - self.kd * d.qvel
-                mujoco.mj_fullM(self.model, m_dense, d.qM)
+                # preceding mj_step/mj_forward on this data. Gains are
+                # per-env (kp_scale/kd_scale randomization).
+                a_des = self._kp[i] * (target - d.qpos) - self._kd[i] * d.qvel
+                mujoco.mj_fullM(m, m_dense, d.qM)
                 d.qfrc_applied[:] = m_dense @ a_des + d.qfrc_bias
-                mujoco.mj_step(self.model, d)
+                mujoco.mj_step(m, d)
             self._elapsed[i] += 1
 
             qpos, qvel = d.qpos.copy(), d.qvel.copy()
@@ -237,19 +265,38 @@ class VecSimEnv:
         info: dict = {"reset_mask": reset_mask}
         if reset_mask.any():
             info["final_observation"] = final_obs
+        if self._rand is not None:
+            info["randomization"] = list(self._draws)  # index-aligned with envs
         return self._obs(), reward, terminated, truncated, info
 
     # ----- helpers ----------------------------------------------------------
 
     def _reset_env(self, i: int) -> None:
         """Seeded initial-state jitter: uniform within `init_jitter` fraction
-        of each joint's limit range around its midpoint; zero velocity."""
-        d = self._data[i]
-        self._mujoco.mj_resetData(self.model, d)
+        of each joint's limit range around its midpoint; zero velocity.
+
+        With `randomization`, the draw comes FIRST from the same per-env
+        stream (fixed order → a seed reproduces draw + jitter together);
+        MODEL-level draws recompile this env's own MjModel from the
+        randomized MJCF (the documented per-env memory cost)."""
+        if self._rand is not None:
+            draw = sample(self._rand, self._rngs[i], self.ndof)
+            self._draws[i] = draw
+            if self._rand.has_model_params():
+                model = self._mujoco.MjModel.from_xml_string(
+                    apply_to_mjcf(draw, self._base_xml)
+                )
+                assert model.nq == self.ndof  # same tree, edited params only
+                self._models[i] = model
+                self._data[i] = self._mujoco.MjData(model)
+        d, m = self._data[i], self._models[i]
+        self._mujoco.mj_resetData(m, d)
         u = self._rngs[i].uniform(-1.0, 1.0, size=self.ndof)
         d.qpos[:] = self._mid + self._init_jitter * self._half * u
         d.qvel[:] = 0.0
-        self._mujoco.mj_forward(self.model, d)  # populate qfrc_bias for the PD
+        if self._rand is not None:
+            apply_to_env(self._draws[i], self, index=i)  # gains/spawn/camera
+        self._mujoco.mj_forward(m, d)  # populate qfrc_bias for the PD
         self._elapsed[i] = 0
 
     def _obs(self) -> dict[str, np.ndarray]:
@@ -266,6 +313,15 @@ class VecSimEnv:
     def action_bounds(self) -> np.ndarray:
         """(ndof, 2) qpos-target sampling bounds (URDF limits, ±pi if unbounded)."""
         return self._bounds.copy()
+
+    @property
+    def randomization_draws(self) -> list[Optional[dict]]:
+        """Per-env current randomization draws (None entries when the env has
+        not reset yet or no spec was given) — `reset()` returns only obs, so
+        this is how a caller logs the draws it just reset into. Treat the
+        dicts as read-only; they are the same objects step() reports in
+        `info["randomization"]`."""
+        return list(self._draws)
 
     def close(self) -> None:
         if self._scenes is not None:

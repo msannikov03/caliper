@@ -19,6 +19,15 @@ W2 DIAGNOSTICS: `eval` (seeded closed-loop harness + checkpoint `sweep`),
 (dataset doctor + debugger + eval + profile merged under one verdict), and the
 `caliper-learn` console script (`cli.main`). Heavy deps (mujoco, lerobot,
 safetensors reads) stay lazy inside those modules, matching the package rule.
+
+W4 DATA ENGINE: `randomize` (seeded, diffable domain-randomization draws —
+MJCF edits for model params, in-place application for runtime params, wired
+into `VecSimEnv(randomization=...)`) and `coverage_gen` (the doctor→generator
+loop: data_doctor D007 coverage holes → targeted planner episodes → doctor
+re-run, `caliper-learn coverage`). `video` closes the last lerobot-parity
+hole: dtype-"video" camera storage (per-episode mp4s, lerobot-mirrored encode
+settings, `attach_video_metadata` post-write bridge) — `collect_camera_dataset
+(video=True)`.
 """
 
 # Version identity: single-sourced from the installed distribution's metadata
@@ -33,6 +42,7 @@ except Exception:  # graceful fallback: plain-checkout import, not pip-installed
 from .autopsy import AutopsyReport, autopsy
 from .collect import collect_demos
 from .collect_sim import collect_camera_dataset
+from .coverage_gen import CoverageReport, generate_coverage
 from .debugger import (
     ACTION_COLLAPSE,
     ACTION_SATURATION,
@@ -74,9 +84,12 @@ from .profile import (
     StageStats,
     profile_rollout,
 )
+from .randomize import RandomizationSpec, apply_to_env, apply_to_mjcf
+from .randomize import sample as sample_randomization
 from .runner import run_policy
 from .sim_camera import SimCameraScene
 from .vec_env import VecSimEnv, reach_task, rollout_random
+from .video import VideoRecorder, attach_video_metadata, encode_episode_video
 
 __all__ = [
     "collect_demos",
@@ -85,6 +98,17 @@ __all__ = [
     "VecSimEnv",
     "reach_task",
     "rollout_random",
+    # domain randomization + coverage generator
+    "RandomizationSpec",
+    "sample_randomization",
+    "apply_to_mjcf",
+    "apply_to_env",
+    "generate_coverage",
+    "CoverageReport",
+    # dtype-"video" camera storage (mp4 encode + post-write bridge)
+    "VideoRecorder",
+    "attach_video_metadata",
+    "encode_episode_video",
     "load_lerobot_policy",
     "LoadedPolicy",
     "CheckpointSecurityError",

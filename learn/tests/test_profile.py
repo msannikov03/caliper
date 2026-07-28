@@ -120,6 +120,56 @@ def test_chunk_config_beats_bimodality():
     assert report.chunk.refill.p95 > 10 * report.chunk.pop.p95
 
 
+def test_l001_fires_on_refill_p95_for_long_period_chunks():
+    """Regression: a period-25 chunked policy over 50 ticks puts at most
+    2/50 = 4% of ticks over budget — below the 5% L001 fraction — and the
+    aggregate p95 lands on a pop tick, so the frac/p95 path is arithmetically
+    BLIND to a refill that misses the 20 ms deadline 2.5x on every single
+    refill. The refill p95 must trip L001 on its own, and the achievable-Hz
+    headline must not claim headroom above the refill-limited rate (the
+    autopsy echoes exactly that 'holds with headroom' sentence)."""
+
+    class LongChunkPolicy(ChunkyPolicy):
+        n_action_steps = 25
+
+    report = profile_rollout(LongChunkPolicy(sleep_s=0.05), FakeLoop(), ticks=50, fps=50)
+    assert report.chunk is not None
+    assert report.chunk.source == "config"
+    assert report.chunk.period == 25
+    assert report.frac_over_budget <= 0.05  # the fraction gate could never fire here
+    l001 = [f for f in report.findings if f.code == BUDGET_EXCEEDED]
+    assert len(l001) == 1 and l001[0].severity == "error"
+    assert "refill" in l001[0].message and l001[0].fix_hint
+    # the honest headline: rate-limited by the refill tick, not the pop p95
+    assert report.achievable_hz <= 1.0 / report.chunk.refill.p95 + 1e-9
+    assert report.achievable_hz < 50
+
+
+def test_irregular_spikes_are_not_a_chunk_queue():
+    """Regression: aperiodic GC-like stalls used to be labeled 'chunk queue
+    (bimodal)' with a fabricated period from the diff histogram — a queue
+    claim requires spacing regularity."""
+
+    def spiky(spike_at):
+        calls = {"n": 0}
+
+        def predict(obs):
+            if calls["n"] in spike_at:
+                time.sleep(0.005)
+            calls["n"] += 1
+            return np.zeros(3, dtype=np.float32)
+
+        return predict
+
+    # three stalls, diffs 8 and 13 — no periodicity, no queue
+    report = profile_rollout(spiky({3, 11, 24}), FakeLoop(), ticks=30, fps=1000)
+    assert report.chunk is None
+    assert "chunk queue" not in report.render_text()
+    # two stalls prove nothing about periodicity either
+    report = profile_rollout(spiky({5, 17}), FakeLoop(), ticks=30, fps=1000)
+    assert report.chunk is None
+
+
 # ---- positive: L002 / L003 --------------------------------------------------
 
 

@@ -1,5 +1,8 @@
 """VecSimEnv substrate tests: shapes, determinism, auto-reset, the one example
-task (reach_task), and the image-observation smoke. CPU-only, seconds."""
+task (reach_task), the fps/timestep cadence warning, rollout_random stream
+independence, and the image-observation smoke. CPU-only, seconds."""
+
+import warnings
 
 import numpy as np
 import pytest
@@ -58,6 +61,38 @@ def test_shapes_dtypes_and_rollout(robot):
         env.step(np.zeros((3, n + 1)))
     with pytest.raises(ValueError):
         VecSimEnv(robot, 1, ctrl_mode="servo")
+
+
+def test_fps_not_dividing_timestep_warns(robot):
+    """Regression: fps=60 with timestep=1e-3 rounds to 17 substeps — a 17 ms
+    control period sold as 16.67 ms, so sim time silently drifted against
+    anything timestamped at fps (invisible to P005). Must warn loudly."""
+    with pytest.warns(UserWarning, match="effective rate"):
+        VecSimEnv(robot, 1, fps=60, timestep=1e-3)
+    # an exact divisor stays silent
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        VecSimEnv(robot, 1, fps=50, timestep=1e-3)
+
+
+def test_rollout_random_rng_does_not_alias_env_stream(robot):
+    """Regression: the action RNG was default_rng(seed) — byte-identical to
+    env 0's post-reset stream (reset(seed=seed) reseeds env i to
+    default_rng(seed + i)), so the 'random' actions were a deterministic
+    replay of the stream that also drives env 0's reset jitter and
+    randomization draws. The action seed must be offset past every env."""
+    n = robot.ndof
+    env = VecSimEnv(robot, 2, fps=50, seed=0)
+    out = rollout_random(env, 1, seed=0)
+    b = env.action_bounds()
+    # what the old aliased stream would have produced as the first action batch
+    aliased = np.random.default_rng(0).uniform(b[:, 0], b[:, 1], size=(2, n))
+    assert not np.array_equal(out["actions"][0], aliased)
+    # the offset stream is the pinned new behavior (recorded expectation)
+    expected = np.random.default_rng(0 + env.num_envs).uniform(
+        b[:, 0], b[:, 1], size=(2, n)
+    )
+    assert np.array_equal(out["actions"][0], expected)
 
 
 def test_determinism_same_seed_identical_trajectories(robot):

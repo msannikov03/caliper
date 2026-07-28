@@ -4,14 +4,20 @@
 `runner.run_policy` (obs build -> predict -> `step_with_target`) and times each
 stage per tick with `time.perf_counter_ns`. The headline is deliberately
 pessimistic: `achievable_hz = 1 / p95(per-tick total)` — the rate the loop holds
-on 95% of ticks, not the average that hides the spikes.
+on 95% of ticks, not the average that hides the spikes — floored further by the
+refill p95 for chunked policies (see below).
 
 Chunk-awareness (the spike that matters): lerobot-style `select_action` pops an
 internal action queue and only re-runs the network every `n_action_steps` ticks
 (see `hub.LoadedPolicy`), so mean inference time is a lie — the refill tick is
 the one that must fit the budget. Refill ticks are identified from the policy's
 chunk config (`n_action_steps`) when available, else detected from timing
-bimodality, and their inference p95 is reported SEPARATELY from pop-tick p95.
+bimodality (spikes must also be PERIODIC — irregular GC/scheduler stalls are
+not a queue), and their inference p95 is reported SEPARATELY from pop-tick p95.
+L001 checks the refill p95 against the budget DIRECTLY: with a period longer
+than 20 ticks, refills are under 5% of ticks, so neither the over-budget
+fraction nor the aggregate p95 can ever see them — the loop would be declared
+healthy while every refill ships late.
 
 Overhead accounting: the timing scaffold itself (four `perf_counter_ns` calls +
 list appends per tick) is measured on an empty loop before profiling and its
@@ -54,6 +60,11 @@ _L003_FLOOR_S = 1e-3
 # policy is never classified as a chunk refill).
 _BIMODAL_FACTOR = 3.0
 _BIMODAL_FLOOR_NS = 200_000
+# ... and the spikes must be PERIODIC to be called a chunk queue: at least
+# 3 spikes (2 intervals) with >= 80% of intervals equal to the modal one.
+# One or two stalls, or irregular spacing, are GC pauses — not a queue.
+_BIMODAL_MIN_INTERVALS = 2
+_BIMODAL_REGULAR_FRAC = 0.8
 
 _SEVERITY_RANK = {"error": 0, "warn": 1, "info": 2}
 
@@ -134,7 +145,10 @@ class LatencyReport:
     fps: int
     ticks: int
     budget_s: float  # 1 / fps, the per-tick deadline
-    achievable_hz: float  # 1 / p95(per-tick total) — the honest headline
+    # 1 / max(p95 per-tick total, chunk refill p95) — the honest headline: a
+    # chunked policy is rate-limited by its refill tick even when refills are
+    # too rare to move the aggregate p95.
+    achievable_hz: float
     jitter_s: float  # std of the tick period (start-to-start)
     frac_over_budget: float  # fraction of ticks whose total exceeded budget_s
     overhead_s: float  # instrumentation baseline subtracted from each total
@@ -242,7 +256,11 @@ def _detect_chunk(inference_ns: list[int], policy, warmup: int) -> ChunkStats | 
             return None  # unimodal: no chunking visible in the timings
         source = "bimodal"
         diffs = np.diff(refill_idx)
-        period = int(np.bincount(diffs).argmax()) if len(diffs) else None
+        if len(diffs) < _BIMODAL_MIN_INTERVALS:
+            return None  # one or two spikes prove nothing about periodicity
+        period = int(np.bincount(diffs).argmax())
+        if float(np.mean(diffs == period)) < _BIMODAL_REGULAR_FRAC:
+            return None  # irregular spacing: latency stalls, not a chunk queue
     refill = [inference_ns[k] for k in refill_idx]
     pop = [v for k, v in enumerate(inference_ns) if k not in set(refill_idx)]
     if not refill:
@@ -277,6 +295,30 @@ def _make_findings(report: LatencyReport) -> list[Finding]:
                     f"run the loop at <= {report.achievable_hz:.0f} Hz (and retrain/collect at "
                     "that fps — deploy cadence must match collection), or cut the dominant "
                     "stage in the table above"
+                ),
+            )
+        )
+    elif report.chunk is not None and report.chunk.refill.p95 > budget:
+        # A long chunk period keeps refills below the L001 fraction AND below
+        # the aggregate p95's reach — the refill deadline must be checked
+        # directly or the report claims headroom while every refill ships late.
+        c = report.chunk
+        cadence = f"once every {c.period} ticks" if c.period is not None else "sporadically"
+        findings.append(
+            Finding(
+                code=BUDGET_EXCEEDED,
+                severity="error",
+                message=(
+                    f"the refill tick blows the {report.fps} Hz budget: refill inference "
+                    f"p95 is {c.refill.p95 * ms:.3f} ms against {budget * ms:.3f} ms/tick "
+                    f"({c.refill.p95 / budget:.1f}x). Refills happen {cadence}, so the "
+                    "over-budget fraction and aggregate p95 cannot see them — but every "
+                    "refill tick still misses its deadline"
+                ),
+                fix_hint=(
+                    f"run the loop at <= {report.achievable_hz:.0f} Hz, or shrink/"
+                    "torch.compile the model — raising n_action_steps makes refills rarer "
+                    "but no faster; the refill tick itself must fit the budget"
                 ),
             )
         )
@@ -399,7 +441,12 @@ def profile_rollout(
     ]
     budget_s = 1.0 / fps
     budget_ns = budget_s * 1e9
+    chunk = _detect_chunk(inf_ns, policy, warmup)
     total_p95_ns = float(np.percentile(total_ns, 95))
+    if chunk is not None:
+        # A chunked policy cannot run faster than its refill tick, even when
+        # refills are too rare for the aggregate p95 to notice them.
+        total_p95_ns = max(total_p95_ns, chunk.refill.p95 * 1e9)
     achievable_hz = 1e9 / total_p95_ns if total_p95_ns > 0 else float("inf")
     periods_ns = np.diff(np.asarray(t0s, dtype=np.float64))
     jitter_s = float(np.std(periods_ns)) * 1e-9
@@ -419,7 +466,7 @@ def profile_rollout(
             "step": StageStats.from_ns(step_ns),
             "total": StageStats.from_ns(total_ns),
         },
-        chunk=_detect_chunk(inf_ns, policy, warmup),
+        chunk=chunk,
     )
     report.findings = _make_findings(report)
     return report

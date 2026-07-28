@@ -211,6 +211,32 @@ def test_env_randomization_changes_dynamics(robot):
     assert plain.randomization_draws == [None, None]
 
 
+def test_autoreset_reports_the_governing_draw(robot):
+    """Regression: at auto-reset, _reset_env overwrote the draw BEFORE the
+    info dict was built, so info["randomization"][i] reported the NEXT
+    episode's draw for a step it did not govern, and the governing draw was
+    lost. The terminal transition's draw must survive in
+    info["final_randomization"] (the final_observation analog)."""
+    spec = RandomizationSpec(kp_scale=(0.7, 1.3), kd_scale=(0.7, 1.3))
+    env = VecSimEnv(robot, 2, fps=50, seed=0, randomization=spec)
+    env.set_task(None, lambda qpos, qvel, i: True)  # terminate every step
+    env.reset(seed=0)
+    governing = env.randomization_draws  # draw A: governs the step below
+    acts = np.tile(env._mid, (2, 1))
+    _obs, _r, te, _tr, info = env.step(acts)
+    assert te.all()
+    # the draw that governed the terminal transition is preserved verbatim...
+    assert info["final_randomization"] == governing
+    # ...and info["randomization"] matches the RESET state actually returned
+    assert info["randomization"] == env.randomization_draws
+    assert info["randomization"] != governing  # fresh draws for the new episode
+    # no reset -> no final_randomization key (mirrors final_observation)
+    env.set_task(None, None)
+    _obs, _r, _te, _tr, info2 = env.step(acts)
+    assert "final_randomization" not in info2
+    assert info2["randomization"] == env.randomization_draws
+
+
 def test_env_model_rebuild_is_per_env(robot):
     env = VecSimEnv(robot, 2, fps=50, seed=0, randomization=MODEL_SPEC)
     env.reset()
@@ -301,6 +327,44 @@ def test_coverage_gen_raises_min_occupancy(robot, tmp_path):
     # report serializes deterministically (sorted keys)
     assert json.loads(rep.to_json())["out_root"] == rep.out_root
     assert "min bin occupancy" in rep.render_text()
+
+
+def _narrow_dataset(robot, out, n_episodes=2, frames=60):
+    """A dense narrow band around each joint's midpoint: it covers most of its
+    OWN observed span (doctor occupancy ~1.0) while visiting only a sliver of
+    the joint-limit range — the shape that inverted the old span-relative
+    before/after delta."""
+    b = _bounds(robot)
+    mid, half = b.mean(axis=1), 0.5 * (b[:, 1] - b[:, 0])
+    rec = caliper.RecorderV3(robot, str(out), fps=50)
+    for ep in range(n_episodes):
+        rng = np.random.default_rng(ep)
+        phase = rng.uniform(0.0, 2 * np.pi, size=robot.ndof)
+        rec.start_episode(f"narrow band episode {ep}")
+        for k in range(frames):
+            q = mid + 0.02 * half * np.sin(0.5 * k + phase)
+            q2 = mid + 0.02 * half * np.sin(0.5 * (k + 1) + phase)
+            rec.append([float(v) for v in q], [float(v) for v in q2], k / 50)
+        rec.finalize_episode()
+    return rec.close()
+
+
+def test_coverage_gen_occupancy_never_inverts_on_widening_span(robot, tmp_path):
+    """Regression: the reported occupancies were the doctor's own, binned
+    between the OBSERVED min/max of each pass — genuinely new coverage widens
+    the observed span, so this narrow-band input scored ~full occupancy
+    before and LOWER occupancy after real holes were filled (the
+    'prove-the-fix' delta inverted on a genuine improvement). Both passes
+    must bin over the fixed joint-limit span, where the delta is monotone."""
+    src = _narrow_dataset(robot, tmp_path / "band")
+    rep = generate_coverage(src, robot, str(tmp_path / "widened"), episodes=3, seed=0)
+    assert rep.episodes_added > 0
+    # a narrow band covers only a sliver of the joint-limit span (the old
+    # doctor-span number here was ~1.0)
+    assert rep.min_occupancy_before < 0.5
+    # fixed-span binning: adding data can only ever add visited bins
+    assert all(a >= b for a, b in zip(rep.occupancy_after, rep.occupancy_before))
+    assert rep.min_occupancy_after > rep.min_occupancy_before
 
 
 def test_coverage_gen_deterministic_reruns(robot, tmp_path):

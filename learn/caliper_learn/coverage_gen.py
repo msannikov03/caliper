@@ -14,15 +14,21 @@ that fill them, and prove the fix by re-running the doctor.
    frames + terminal hold) whose GOALS sit in the least-occupied histogram
    bins — the histogram is recomputed after every episode, so consecutive
    episodes chase different holes instead of piling into the first one;
-4. re-run the doctor on the merged output and report the before/after
-   occupancy delta — the closed loop, in one `CoverageReport`.
+4. re-run the doctor on the merged output for its D007 verdict, and report
+   the before/after occupancy delta over the joint-limit span — the closed
+   loop, in one `CoverageReport`.
 
-Binning for goal TARGETING uses the robot's joint limits (`collect._bounds`),
-not the observed min/max: the point is to reach where the data has never
-been, and the observed span of a hole-ridden dataset understates the
-reachable one. The REPORTED occupancy is the doctor's own (bins between
-observed min/max), because that is the number D007 fires on — the loop
-closes against the doctor's metric, not a private one.
+Binning — for goal TARGETING and for the REPORTED occupancy alike — uses the
+robot's joint limits (`collect._bounds`), not the observed min/max: the point
+is to reach where the data has never been, and the observed span of a
+hole-ridden dataset understates the reachable one. The before/after occupancy
+MUST share one fixed span: the doctor's own occupancy is relative to the
+observed min/max, which widens exactly when new coverage lands, so the
+"prove the fix" delta could invert on a genuine improvement (a dense narrow
+band scores ~1.0 before and less after real holes are filled). Over a fixed
+span, adding data can only add visited bins — the delta is monotone. The loop
+still closes against the doctor's own metric through the D007 counts, which
+remain the doctor's verdict on the input and the merged output.
 
 Scope: state/action datasets. Image features are refused up front (episode
 replay would silently drop the pixels — better loud than lossy).
@@ -48,10 +54,13 @@ _D007 = "D007"
 
 @dataclass(frozen=True)
 class CoverageReport:
-    """Before/after of one doctor→generator pass. Occupancies are the data
-    doctor's per-dof `bin_occupancy` (fraction of bins visited between the
-    observed min and max); `min_*` is the worst dof — the number that decides
-    whether D007 keeps firing."""
+    """Before/after of one doctor→generator pass. Occupancies are per-dof
+    fractions of `bins` visited over the robot's JOINT-LIMIT span — the same
+    fixed span for both passes, so the delta is monotone (the doctor's own
+    occupancy is relative to the observed min/max, which widens as holes
+    fill and can invert the delta on a genuine improvement); `min_*` is the
+    worst dof. `d007_*` remain the doctor's own verdict on input and output —
+    the number that decides whether D007 keeps firing."""
 
     out_root: str
     episodes_replayed: int
@@ -106,6 +115,11 @@ def _count_d007(report: dict) -> int:
     )
 
 
+def _hist_occupancy(hist: np.ndarray) -> list[float]:
+    """(ndof, bins) visit counts -> per-dof fraction of bins visited."""
+    return [float(np.count_nonzero(row)) / hist.shape[1] for row in hist]
+
+
 def _bin_rows(rows: np.ndarray, bounds: np.ndarray, bins: int) -> np.ndarray:
     """(T, ndof) states -> (T, ndof) int bin indices over the joint-limit span."""
     span = bounds[:, 1] - bounds[:, 0]
@@ -152,7 +166,8 @@ def generate_coverage(
 ) -> CoverageReport:
     """Fill `dataset_root`'s coverage holes: write input + `episodes` targeted
     planner episodes to a NEW LeRobotDataset v3.0 at `out_root` and report the
-    doctor's before/after occupancy (module doc has the full loop).
+    before/after occupancy over the joint-limit span plus the doctor's D007
+    verdict (module doc has the full loop).
 
     `robot` must be the dataset's robot (`ndof` is checked; goal targeting
     bins over ITS joint limits). `seed` follows the `collect_demos` scheme —
@@ -167,7 +182,7 @@ def generate_coverage(
     boxes = _DEFAULT_BOXES if boxes is None else boxes
 
     before = caliper.data_doctor(str(dataset_root))
-    occ_before = _doctor_occupancy(before)
+    _doctor_occupancy(before)  # loud error on an empty dataset (nothing to bin)
 
     rd = caliper.DatasetReaderV3.open(str(dataset_root))
     if rd.image_features:
@@ -195,6 +210,10 @@ def generate_coverage(
         rec.finalize_episode()
         for row in _bin_rows(np.asarray(states, dtype=np.float64), bounds, bins):
             hist[np.arange(ndof), row] += 1
+    # BEFORE occupancy: the input's coverage over the fixed joint-limit span
+    # (same span as after — see the module doc on why the doctor's own
+    # observed-min/max occupancy cannot be compared across the two passes).
+    occ_before = _hist_occupancy(hist)
 
     # 2) targeted episodes: goals in the emptiest bins, hist updated per
     # episode so the next one chases the next hole.
@@ -219,10 +238,10 @@ def generate_coverage(
             hist[np.arange(ndof), row] += 1
 
     root = rec.close()
+    occ_after = _hist_occupancy(hist)  # same fixed span as occ_before
 
     # 3) close the loop: the doctor's verdict on the merged dataset.
     after = caliper.data_doctor(root)
-    occ_after = _doctor_occupancy(after)
     return CoverageReport(
         out_root=root,
         episodes_replayed=rd.total_episodes,

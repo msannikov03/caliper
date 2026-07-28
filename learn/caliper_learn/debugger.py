@@ -13,7 +13,9 @@ pattern — every finding carries `message`, `fix_hint`, and machine fields):
 - P002 per-dof collapse      a dof the DATA moves but the policy never does
                              (needs `dataset_root`).
 - P003 saturation            actions pinned at / beyond the joint limits — the
-                             SafetyMonitor will clamp every tick (needs `robot`).
+                             SafetyMonitor will clamp every tick (needs `robot`;
+                             limitless joints are exempt — the monitor never
+                             clamps them, so there is nothing to saturate).
 - P004 normalization mismatch  the processor's train-time stats disagree with
                              stats recomputed from the dataset — the killer:
                              predictions are silently scaled/shifted garbage
@@ -301,7 +303,9 @@ def _check_normalization(cfg, pre_stats, post_stats, ds: _DatasetView) -> list[P
     s_mean, s_std = ds.states.mean(axis=0), ds.states.std(axis=0)
     a_mean, a_std = ds.actions.mean(axis=0), ds.actions.std(axis=0)
     targets = [(name, pre_stats.get(name), s_mean, s_std) for name in cfg.state_feature_names]
-    targets.append(("action", (post_stats or pre_stats).get("action"), a_mean, a_std))
+    # Fall back per-KEY, not per-dict: a postprocessor that exists but carries
+    # no 'action' stats must not silently skip the action comparison.
+    targets.append(("action", post_stats.get("action") or pre_stats.get("action"), a_mean, a_std))
 
     for feature, proc, d_mean, d_std in targets:
         if not proc or "mean" not in proc or "std" not in proc:
@@ -459,9 +463,16 @@ def _behavioral_checks(policy, ds, robot, pre_stats, post_stats) -> list[PolicyF
         from .collect import _bounds  # URDF limits, ±pi when unbounded
 
         bounds = _bounds(robot)
+        limits = list(robot.joint_limits)
         if bounds.shape[0] == actions.shape[1]:
             outside = (actions < bounds[:, 0]) | (actions > bounds[:, 1])
             for j in range(actions.shape[1]):
+                if limits[j] is None:
+                    # Limitless joint: the ±pi bounds above are fabricated for
+                    # sampling only, and the SafetyMonitor skips position
+                    # clamping for limitless joints — "clamped every tick"
+                    # would be a false diagnosis.
+                    continue
                 frac = float(outside[:, j].mean())
                 if frac > _SATURATION_FRAC:
                     findings.append(

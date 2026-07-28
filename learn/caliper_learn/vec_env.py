@@ -52,7 +52,9 @@ Design notes (read before touching):
   design avoids) plus an XML parse + compile per reset (~ms for a small
   arm). That is the price of physics randomization; state-only N stays cheap
   because MjData is still tiny. The current draws are `info["randomization"]`
-  on every step (plain diffable dicts, index-aligned with envs). Camera
+  on every step (plain diffable dicts, index-aligned with envs; an auto-reset
+  env's terminal-transition draw moves to `info["final_randomization"][i]`,
+  mirroring `final_observation`). Camera
   jitter moves the RENDER scene's camera only; mass/damping do not affect
   rendering, so scenes are not rebuilt.
 
@@ -67,6 +69,8 @@ package: `import caliper_learn` stays cheap.
 
 from __future__ import annotations
 
+import math
+import warnings
 from typing import Callable, Optional
 
 import numpy as np
@@ -127,6 +131,18 @@ class VecSimEnv:
             raise ValueError(
                 f"fps={fps} finer than the physics timestep={timestep} "
                 "(need 1/(fps*timestep) >= 1)"
+            )
+        if not math.isclose(substeps * fps * timestep, 1.0, rel_tol=1e-6):
+            eff_fps = 1.0 / (substeps * timestep)
+            warnings.warn(
+                f"fps={fps} does not divide the physics timestep={timestep}: each "
+                f"control step runs {substeps} substeps = "
+                f"{substeps * timestep * 1e3:.3f} ms, an effective rate of "
+                f"{eff_fps:.2f} Hz. Anything timestamped at {fps} Hz (recorded "
+                f"datasets, deploy cadence) silently drifts "
+                f"{abs(1.0 / fps - substeps * timestep) * 1e3:.3f} ms per tick — "
+                "pick fps and timestep so that 1/(fps*timestep) is an integer",
+                stacklevel=2,
             )
 
         self._mujoco = mujoco
@@ -216,7 +232,11 @@ class VecSimEnv:
         truncated (N,) bool, info)`. Done envs auto-reset same-step: `obs`
         holds their fresh reset observation and
         `info["final_observation"][i]` the terminal state vector
-        (`info["reset_mask"]` flags which envs reset)."""
+        (`info["reset_mask"]` flags which envs reset). With randomization,
+        `info["randomization"]` is index-aligned with the RETURNED obs (a
+        reset env's entry is its fresh draw); the draw that governed a reset
+        env's terminal transition is preserved in
+        `info["final_randomization"][i]` (the final_observation analog)."""
         acts = np.asarray(actions, dtype=np.float64)
         if acts.shape != (self.num_envs, self.ndof):
             raise ValueError(
@@ -230,6 +250,7 @@ class VecSimEnv:
         terminated = np.zeros(self.num_envs, dtype=bool)
         truncated = np.zeros(self.num_envs, dtype=bool)
         final_obs: list[Optional[np.ndarray]] = [None] * self.num_envs
+        final_rand: list[Optional[dict]] = [None] * self.num_envs
 
         nv = self.model.nv
         m_dense = np.zeros((nv, nv), dtype=np.float64)
@@ -259,12 +280,18 @@ class VecSimEnv:
                 )
             if terminated[i] or truncated[i]:
                 final_obs[i] = np.concatenate([qpos, qvel]).astype(np.float32)
+                # Capture the draw that governed THIS step before _reset_env
+                # overwrites it with the next episode's draw (the
+                # final_observation analog — otherwise it is lost).
+                final_rand[i] = self._draws[i]
                 self._reset_env(i)  # same-step auto-reset (gym.vector semantics)
 
         reset_mask = terminated | truncated
         info: dict = {"reset_mask": reset_mask}
         if reset_mask.any():
             info["final_observation"] = final_obs
+            if self._rand is not None:
+                info["final_randomization"] = final_rand
         if self._rand is not None:
             info["randomization"] = list(self._draws)  # index-aligned with envs
         return self._obs(), reward, terminated, truncated, info
@@ -363,7 +390,11 @@ def rollout_random(env: VecSimEnv, steps: int, *, seed: int = 0) -> dict[str, np
     `{"states": (steps, N, 2*ndof) f32, "actions": (steps, N, ndof) f64,
     "rewards": (steps, N) f64, "terminated"/"truncated": (steps, N) bool}`
     plus `"images": (steps, N, H, W, 3) u8` when the env renders images."""
-    rng = np.random.default_rng(seed)
+    # Offset past the env streams: reset(seed=seed) reseeds env i to
+    # default_rng(seed + i), so default_rng(seed) would be byte-identical to
+    # env 0's stream — the "random" actions would deterministically replay
+    # env 0's reset-jitter/randomization draws.
+    rng = np.random.default_rng(seed + env.num_envs)
     b = env.action_bounds()
     env.reset(seed=seed)
     states, actions, rewards, terms, truncs, images = [], [], [], [], [], []

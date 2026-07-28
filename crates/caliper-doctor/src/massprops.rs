@@ -5,13 +5,21 @@
 //!
 //! - Triangle meshes: the Mirtich/Eberly DIVERGENCE-THEOREM integrals
 //!   ([`mesh_props`]) — each triangle contributes a signed tetrahedron against
-//!   the origin, so volume, COM, and the full inertia tensor (off-diagonals
-//!   included) come out of one pass over the faces. Requires a CLOSED,
-//!   consistently wound mesh; a globally reversed winding is detected (negative
-//!   volume) and flipped, but an open or mixed-winding mesh integrates to a
-//!   near-zero volume and is REFUSED (`None`) rather than silently writing a
-//!   garbage inertial. (The repo's own `unit_cube.stl` hull fixture is exactly
-//!   such a cloud — see the refusal test.)
+//!   the vertex-cloud centroid (integrating about the centroid keeps the
+//!   near-zero-volume refusal threshold relative to the MESH's own scale, so a
+//!   small closed part authored far from its link origin is not refused), and
+//!   volume, COM, and the full inertia tensor (off-diagonals included) come
+//!   out of one pass over the faces. Requires a CLOSED, consistently wound
+//!   mesh, enforced STRUCTURALLY by a directed-edge pairing check (every
+//!   shared edge must be traversed once in each direction): a partially
+//!   miswound mesh can keep a plausible signed volume — one flipped z-face
+//!   triangle leaves the x-projected volume integral untouched while
+//!   corrupting COM.z — so a volume test alone is not enough. A globally
+//!   reversed winding pairs consistently and is detected (negative volume)
+//!   and flipped; an open or mixed-winding mesh is REFUSED (`None`) rather
+//!   than silently writing a garbage inertial. (The repo's own
+//!   `unit_cube.stl` hull fixture is exactly such a cloud — see the refusal
+//!   test.)
 //! - Primitives (box/sphere/cylinder/capsule): closed-form reference formulas,
 //!   the capsule composed as cylinder + two hemispheres via parallel axis.
 //!
@@ -78,23 +86,69 @@ fn subexpr(w0: f64, w1: f64, w2: f64) -> (f64, f64, f64, f64, f64, f64) {
     (f1, f2, f3, g0, g1, g2)
 }
 
+/// Bit-exact vertex key for edge pairing; `-0.0` folds onto `0.0` so equal
+/// coordinates always match. STL repeats each shared vertex's exact bytes per
+/// facet, so bitwise identity is the right equality for well-formed exports
+/// (a mesh whose shared vertices drift is refused — conservatively, like any
+/// other mesh the integrals cannot trust).
+type VKey = [u64; 3];
+
+fn vkey(p: &Point3<f64>) -> VKey {
+    let b = |x: f64| {
+        if x == 0.0 {
+            0.0f64.to_bits()
+        } else {
+            x.to_bits()
+        }
+    };
+    [b(p.x), b(p.y), b(p.z)]
+}
+
 /// Mass properties of a triangle soup (`tris.len() % 3 == 0`, three vertices
 /// per face, the layout `caliper_model::stl::parse_stl` produces). `None` when
 /// the soup cannot be a closed solid: fewer than 4 faces, non-finite vertices,
-/// or a |signed volume| indistinguishable from zero (open or inconsistently
-/// wound mesh) — see the module docs.
+/// a directed edge without its reverse partner (open or PARTIALLY miswound
+/// mesh — the case a volume test alone misses), or a |signed volume|
+/// indistinguishable from zero — see the module docs.
 pub fn mesh_props(tris: &[Point3<f64>]) -> Option<MassProps> {
     if tris.len() < 12 || !tris.len().is_multiple_of(3) {
         return None;
     }
-    let mut scale: f64 = 0.0;
-    let mut intg = [0.0f64; 10];
+    // pass 1: finiteness, vertex-cloud centroid (the integration origin), and
+    // the directed-edge pairing check. Net flow per undirected edge must be 0:
+    // a closed consistently wound mesh (either global orientation) traverses
+    // every shared edge once in each direction.
+    let mut mean = Vector3::zeros();
+    let mut edges: std::collections::HashMap<(VKey, VKey), i64> = std::collections::HashMap::new();
     for t in tris.chunks_exact(3) {
-        let (p0, p1, p2) = (t[0], t[1], t[2]);
-        for p in [&p0, &p1, &p2] {
+        for p in t {
             if !(p.x.is_finite() && p.y.is_finite() && p.z.is_finite()) {
                 return None;
             }
+            mean += p.coords;
+        }
+        for (a, b) in [(&t[0], &t[1]), (&t[1], &t[2]), (&t[2], &t[0])] {
+            let (ka, kb) = (vkey(a), vkey(b));
+            if ka == kb {
+                continue; // zero-length edge of a degenerate sliver
+            }
+            if ka < kb {
+                *edges.entry((ka, kb)).or_default() += 1;
+            } else {
+                *edges.entry((kb, ka)).or_default() -= 1;
+            }
+        }
+    }
+    if edges.values().any(|&c| c != 0) {
+        return None;
+    }
+    let mean = mean / tris.len() as f64;
+    // pass 2: the integrals, about the centroid
+    let mut scale: f64 = 0.0;
+    let mut intg = [0.0f64; 10];
+    for t in tris.chunks_exact(3) {
+        let (p0, p1, p2) = (t[0] - mean, t[1] - mean, t[2] - mean);
+        for p in [&p0, &p1, &p2] {
             scale = scale.max(p.coords.amax());
         }
         let d = (p1 - p0).cross(&(p2 - p0));
@@ -138,6 +192,8 @@ pub fn mesh_props(tris: &[Point3<f64>]) -> Option<MassProps> {
     if !vol.is_finite() || vol <= 1e-12 * scale.powi(3).max(f64::MIN_POSITIVE) {
         return None;
     }
+    // COM relative to the centroid; the tensor about the COM is
+    // translation-invariant, so only the returned COM needs the shift back
     let com = Vector3::new(intg[1], intg[2], intg[3]) / vol;
     let m = vol; // unit density
     let ixx = intg[5] + intg[6] - m * (com.y * com.y + com.z * com.z);
@@ -148,7 +204,7 @@ pub fn mesh_props(tris: &[Point3<f64>]) -> Option<MassProps> {
     let ixz = -(intg[9] - m * com.z * com.x);
     Some(MassProps {
         volume: vol,
-        com,
+        com: com + mean,
         inertia_com: Matrix3::new(ixx, ixy, ixz, ixy, iyy, iyz, ixz, iyz, izz),
     })
 }
@@ -313,9 +369,13 @@ pub mod testmesh {
         let ct = Point3::new(0.0, 0.0, l / 2.0);
         let cb = Point3::new(0.0, 0.0, -l / 2.0);
         for k in 0..n {
+            // Modular index for the seam: vertex n must be computed as vertex 0
+            // (bit-identical), not as 2π·n/n whose sin is ~-2.4e-16 — the
+            // directed-edge pairing check keys on exact bits, and a bitwise-open
+            // seam is (correctly) refused.
             let (a0, a1) = (
                 2.0 * std::f64::consts::PI * k as f64 / n as f64,
-                2.0 * std::f64::consts::PI * (k + 1) as f64 / n as f64,
+                2.0 * std::f64::consts::PI * (((k + 1) % n) as f64) / n as f64,
             );
             let b0 = Point3::new(r * a0.cos(), r * a0.sin(), -l / 2.0);
             let b1 = Point3::new(r * a1.cos(), r * a1.sin(), -l / 2.0);
@@ -439,6 +499,42 @@ mod tests {
         assert!(mesh_props(&quad).is_none(), "open surface has no volume");
         let cube = cube_tris(0.5, Vector3::zeros());
         assert!(mesh_props(&cube[..35]).is_none(), "len % 3 != 0");
+    }
+
+    /// Regression (#4, 2026-07-28 audit): a SINGLE flipped triangle on a z
+    /// face is invisible to the volume-only guard — a z-face triangle's face
+    /// normal has no x component, so the x-projected volume integral (intg[0])
+    /// is untouched and the signed volume stays exactly 1.0 while COM.z is
+    /// corrupted. The directed-edge pairing check must refuse the mesh.
+    #[test]
+    fn single_flipped_face_is_refused_by_edge_pairing() {
+        let mut tris = cube_tris(0.5, Vector3::zeros());
+        let flipped = (0..tris.len() / 3)
+            .find(|&i| tris[3 * i..3 * i + 3].iter().all(|p| p.z == 0.5))
+            .expect("a +z-face triangle");
+        tris.swap(3 * flipped + 1, 3 * flipped + 2);
+        assert!(
+            mesh_props(&tris).is_none(),
+            "partially miswound mesh must be refused, not integrated"
+        );
+    }
+
+    /// Regression (#29, 2026-07-28 audit): the refusal threshold used to be
+    /// relative to the mesh's distance from the ORIGIN (`scale` = max |coord|),
+    /// so a 1 cm closed cube authored 150 m out was refused
+    /// (1e-12 · 150³ ≈ 3.4e-6 > its 1e-6 m³ volume). Integrating about the
+    /// vertex centroid makes the threshold relative to the mesh itself.
+    #[test]
+    fn far_from_origin_small_mesh_is_integrated_not_refused() {
+        let off = Vector3::new(150.0, 0.0, 0.0);
+        let p = mesh_props(&cube_tris(0.005, off)).expect("closed cube must integrate");
+        let a = box_props(Vector3::new(0.005, 0.005, 0.005));
+        assert!(rel(p.volume, a.volume) < 1e-9, "vol {}", p.volume);
+        assert!((p.com - off).norm() < 1e-9, "com {:?}", p.com);
+        assert!(
+            (p.inertia_com - a.inertia_com).norm() < 1e-9 * a.inertia_com.norm(),
+            "COM tensor matches the analytic 1 cm cube"
+        );
     }
 
     #[test]

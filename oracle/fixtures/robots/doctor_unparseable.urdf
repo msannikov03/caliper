@@ -1,0 +1,32 @@
+<?xml version="1.0"?>
+<!-- A016 positive (regression, 2026-07-28 audit #14): j1's limit has
+     lower="abc" — with the old unwrap_or(0.0) it read as 0 < 2, so this
+     urdf-rs-REJECTED file diagnosed completely CLEAN and repair claimed
+     success while leaving the unparseable float in the copy. j2's origin xyz
+     has a non-numeric component (the doctor used to silently read the
+     identity).
+     Expected diagnose: A016 x2 (Error; the j1 range one auto-fixable) +
+     A007 (j1's range is unusable, auto-fixable). -->
+<robot name="doctor_unparseable">
+  <link name="base">
+    <inertial><origin xyz="0 0 0"/><mass value="1.0"/>
+      <inertia ixx="0.01" ixy="0" ixz="0" iyy="0.01" iyz="0" izz="0.01"/></inertial>
+  </link>
+  <link name="l1">
+    <inertial><origin xyz="0 0 0"/><mass value="0.5"/>
+      <inertia ixx="0.005" ixy="0" ixz="0" iyy="0.005" iyz="0" izz="0.005"/></inertial>
+  </link>
+  <link name="l2">
+    <inertial><origin xyz="0 0 0"/><mass value="0.5"/>
+      <inertia ixx="0.005" ixy="0" ixz="0" iyy="0.005" iyz="0" izz="0.005"/></inertial>
+  </link>
+
+  <joint name="j1" type="revolute">
+    <parent link="base"/><child link="l1"/><origin xyz="0 0 0.1"/><axis xyz="0 0 1"/>
+    <limit lower="abc" upper="2" effort="1" velocity="1"/>
+  </joint>
+  <joint name="j2" type="revolute">
+    <parent link="l1"/><child link="l2"/><origin xyz="0 0 zz"/><axis xyz="0 1 0"/>
+    <limit lower="-1" upper="1" effort="1" velocity="1"/>
+  </joint>
+</robot>

@@ -20,18 +20,20 @@
 //! |---|---|---|---|
 //! | A001 | Error | missing/zero `<inertial>` on a non-root link | `compute_inertials` (divergence-theorem mesh integrals / analytic primitives × density) |
 //! | A002 | Error | implausible inertia: non-finite, zero tensor with mass, negative principal moment, or triangle-inequality violation (checked on EIGENVALUES, so converter-dropped off-diagonals are caught) | — |
-//! | A003 | Error/Warn | mesh unresolvable (says which paths were tried) or unloadable — Error on `<collision>` (collider silently dropped), Warn on `<visual>` | — |
+//! | A003 | Error/Warn | mesh unresolvable (says which paths were tried), unloadable, or degenerate under the model's own hull test (collider silently dropped) — Error on `<collision>`, Warn on `<visual>` | — |
 //! | A004 | Warn | duplicate mesh basenames pointing at DIFFERENT files | `dedupe_mesh_basenames` (rename + copy plan) |
 //! | A005 | Warn | link has `<visual>` but no `<collision>` (uncheckable) | — |
 //! | A006 | Info | collision mesh above the 1024-vertex hull cap (subsampled) | — |
 //! | A007 | Warn | revolute joint without usable position limits | `inject_limits` (±π, marked conservative) |
 //! | A008 | Error | zero-length / unparseable joint axis | — |
 //! | A009 | Warn | non-unit joint axis | `normalize_axes` |
-//! | A010 | Info | `[heuristic]` zero-mass root link — onshape-to-robot signature | — |
+//! | A010 | Info | `[heuristic]` zero-mass root link while other links carry mass, now OR after `compute_inertials` (so repairing never SURFACES it) — onshape-to-robot signature | — |
 //! | A011 | Error | mimic references an unknown joint | — |
 //! | A012 | Error | mimic chain (incl. self-mimic) | — |
 //! | A013 | Error/Warn | xacro leftovers in a `.urdf` (Warn when `xmlns:xacro` is declared and expansion succeeds) | — |
 //! | A014 | Error | `<limit>` missing `velocity=` (urdf-rs rejects the whole file; `effort=` safely defaults to 0) | `inject_limits` |
+//! | A015 | Error | duplicate link/joint names — every by-name reference binds ambiguously | — |
+//! | A016 | Error | numeric attribute present but unparseable (`<limit>` floats, `<origin>` xyz/rpy) — urdf-rs rejects the whole file while the doctor would otherwise silently read a default | `inject_limits` (revolute `lower=`/`upper=` only) |
 
 use std::path::{Path, PathBuf};
 
@@ -60,6 +62,8 @@ pub mod codes {
     pub const MIMIC_CHAIN: &str = "A012";
     pub const XACRO_LEFTOVERS: &str = "A013";
     pub const LIMIT_MISSING_ATTRS: &str = "A014";
+    pub const DUPLICATE_NAME: &str = "A015";
+    pub const UNPARSEABLE_NUMBER: &str = "A016";
 }
 
 /// Finding severity: how broken things are if the finding is ignored.

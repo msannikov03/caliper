@@ -1,0 +1,29 @@
+<?xml version="1.0"?>
+<!-- A015 positive: TWO links named `arm` (different geometry) and TWO joints
+     named `j` — every by-name reference binds ambiguously. Repair must target
+     links POSITIONALLY so each `arm` gets the inertial computed from its OWN
+     geometry (regression, 2026-07-28 audit #15: the by-name phase 2 applied
+     both plans to the FIRST `arm` — it ended up with the second's numbers and
+     the second stayed massless).
+     Expected diagnose: A015 x2 (Error) + A001 x2 (the massless arms). -->
+<robot name="doctor_dup_names">
+  <link name="base">
+    <inertial><origin xyz="0 0 0"/><mass value="2.0"/>
+      <inertia ixx="0.02" ixy="0" ixz="0" iyy="0.02" iyz="0" izz="0.02"/></inertial>
+  </link>
+  <link name="arm">
+    <collision><geometry><box size="1 1 1"/></geometry></collision>
+  </link>
+  <link name="arm">
+    <collision><geometry><box size="0.1 0.1 0.1"/></geometry></collision>
+  </link>
+
+  <joint name="j" type="revolute">
+    <parent link="base"/><child link="arm"/><origin xyz="0 0 0.1"/><axis xyz="0 0 1"/>
+    <limit lower="-1" upper="1" effort="1" velocity="1"/>
+  </joint>
+  <joint name="j" type="revolute">
+    <parent link="base"/><child link="arm"/><origin xyz="0 0 0.2"/><axis xyz="0 1 0"/>
+    <limit lower="-1" upper="1" effort="1" velocity="1"/>
+  </joint>
+</robot>

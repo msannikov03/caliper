@@ -5,12 +5,16 @@
 //! the doctor must read files that urdf-rs REJECTS outright (a `<limit>`
 //! without `velocity=`, xacro leftovers, negative masses, …) — a lenient DOM
 //! is the whole point of the crate. Supported: elements, attributes (either
-//! quote style), text, comments (preserved), the XML declaration and
-//! processing instructions (skipped). Rejected loudly: DOCTYPE and CDATA,
-//! exactly like the xacro expander.
+//! quote style; a repeated attribute keeps its FIRST value, matching lookup
+//! order — re-emitting both would produce a file no strict parser accepts),
+//! text, comments (preserved verbatim), the XML declaration and processing
+//! instructions (skipped). Rejected loudly: DOCTYPE and CDATA, exactly like
+//! the xacro expander.
 //!
 //! The writer re-emits a normalized 2-space-indented document. Comments are
-//! kept; insignificant whitespace is not. It is used to produce repaired
+//! kept verbatim (except that `--` inside one gains a space and a trailing
+//! `-` a padding space — XML forbids them, and the repaired copy must stay
+//! loadable); insignificant whitespace is not. It is used to produce repaired
 //! COPIES only — an input file is never overwritten.
 
 /// Parse/shape error, positioned by byte offset into the input.
@@ -182,7 +186,11 @@ impl<'a> Parser<'a> {
             } else {
                 return Err(self.err(format!("attribute `{key}`: expected a quoted value")));
             };
-            attrs.push((key, unescape(raw)));
+            // a repeated attribute keeps its FIRST value (matches `attr()`
+            // lookup); re-emitting both would break every strict parser
+            if !attrs.iter().any(|(k, _)| *k == key) {
+                attrs.push((key, unescape(raw)));
+            }
         }
         let mut children = Vec::new();
         loop {
@@ -203,7 +211,7 @@ impl<'a> Parser<'a> {
             }
             if self.eat("<!--") {
                 let c = self.until("-->")?;
-                children.push(Node::Comment(c.trim().to_string()));
+                children.push(Node::Comment(c.to_string()));
                 continue;
             }
             if self.rest().starts_with("<![") {
@@ -286,6 +294,11 @@ fn unescape(s: &str) -> String {
         if let Some((tok, ch)) = KNOWN.iter().find(|(t, _)| rest.starts_with(t)) {
             out.push(*ch);
             rest = &rest[tok.len()..];
+        } else if let Some((ch, len)) = numeric_ref(rest) {
+            // decode &#NN; / &#xHH; here, or the writer re-escapes the `&`
+            // into `&amp;#NN;` — a silent identifier rename in every copy
+            out.push(ch);
+            rest = &rest[len..];
         } else {
             // unknown entity: kept verbatim — the doctor is lenient by design
             out.push('&');
@@ -294,6 +307,20 @@ fn unescape(s: &str) -> String {
     }
     out.push_str(rest);
     out
+}
+
+/// A numeric character reference (`&#45;` / `&#x2F;`) at the start of `rest`:
+/// the decoded char and the reference's byte length. `None` when it is not a
+/// valid reference (kept verbatim by the lenient path instead).
+fn numeric_ref(rest: &str) -> Option<(char, usize)> {
+    let body = rest.strip_prefix("&#")?;
+    let end = body.find(';')?;
+    let digits = &body[..end];
+    let code = match digits.strip_prefix(['x', 'X']) {
+        Some(hex) => u32::from_str_radix(hex, 16).ok()?,
+        None => digits.parse::<u32>().ok()?,
+    };
+    Some((char::from_u32(code)?, 2 + end + 1))
 }
 
 fn escape(s: &str, quote: bool) -> String {
@@ -312,8 +339,29 @@ fn escape(s: &str, quote: bool) -> String {
 
 // ===== writing =====
 
+/// Comment text made legal for re-emission: XML forbids `--` inside a comment
+/// and a `-` right before the closing `-->`, and the lenient parser can have
+/// accepted both. A space is inserted between consecutive dashes and after a
+/// trailing dash — the ONE place the writer alters preserved content, and only
+/// because the alternative is a repaired copy no parser loads.
+fn comment_safe(c: &str) -> String {
+    let mut out = String::with_capacity(c.len());
+    for ch in c.chars() {
+        if ch == '-' && out.ends_with('-') {
+            out.push(' ');
+        }
+        out.push(ch);
+    }
+    if out.ends_with('-') {
+        out.push(' ');
+    }
+    out
+}
+
 /// Re-emit a document from its root element (see the module docs for what is
-/// normalized). The output always re-parses to a structurally equal tree.
+/// normalized). The output always re-parses to a structurally equal tree,
+/// except that a comment containing `--` (or ending in `-`) re-parses with
+/// the spaces [`comment_safe`] inserted to keep the document well-formed.
 pub fn write_document(root: &Element) -> String {
     let mut out = String::from("<?xml version=\"1.0\"?>\n");
     write_element(&mut out, root, 0);
@@ -357,9 +405,9 @@ fn write_element(out: &mut String, e: &Element, depth: usize) {
             }
             Node::Comment(c) => {
                 out.push_str(&pad);
-                out.push_str("  <!-- ");
-                out.push_str(c);
-                out.push_str(" -->\n");
+                out.push_str("  <!--");
+                out.push_str(&comment_safe(c));
+                out.push_str("-->\n");
             }
         }
     }
@@ -393,7 +441,80 @@ mod tests {
         assert!(
             root.children
                 .iter()
-                .any(|n| matches!(n, Node::Comment(c) if c == "kept"))
+                .any(|n| matches!(n, Node::Comment(c) if c == " kept ")),
+            "comment text is preserved verbatim, whitespace included"
+        );
+    }
+
+    /// Regression (#16, 2026-07-28 audit): numeric character refs were left
+    /// verbatim by unescape, so the writer re-escaped `&#45;` into
+    /// `&amp;#45;` — a silent identifier rename in every repaired copy.
+    #[test]
+    fn numeric_character_refs_decode_and_round_trip() {
+        let root = parse_document(r##"<robot name="a&#45;b&#x2F;c&#X41;"/>"##).unwrap();
+        assert_eq!(root.attr("name"), Some("a-b/cA"));
+        let emitted = write_document(&root);
+        assert!(emitted.contains("a-b/cA"), "{emitted}");
+        assert!(!emitted.contains("&amp;#"), "no re-escaped refs: {emitted}");
+        assert_eq!(parse_document(&emitted).unwrap(), root);
+        // malformed refs stay verbatim (lenient), like unknown entities
+        let bad = parse_document(r#"<a x="&#zz;&#x;"/>"#).unwrap();
+        assert_eq!(bad.attr("x"), Some("&#zz;&#x;"));
+    }
+
+    /// Regression (#17, 2026-07-28 audit): duplicate attributes were all
+    /// parsed AND all re-emitted, turning a leniently-loadable file into one
+    /// no strict parser accepts. The first value wins (matching `attr()`).
+    #[test]
+    fn duplicate_attributes_dedupe_to_the_first_value() {
+        let doc = r#"<robot name="a"><link name="l1" name="l2"/></robot>"#;
+        let root = parse_document(doc).unwrap();
+        let link = root.child("link").unwrap();
+        assert_eq!(link.attrs, vec![("name".to_string(), "l1".to_string())]);
+        let emitted = write_document(&root);
+        assert_eq!(
+            emitted.matches("name=").count(),
+            2,
+            "one per element: {emitted}"
+        );
+        parse_document(&emitted).unwrap();
+    }
+
+    /// Regression (#30, 2026-07-28 audit): comment whitespace was trimmed at
+    /// parse, and a comment containing `--` was re-emitted as-is — illegal
+    /// XML that strict parsers (and our own `until("-->")`) misread.
+    #[test]
+    fn comments_preserve_whitespace_and_double_dashes_are_made_legal() {
+        // the third comment's `--->` closes at the FIRST `-->`, leaving a
+        // trailing `-` in its text — the other illegal-on-write shape
+        let doc = "<a><!--  spaced  out  --><!-- x -- y --><!-- z --->hi</a>";
+        let root = parse_document(doc).unwrap();
+        assert!(
+            root.children
+                .iter()
+                .any(|n| matches!(n, Node::Comment(c) if c == "  spaced  out  "))
+        );
+        let emitted = write_document(&root);
+        let back = parse_document(&emitted).expect("emitted document must stay parseable");
+        // the verbatim comment round-trips exactly; the illegal one only
+        // gained the legalizing spaces
+        assert!(
+            back.children
+                .iter()
+                .any(|n| matches!(n, Node::Comment(c) if c == "  spaced  out  "))
+        );
+        assert!(
+            back.children
+                .iter()
+                .any(|n| matches!(n, Node::Comment(c) if c.contains("x - - y"))),
+            "{emitted}"
+        );
+        assert!(!emitted.contains("---"), "no illegal dash runs: {emitted}");
+        assert!(
+            back.children
+                .iter()
+                .any(|n| matches!(n, Node::Text(t) if t == "hi")),
+            "text child survives beside comments"
         );
     }
 

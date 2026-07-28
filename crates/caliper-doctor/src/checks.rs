@@ -1,4 +1,4 @@
-//! The doctor's checks (codes A001–A014) over the lenient URDF DOM.
+//! The doctor's checks (codes A001–A016) over the lenient URDF DOM.
 //!
 //! Every check emits [`Finding`]s with a stable code, a plain-English message
 //! that names the offending field and value AND states the consequence, and —
@@ -186,12 +186,45 @@ pub fn inertial_status(link: &Element) -> InertialStatus {
 pub fn run(robot: &Element, dir: Option<&Path>) -> Vec<Finding> {
     let v = View::new(robot);
     let mut out = Vec::new();
+    check_duplicate_names(&v, &mut out);
     check_inertials(&v, &mut out);
     check_meshes(&v, dir, &mut out);
     check_visual_coverage(&v, &mut out);
     check_joints(&v, &mut out);
     check_mimics(&v, &mut out);
+    check_origins(&v, &mut out);
     out
+}
+
+/// A015: duplicate link/joint names. Everything downstream binds by name —
+/// joint `<parent>`/`<child>`, mimics, repair targeting, MJCF export — so a
+/// duplicated name makes every one of those references ambiguous.
+fn check_duplicate_names(v: &View, out: &mut Vec<Finding>) {
+    for (kind, names) in [
+        ("link", v.links.iter().map(|(n, _)| n).collect::<Vec<_>>()),
+        ("joint", v.joints.iter().map(|(n, _)| n).collect::<Vec<_>>()),
+    ] {
+        let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+        for n in names {
+            *counts.entry(n.as_str()).or_default() += 1;
+        }
+        for (name, count) in counts {
+            if count > 1 {
+                out.push(
+                    Finding::error(
+                        codes::DUPLICATE_NAME,
+                        format!(
+                            "{count} {kind}s share the name `{name}`: every by-name \
+                             reference (joint <parent>/<child>, mimics, tools that index \
+                             by name) binds ambiguously — most consumers silently pick \
+                             the first or last match"
+                        ),
+                    )
+                    .hint(&format!("rename so every {kind} name is unique")),
+                );
+            }
+        }
+    }
 }
 
 /// A001 (missing/zero inertial), A002 (implausible tensor), A010 (zero-mass root).
@@ -205,6 +238,17 @@ fn check_inertials(v: &View, out: &mut Vec<Finding>) {
         .iter()
         .filter(|(_, _, s)| matches!(s, InertialStatus::Present { .. }))
         .count();
+    // A010 must be evaluated independently of the CURRENT mass distribution:
+    // links that compute_inertials will give mass count too, so repairing an
+    // all-massless robot never SURFACES a new root finding afterwards.
+    let n_repairable = statuses
+        .iter()
+        .filter(|(name, link, s)| {
+            Some(*name) != v.root_link.as_ref()
+                && !matches!(s, InertialStatus::Present { .. })
+                && has_repair_geometry(link)
+        })
+        .count();
     for (name, link, status) in &statuses {
         let is_root = Some(*name) == v.root_link.as_ref();
         match status {
@@ -217,16 +261,24 @@ fn check_inertials(v: &View, out: &mut Vec<Finding>) {
                     _ => "no <inertial>".to_string(),
                 };
                 if is_root {
-                    if n_with > 0 {
+                    if n_with > 0 || n_repairable > 0 {
+                        let others = if n_with > 0 {
+                            format!("{n_with} other link(s) carry mass")
+                        } else {
+                            format!(
+                                "{n_repairable} other massless link(s) carry geometry that \
+                                 compute_inertials turns into mass"
+                            )
+                        };
                         out.push(
                             Finding::info(
                                 codes::CAD_ZERO_MASS_ROOT,
                                 format!(
-                                    "[heuristic] root link `{name}` has {what} while {n_with} \
-                                     other link(s) carry mass — the signature of \
-                                     onshape-to-robot and similar CAD exporters. Harmless for \
-                                     a fixed base (caliper folds the root into the world), but \
-                                     a floating-base export sees a massless base"
+                                    "[heuristic] root link `{name}` has {what} while {others} \
+                                     — the signature of onshape-to-robot and similar CAD \
+                                     exporters. Harmless for a fixed base (caliper folds the \
+                                     root into the world), but a floating-base export sees a \
+                                     massless base"
                                 ),
                             )
                             .hint(
@@ -428,25 +480,43 @@ fn check_meshes(v: &View, dir: Option<&Path>, out: &mut Vec<Finding>) {
                 );
                 out.push(f.hint("re-export the STL; both binary and ASCII are accepted"));
             }
-            Some(cloud) if cloud.len() > HULL_VERT_CAP => {
-                let f = Finding::info(
-                    codes::COLLISION_MESH_HUGE,
-                    format!(
-                        "collision mesh `{}` on link `{}` has {} vertices \
-                         (> {HULL_VERT_CAP}): caliper subsamples it before convex hulling — \
-                         conservative and axis-exact, but an approximation, and loading is \
-                         slower",
-                        r.raw,
-                        r.link,
-                        cloud.len()
-                    ),
-                );
-                out.push(f.hint(
-                    "collision meshes only need the coarse envelope: decimate or replace \
-                     with primitives",
-                ));
+            Some(cloud) => {
+                // the model's OWN degeneracy test: from_urdf drops a mesh
+                // collider whose convex hull collapses below a triangle
+                if caliper_model::hull::convex_hull(&cloud).len() < 3 {
+                    let f = Finding::error(
+                        codes::MESH_UNRESOLVABLE,
+                        format!(
+                            "collision mesh `{}` on link `{}` resolves to `{}` but is \
+                             degenerate ({} vertices reduce to fewer than 3 distinct \
+                             points): the collider is silently DROPPED and that part of \
+                             the link is never collision-checked",
+                            r.raw,
+                            r.link,
+                            path.display(),
+                            cloud.len()
+                        ),
+                    );
+                    out.push(f.hint("re-export the mesh — it has no spatial extent"));
+                } else if cloud.len() > HULL_VERT_CAP {
+                    let f = Finding::info(
+                        codes::COLLISION_MESH_HUGE,
+                        format!(
+                            "collision mesh `{}` on link `{}` has {} vertices \
+                             (> {HULL_VERT_CAP}): caliper subsamples it before convex \
+                             hulling — conservative and axis-exact, but an approximation, \
+                             and loading is slower",
+                            r.raw,
+                            r.link,
+                            cloud.len()
+                        ),
+                    );
+                    out.push(f.hint(
+                        "collision meshes only need the coarse envelope: decimate or \
+                         replace with primitives",
+                    ));
+                }
             }
-            Some(_) => {}
         }
     }
 
@@ -594,12 +664,48 @@ fn check_joints(v: &View, out: &mut Vec<Finding>) {
             }
         }
         let limit = joint.child("limit");
+        // A016: a <limit> float that is PRESENT but unparseable. Without this,
+        // parse_f's unwrap_or(0.0) can make a urdf-rs-rejected file diagnose
+        // completely clean (e.g. lower="abc" upper="2" reads as 0 < 2 = fine).
+        let mut range_unparseable = false;
+        if let Some(l) = limit {
+            for key in ["lower", "upper", "effort", "velocity"] {
+                let Some(raw) = l.attr(key) else {
+                    continue; // absent attrs default per urdf-rs (A014 covers velocity)
+                };
+                if raw.trim().parse::<f64>().is_ok() || is_xacro_expr(raw) {
+                    continue; // xacro expressions are A013's finding, not A016's
+                }
+                let is_range = matches!(key, "lower" | "upper");
+                if is_range {
+                    range_unparseable = true;
+                }
+                let f = Finding::error(
+                    codes::UNPARSEABLE_NUMBER,
+                    format!(
+                        "joint `{name}` <limit {key}=\"{raw}\"> is not a number: urdf-rs \
+                         (the parser caliper uses) rejects the WHOLE file, and the \
+                         doctor's own range checks cannot trust the value"
+                    ),
+                );
+                out.push(if is_range && jtype == "revolute" {
+                    f.hint(
+                        "repair with inject_limits replaces the unusable range with a \
+                         conservative ±π",
+                    )
+                    .auto()
+                } else {
+                    f.hint("fix the value by hand — the doctor cannot guess the number")
+                });
+            }
+        }
         if jtype == "revolute" {
-            let usable = limit.is_some_and(|l| {
-                let lo = parse_f(l, "lower").unwrap_or(0.0);
-                let hi = parse_f(l, "upper").unwrap_or(0.0);
-                lo < hi
-            });
+            let usable = !range_unparseable
+                && limit.is_some_and(|l| {
+                    let lo = parse_f(l, "lower").unwrap_or(0.0);
+                    let hi = parse_f(l, "upper").unwrap_or(0.0);
+                    lo < hi
+                });
             if !usable {
                 let detail = match limit {
                     None => "has no <limit> element".to_string(),
@@ -695,6 +801,52 @@ fn check_mimics(v: &View, out: &mut Vec<Finding>) {
                 .hint("point every mimic directly at the one driving joint"),
             );
         }
+    }
+}
+
+/// Unexpanded xacro (`${..}` / `$(..)`) is A013's domain — A016 firing on every
+/// such value would double-report the same root cause per attribute.
+fn is_xacro_expr(raw: &str) -> bool {
+    raw.contains("${") || raw.contains("$(")
+}
+
+/// A016 (origins): an `<origin>` whose xyz/rpy is present but not three
+/// numbers. urdf-rs rejects the file outright, while the doctor's own
+/// geometry checks would silently read the identity (`parse_origin` defaults)
+/// — so say it loudly instead.
+fn check_origins(v: &View, out: &mut Vec<Finding>) {
+    let mut scan = |owner: String, holder: &Element| {
+        for o in holder.children_named("origin") {
+            for key in ["xyz", "rpy"] {
+                let Some(raw) = o.attr(key) else {
+                    continue;
+                };
+                if parse_vec3(raw).is_none() && !is_xacro_expr(raw) {
+                    out.push(
+                        Finding::error(
+                            codes::UNPARSEABLE_NUMBER,
+                            format!(
+                                "{owner} <origin {key}=\"{raw}\"> is not three numbers: \
+                                 urdf-rs (the parser caliper uses) rejects the WHOLE \
+                                 file, and the doctor's own checks fall back to reading \
+                                 it as the identity"
+                            ),
+                        )
+                        .hint("write three floats, e.g. xyz=\"0 0 0.1\""),
+                    );
+                }
+            }
+        }
+    };
+    for (name, link) in &v.links {
+        for tag in ["inertial", "visual", "collision"] {
+            for c in link.children_named(tag) {
+                scan(format!("link `{name}` <{tag}>"), c);
+            }
+        }
+    }
+    for (name, joint) in &v.joints {
+        scan(format!("joint `{name}`"), joint);
     }
 }
 
@@ -948,6 +1100,156 @@ mod tests {
         assert!(chains.iter().any(|f| f.message.contains("`j5`")));
         // j3's VALID mimic of j1 must NOT be flagged
         assert!(!r.findings.iter().any(|f| f.message.contains("`j3` mimics")));
+    }
+
+    /// Regression (#14, 2026-07-28 audit): parse_f's unwrap_or(0.0) made a
+    /// urdf-rs-REJECTED file (limit lower="abc" upper="2") diagnose with ZERO
+    /// findings — 0.0 < 2.0 read as a usable range — and repair then claimed
+    /// success while leaving the unparseable float in the copy. Same for an
+    /// origin xyz silently read as the identity.
+    #[test]
+    fn unparseable_limit_floats_and_origins_are_errors_not_defaults() {
+        let r = diag("doctor_unparseable.urdf");
+        let f = with_code(&r, codes::UNPARSEABLE_NUMBER);
+        assert_eq!(f.len(), 2, "{}", r.render_text());
+        let lim = f
+            .iter()
+            .find(|x| x.message.contains("lower=\"abc\""))
+            .expect("limit hit");
+        assert_eq!(lim.severity, Severity::Error);
+        assert!(lim.message.contains("`j1`"));
+        assert!(lim.auto_fixable, "inject_limits replaces a revolute range");
+        let org = f
+            .iter()
+            .find(|x| x.message.contains("xyz=\"0 0 zz\""))
+            .expect("origin hit");
+        assert!(org.message.contains("`j2`"));
+        assert!(!org.auto_fixable);
+        // the unusable range also surfaces as A007, driving the auto-fix
+        let no_lim = with_code(&r, codes::REVOLUTE_NO_LIMITS);
+        assert_eq!(no_lim.len(), 1, "{}", r.render_text());
+        assert!(no_lim[0].message.contains("`j1`"));
+        assert_eq!(r.findings.len(), 3, "{}", r.render_text());
+    }
+
+    /// Regression (#15, 2026-07-28 audit): duplicate link/joint names went
+    /// entirely unreported while quietly mis-targeting by-name repairs.
+    #[test]
+    fn duplicate_link_and_joint_names_are_errors() {
+        let r = diag("doctor_dup_names.urdf");
+        let f = with_code(&r, codes::DUPLICATE_NAME);
+        assert_eq!(f.len(), 2, "{}", r.render_text());
+        assert!(
+            f.iter()
+                .any(|x| x.message.contains("2 links share the name `arm`"))
+        );
+        assert!(
+            f.iter()
+                .any(|x| x.message.contains("2 joints share the name `j`"))
+        );
+        assert!(f.iter().all(|x| x.severity == Severity::Error));
+    }
+
+    /// Regression (#27, 2026-07-28 audit): a parseable STL whose vertices
+    /// collapse to fewer than 3 distinct points passed the doctor CLEAN while
+    /// Model::from_urdf silently DROPPED the collider (its own hull test).
+    #[test]
+    fn degenerate_collision_stl_is_flagged_as_dropped() {
+        let dir = crate::repair::tests::temp_dir("degen");
+        let flat = [nalgebra::Point3::new(0.0f64, 0.0, 0.0); 12];
+        let stl = crate::massprops::testmesh::ascii_stl(&flat);
+        std::fs::write(dir.join("flat.stl"), stl).unwrap();
+        std::fs::write(
+            dir.join("r.urdf"),
+            r#"<robot name="r">
+  <link name="base">
+    <inertial><mass value="1"/><inertia ixx="0.1" ixy="0" ixz="0" iyy="0.1" iyz="0" izz="0.1"/></inertial>
+  </link>
+  <link name="l1">
+    <inertial><mass value="1"/><inertia ixx="0.1" ixy="0" ixz="0" iyy="0.1" iyz="0" izz="0.1"/></inertial>
+    <collision><geometry><mesh filename="flat.stl"/></geometry></collision>
+  </link>
+  <joint name="j1" type="revolute"><parent link="base"/><child link="l1"/><axis xyz="0 0 1"/>
+    <limit lower="-1" upper="1" effort="1" velocity="1"/></joint>
+</robot>"#,
+        )
+        .unwrap();
+        let r = diagnose(&dir.join("r.urdf")).unwrap();
+        assert_eq!(r.findings.len(), 1, "{}", r.render_text());
+        assert_eq!(r.findings[0].code, codes::MESH_UNRESOLVABLE);
+        assert_eq!(r.findings[0].severity, Severity::Error);
+        assert!(
+            r.findings[0].message.contains("degenerate")
+                && r.findings[0].message.contains("DROPPED"),
+            "{}",
+            r.findings[0].message
+        );
+        // parity proof: the model really does drop this collider
+        let m = caliper_model::Model::from_urdf(&dir.join("r.urdf")).unwrap();
+        assert!(
+            !m.dropped_collider_frames.is_empty(),
+            "the doctor's verdict must match the model's"
+        );
+    }
+
+    /// Regression (#28, 2026-07-28 audit): A010 was gated on links CURRENTLY
+    /// carrying mass, so an all-massless robot showed no A010 before repair
+    /// and a brand-new A010 AFTER compute_inertials filled the other links —
+    /// repair must never surface a finding that diagnose hid.
+    #[test]
+    fn a010_is_stable_across_repair_of_an_all_massless_robot() {
+        let dir = crate::repair::tests::temp_dir("a010");
+        let urdf = dir.join("r.urdf");
+        std::fs::write(
+            &urdf,
+            r#"<robot name="r">
+  <link name="base"/>
+  <link name="l1"><collision><geometry><box size="0.1 0.1 0.1"/></geometry></collision></link>
+  <joint name="j1" type="revolute"><parent link="base"/><child link="l1"/><axis xyz="0 0 1"/>
+    <limit lower="-1" upper="1" effort="1" velocity="1"/></joint>
+</robot>"#,
+        )
+        .unwrap();
+        let before = diagnose(&urdf).unwrap();
+        assert!(
+            before
+                .findings
+                .iter()
+                .any(|f| f.code == codes::CAD_ZERO_MASS_ROOT),
+            "A010 must already fire BEFORE repair:\n{}",
+            before.render_text()
+        );
+        let out = crate::repair(
+            &urdf,
+            &crate::RepairOpts {
+                compute_inertials: true,
+                ..crate::RepairOpts::default()
+            },
+        )
+        .unwrap();
+        let repaired = dir.join("repaired.urdf");
+        std::fs::write(&repaired, &out.repaired_urdf).unwrap();
+        let after = diagnose(&repaired).unwrap();
+        let codes_of = |r: &DoctorReport| {
+            r.findings
+                .iter()
+                .map(|f| f.code.clone())
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        assert!(
+            codes_of(&after).is_subset(&codes_of(&before)),
+            "repair surfaced NEW findings:\nbefore:\n{}\nafter:\n{}",
+            before.render_text(),
+            after.render_text()
+        );
+        assert!(
+            after
+                .findings
+                .iter()
+                .any(|f| f.code == codes::CAD_ZERO_MASS_ROOT),
+            "{}",
+            after.render_text()
+        );
     }
 
     #[test]

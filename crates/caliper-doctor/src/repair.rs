@@ -209,19 +209,26 @@ fn repair_limits(robot: &mut Element, applied: &mut Vec<RepairAction>) {
             });
         }
         if revolute {
+            // a range float that is PRESENT but unparseable (A016) is as
+            // unusable as a degenerate one — urdf-rs rejects the file over it,
+            // and unwrap_or(0.0) must not make it look usable (lower="abc"
+            // upper="2" would otherwise read as 0 < 2 and be left in place)
+            let bad = |k: &str| l.attr(k).is_some_and(|r| r.trim().parse::<f64>().is_err());
             let lo = parse_f(l, "lower").unwrap_or(0.0);
             let hi = parse_f(l, "upper").unwrap_or(0.0);
-            let usable = lo < hi;
+            let usable = !bad("lower") && !bad("upper") && lo < hi;
             if !usable {
+                let detail = format!(
+                    "replaced unusable range (lower={}, upper={}) with a conservative ±π",
+                    l.attr("lower").unwrap_or("0"),
+                    l.attr("upper").unwrap_or("0")
+                );
                 l.set_attr("lower", &(-PI).to_string());
                 l.set_attr("upper", &PI.to_string());
                 applied.push(RepairAction {
                     code: codes::REVOLUTE_NO_LIMITS.to_string(),
                     target: name,
-                    detail: format!(
-                        "replaced degenerate range (lower={lo}, upper={hi}) with a \
-                         conservative ±π"
-                    ),
+                    detail,
                 });
             }
         }
@@ -258,8 +265,9 @@ fn shape_props(shape: &Shape, dir: Option<&Path>) -> Result<MassProps, String> {
             }
             mesh_props(&cloud).ok_or_else(|| {
                 format!(
-                    "mesh `{raw}` is open, degenerate, or inconsistently wound — its signed \
-                     volume integrates to ~0, so no honest inertial can be derived"
+                    "mesh `{raw}` is open, degenerate, or inconsistently wound (a shared \
+                     edge without its reverse partner, or a signed volume of ~0) — no \
+                     honest inertial can be derived"
                 )
             })
         }
@@ -277,6 +285,10 @@ fn repair_inertials(
     skipped: &mut Vec<RepairAction>,
 ) {
     struct Plan {
+        /// Index into the named-link sequence (the filter [`View::new`] uses):
+        /// phase 2 targets POSITIONALLY, so duplicate link names cannot make
+        /// one link receive an inertial computed from another's geometry.
+        idx: usize,
         link: String,
         inertial: Element,
         detail: String,
@@ -284,7 +296,7 @@ fn repair_inertials(
     let mut plans: Vec<Plan> = Vec::new();
     {
         let v = View::new(robot);
-        for (name, link) in &v.links {
+        for (idx, (name, link)) in v.links.iter().enumerate() {
             if Some(name) == v.root_link.as_ref() {
                 continue;
             }
@@ -337,6 +349,7 @@ fn repair_inertials(
                 continue;
             }
             plans.push(Plan {
+                idx,
                 link: name.clone(),
                 inertial: inertial_element(mass, &com, &i_com),
                 detail: format!(
@@ -348,9 +361,12 @@ fn repair_inertials(
         }
     }
     for plan in plans {
+        // positional, NOT by name: with duplicate link names (A015) a by-name
+        // find would clobber the first duplicate with every later plan
         let Some(link) = robot
             .children_named_mut("link")
-            .find(|l| l.attr("name") == Some(plan.link.as_str()))
+            .filter(|l| l.attr("name").is_some())
+            .nth(plan.idx)
         else {
             continue;
         };
@@ -729,6 +745,79 @@ pub(crate) mod tests {
         let m = Model::from_urdf(&repaired).unwrap();
         assert_eq!(m.collision.len(), 2, "both hulls load");
         assert!(m.dropped_collider_frames.is_empty());
+    }
+
+    /// Regression (#15, 2026-07-28 audit): with TWO links named `arm`, the
+    /// by-name phase 2 applied BOTH plans to the first `arm` — it ended up
+    /// with the inertial computed from the SECOND link's geometry and the
+    /// second stayed massless. Positional targeting gives each its own numbers.
+    #[test]
+    fn duplicate_link_names_get_their_own_inertials() {
+        let out = repair(
+            &fixture("doctor_dup_names.urdf"),
+            &RepairOpts {
+                compute_inertials: true,
+                ..RepairOpts::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(out.applied.len(), 2, "{:?}", out.applied);
+        assert!(out.skipped.is_empty(), "{:?}", out.skipped);
+        let root = crate::xml::parse_document(&out.repaired_urdf).unwrap();
+        let masses: Vec<f64> = root
+            .children_named("link")
+            .filter(|l| l.attr("name") == Some("arm"))
+            .map(|l| {
+                let inr = l.child("inertial").expect("BOTH arms repaired");
+                parse_f(inr.child("mass").unwrap(), "value").unwrap()
+            })
+            .collect();
+        assert_eq!(masses.len(), 2);
+        assert!(
+            (masses[0] - 1000.0).abs() < 1e-6,
+            "first arm: its own 1 m³ box at 1000 kg/m³, got {masses:?}"
+        );
+        assert!(
+            (masses[1] - 1.0).abs() < 1e-6,
+            "second arm: its own 0.001 m³ box, got {masses:?}"
+        );
+    }
+
+    /// Regression (#14, 2026-07-28 audit): inject_limits must treat a
+    /// present-but-unparseable range float as unusable and replace it — the
+    /// old unwrap_or(0.0) read lower="abc" upper="2" as a usable 0..2 range
+    /// and left the urdf-rs-rejected value in the "repaired" copy.
+    #[test]
+    fn unparseable_range_is_replaced_by_inject_limits() {
+        let out = repair(
+            &fixture("doctor_unparseable.urdf"),
+            &RepairOpts {
+                inject_limits: true,
+                ..RepairOpts::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            out.applied
+                .iter()
+                .any(|a| a.code == codes::REVOLUTE_NO_LIMITS && a.detail.contains("abc")),
+            "{:?}",
+            out.applied
+        );
+        let root = crate::xml::parse_document(&out.repaired_urdf).unwrap();
+        let j1 = root
+            .children_named("joint")
+            .find(|j| j.attr("name") == Some("j1"))
+            .unwrap();
+        let l = j1.child("limit").unwrap();
+        assert!((parse_f(l, "lower").unwrap() + PI).abs() < 1e-12);
+        assert!((parse_f(l, "upper").unwrap() - PI).abs() < 1e-12);
+        // j2's healthy authored range is untouched
+        let j2 = root
+            .children_named("joint")
+            .find(|j| j.attr("name") == Some("j2"))
+            .unwrap();
+        assert_eq!(j2.child("limit").unwrap().attr("lower"), Some("-1"));
     }
 
     #[test]

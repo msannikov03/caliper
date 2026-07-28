@@ -9,16 +9,22 @@ proves a Caliper-recorded dataset SURVIVES the actual lerobot toolchain:
     -> per-frame values equal what we recorded (windowing + edge padding)
     -> one optimizer step of a tiny torch policy on a DataLoader batch.
 
-Offline notes (verified on lerobot 0.4.4): ``convert_dataset(repo_id,
-root=DIR, push_to_hub=False)`` operates fully locally when ``DIR/repo_id``
-holds a v2.1 dataset — it validates ``codebase_version``, converts in place
-(keeping the v2.1 original at ``<name>_old``), and never contacts the hub.
+Offline notes (verified on lerobot 0.4.4; module path + root semantics for
+0.5+ verified against the lerobot 0.6.0 wheel): ``convert_dataset(...,
+push_to_hub=False)`` operates fully locally on a v2.1 dataset — it validates
+``codebase_version``, converts in place (keeping the v2.1 original at
+``<name>_old``), and never contacts the hub. The converter MOVED between
+releases: 0.4.x ships it at ``lerobot.datasets.v30.convert_dataset_v21_to_v30``
+and resolves the dataset at ``Path(root) / repo_id``; 0.5+ ships it at
+``lerobot.scripts.convert_dataset_v21_to_v30`` and treats ``root`` as the
+dataset directory itself. Both paths are tried below — new first — so this
+gate RUNS on every lerobot generation instead of silently skipping on 0.5+.
 ``LeRobotDataset(repo_id, root=...)`` likewise loads straight from disk. We
 set HF_HUB_OFFLINE=1 before importing lerobot so any accidental hub call
 raises instead of hitting the network.
 
-Skips (never fakes a pass): lerobot missing, or lerobot without the v3.0
-converter module (pre-0.4 releases shipped a different converter path).
+Skips (never fakes a pass): lerobot missing, or a lerobot that ships the
+converter under NEITHER known module path.
 """
 
 import json
@@ -35,10 +41,23 @@ os.environ.setdefault("HF_HUB_OFFLINE", "1")  # must precede lerobot import
 np = pytest.importorskip("numpy")
 torch = pytest.importorskip("torch")
 pytest.importorskip("lerobot", reason="lerobot not installed")
-convert_mod = pytest.importorskip(
-    "lerobot.datasets.v30.convert_dataset_v21_to_v30",
-    reason="this lerobot has no v2.1->v3.0 converter (need lerobot >= 0.4, e.g. 0.4.4)",
-)
+# Dual-path converter import (see module docstring): lerobot 0.5+ first, then
+# 0.4.x. Skip ONLY when lerobot ships the converter under neither path.
+try:
+    import lerobot.scripts.convert_dataset_v21_to_v30 as convert_mod  # >= 0.5
+
+    _CONVERT_ROOT_IS_DATASET_DIR = True
+except ImportError:
+    try:
+        import lerobot.datasets.v30.convert_dataset_v21_to_v30 as convert_mod  # 0.4.x
+
+        _CONVERT_ROOT_IS_DATASET_DIR = False
+    except ImportError:
+        pytest.skip(
+            "this lerobot has no v2.1->v3.0 converter under either known path "
+            "(lerobot.scripts.* for >= 0.5, lerobot.datasets.v30.* for 0.4.x)",
+            allow_module_level=True,
+        )
 lerobot_dataset_mod = pytest.importorskip("lerobot.datasets.lerobot_dataset")
 LeRobotDataset = lerobot_dataset_mod.LeRobotDataset
 
@@ -60,9 +79,12 @@ def roundtrip(tmp_path_factory):
     tmp = tmp_path_factory.mktemp("lerobot_roundtrip")
     ds_root = tmp / REPO_ID
     _, states, actions, times = _record(ds_root, fps=FPS, ticks=TICKS)
-    # The converter resolves the dataset at Path(root)/repo_id and converts it
-    # IN PLACE (v3.0 replaces ds_root; the v2.1 original moves to `<name>_old`).
-    convert_mod.convert_dataset(repo_id=REPO_ID, root=str(tmp), push_to_hub=False)
+    # Root semantics differ by generation (see module docstring): 0.5+ takes
+    # the dataset dir itself, 0.4.x takes the parent and appends repo_id.
+    # Either way the conversion is IN PLACE (v3.0 replaces ds_root; the v2.1
+    # original moves to `<name>_old`).
+    convert_root = str(ds_root) if _CONVERT_ROOT_IS_DATASET_DIR else str(tmp)
+    convert_mod.convert_dataset(repo_id=REPO_ID, root=convert_root, push_to_hub=False)
     ds = LeRobotDataset(
         REPO_ID,
         root=str(ds_root),

@@ -2,9 +2,16 @@
 //! auto-finalize, size-based file rolling, stats parity, determinism, and the
 //! error paths that keep buffers consistent.
 
+use arrow::array::{Array, FixedSizeListArray, Float32Array};
+use arrow::datatypes::DataType;
 use caliper_dataset::{DatasetReader, DatasetSpec, DatasetWriter, Error, FeatureSpec};
+use parquet::arrow::ArrowWriter;
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use parquet::basic::Compression;
+use parquet::file::properties::WriterProperties;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 fn tmpdir(tag: &str) -> PathBuf {
     let p = std::env::temp_dir().join(format!("caliper_dataset_{tag}_{}", std::process::id()));
@@ -356,5 +363,103 @@ fn error_paths_stay_consistent() {
     record_episode(&mut w, 2, "t", &mut seed);
     let root = w.finalize().unwrap();
     assert!(DatasetWriter::create(&root, spec2()).is_err());
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn writer_rejects_non_finite_values_and_timestamps() {
+    // Confirmed failure scenario: add_frame accepted NaN/inf values and
+    // timestamps, silently poisoning stats.json and every downstream loss.
+    let dir = tmpdir("nonfinite");
+    let mut w = DatasetWriter::create(&dir, spec2()).unwrap();
+    let ok = [0.0, 0.0];
+    for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 1e39] {
+        // 1e39 is finite as f64 but overflows the stored f32 to inf.
+        let err = w
+            .add_frame(&[("observation.state", &[bad, 0.0][..]), ("action", &ok)])
+            .unwrap_err();
+        assert!(err.to_string().contains("finite"), "{err}");
+    }
+    let err = w
+        .add_frame_at(&[("observation.state", &ok), ("action", &ok)], f64::NAN)
+        .unwrap_err();
+    assert!(err.to_string().contains("timestamp"), "{err}");
+    // Rejected frames must not leave ragged buffers; a good frame still lands.
+    assert_eq!(w.buffered_frames(), 0);
+    w.add_frame(&[("observation.state", &ok), ("action", &ok)])
+        .unwrap();
+    assert_eq!(w.buffered_frames(), 1);
+    w.save_episode("t").unwrap();
+    let root = w.finalize().unwrap();
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn reader_refuses_null_values_instead_of_fabricating_zeros() {
+    // Confirmed failure scenario: a null slot in a float column has NO value,
+    // but `extract_f32_rows` decoded it as 0.0. Build a valid dataset, then
+    // null one element the way a foreign writer could.
+    let dir = tmpdir("nulls");
+    let mut w = DatasetWriter::create(&dir, spec2()).unwrap();
+    let mut seed = 17;
+    record_episode(&mut w, 4, "t", &mut seed);
+    let root = w.finalize().unwrap();
+
+    let path = root.join("data/chunk-000/file-000.parquet");
+    let batches: Vec<arrow::record_batch::RecordBatch> = {
+        let file = fs::File::open(&path).unwrap();
+        ParquetRecordBatchReaderBuilder::try_new(file)
+            .unwrap()
+            .build()
+            .unwrap()
+            .map(|b| b.unwrap())
+            .collect()
+    };
+    assert_eq!(batches.len(), 1, "one small episode reads as one batch");
+    let batch = &batches[0];
+    let idx = batch.schema().index_of("observation.state").unwrap();
+    let col = batch.columns()[idx]
+        .as_any()
+        .downcast_ref::<FixedSizeListArray>()
+        .unwrap();
+    let (field, size) = match col.data_type() {
+        DataType::FixedSizeList(f, s) => (f.clone(), *s),
+        other => panic!("unexpected column type {other:?}"),
+    };
+    let vals = col
+        .values()
+        .as_any()
+        .downcast_ref::<Float32Array>()
+        .unwrap();
+    // Null the second element of frame 1.
+    let target = size as usize + 1;
+    let patched: Float32Array = (0..vals.len())
+        .map(|i| {
+            if i == target {
+                None
+            } else {
+                Some(vals.value(i))
+            }
+        })
+        .collect();
+    let mut cols = batch.columns().to_vec();
+    cols[idx] = Arc::new(FixedSizeListArray::new(
+        field,
+        size,
+        Arc::new(patched),
+        None,
+    ));
+    let rebuilt = arrow::record_batch::RecordBatch::try_new(batch.schema(), cols).unwrap();
+    let file = fs::File::create(&path).unwrap();
+    let props = WriterProperties::builder()
+        .set_compression(Compression::SNAPPY)
+        .build();
+    let mut pw = ArrowWriter::try_new(file, rebuilt.schema(), Some(props)).unwrap();
+    pw.write(&rebuilt).unwrap();
+    pw.close().unwrap();
+
+    let r = DatasetReader::open(&root).unwrap();
+    let err = r.read_episode(0).unwrap_err();
+    assert!(err.to_string().contains("null"), "{err}");
     let _ = fs::remove_dir_all(&root);
 }

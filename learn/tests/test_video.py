@@ -309,6 +309,75 @@ def test_attach_requires_every_video_on_disk(tmp_path, robot):
         attach_video_metadata(root, [vrec])  # double-attach guard
 
 
+@needs_encoder
+def test_attach_rejects_fps_mismatch(tmp_path, robot):
+    """A recorder encoded at a different fps than the dataset must be refused
+    — the mp4 clock and the parquet timestamps would silently desync (1.5x
+    A/V drift with nobody the wiser)."""
+    lengths = [4, 5]
+    root = _vector_ds(tmp_path / "ds", robot, lengths)
+    r = VideoRecorder(root, KEY, FPS * 2)
+    for ep, n in enumerate(lengths):
+        for f in _frames(n, seed=30 + ep):
+            r.append(f)
+        r.finalize_episode()
+    with pytest.raises(ValueError, match="fps"):
+        attach_video_metadata(root, [r])
+
+
+@needs_encoder
+def test_attach_rejects_frame_count_mismatch(tmp_path, robot):
+    """Same episode COUNT but a wrong per-episode frame count must be refused
+    — the video would run short/long against the frame data. Nothing in meta/
+    may be touched by the failed attach."""
+    import json
+
+    import pyarrow.parquet as pq
+
+    root = _vector_ds(tmp_path / "ds", robot, [4, 5])
+    r = _video_recorder(root, [4, 4])  # episode 1: 4 video frames vs 5 rows
+    with pytest.raises(ValueError, match="video"):
+        attach_video_metadata(root, [r])
+    ep_file = next(iter(pathlib.Path(root).glob("meta/episodes/*/*.parquet")))
+    assert not any(c.startswith("videos/") for c in pq.read_schema(ep_file).names)
+    info = json.loads((pathlib.Path(root) / "meta" / "info.json").read_text())
+    assert not info.get("video_path")
+
+
+@needs_encoder
+def test_attach_crash_leaves_meta_intact(tmp_path, robot, monkeypatch):
+    """Crash-safety regression: a failure mid-parquet-write used to truncate
+    the ONLY episodes parquet in place. With temp + os.replace the original
+    must stay byte-identical, no temp litter, and a retry must succeed."""
+    import pyarrow.parquet as pq
+
+    lengths = [4, 5]
+    root = _vector_ds(tmp_path / "ds", robot, lengths)
+    vrec = _video_recorder(root, lengths)
+    ep_file = next(iter(pathlib.Path(root).glob("meta/episodes/*/*.parquet")))
+    before = ep_file.read_bytes()
+
+    real_write = pq.write_table
+
+    def dying_write(table, where, **kw):
+        # Simulate a crash mid-write: partial bytes land at the destination
+        # path, then the process "dies".
+        pathlib.Path(where).write_bytes(b"partial garbage")
+        raise RuntimeError("simulated crash during parquet write")
+
+    monkeypatch.setattr(pq, "write_table", dying_write)
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        attach_video_metadata(root, [vrec])
+    monkeypatch.setattr(pq, "write_table", real_write)
+
+    assert ep_file.read_bytes() == before, "episodes parquet was corrupted in place"
+    assert not list(pathlib.Path(root).glob("meta/**/*.tmp-attach"))
+    attach_video_metadata(root, [vrec])  # original intact -> retry succeeds
+    assert any(
+        c.startswith("videos/") for c in pq.read_schema(ep_file).names
+    )
+
+
 # --------------------------------- THE GATE: real lerobot decodes our videos
 
 

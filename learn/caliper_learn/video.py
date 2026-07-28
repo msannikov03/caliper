@@ -47,8 +47,10 @@ content, not file hashes.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess  # nosec B404 — fixed argv, no shell
+from collections.abc import Callable
 from pathlib import Path
 
 import numpy as np
@@ -267,6 +269,7 @@ class VideoRecorder:
         self._chunks_size = int(chunks_size)
         self._frames: list[np.ndarray] = []
         self._episodes: list[dict] = []
+        self._lengths: list[int] = []
         self._chunk = 0
         self._file = 0
         self._shape: tuple[int, int] | None = None  # (h, w), locked at frame 1
@@ -284,8 +287,18 @@ class VideoRecorder:
         return self._key
 
     @property
+    def fps(self) -> int:
+        return self._fps
+
+    @property
     def total_episodes(self) -> int:
         return len(self._episodes)
+
+    @property
+    def episode_lengths(self) -> list[int]:
+        """Frame count of each finalized episode, in episode order — what
+        `attach_video_metadata` checks against the parquet episode lengths."""
+        return list(self._lengths)
 
     @property
     def episode_metadata(self) -> list[dict]:
@@ -333,6 +346,7 @@ class VideoRecorder:
             f"videos/{self._key}/from_timestamp": 0.0,
             f"videos/{self._key}/to_timestamp": duration,
         })
+        self._lengths.append(int(arr.shape[0]))
         x = arr.astype(np.float64) / 255.0
         self._stat_min = np.minimum(self._stat_min, x.min(axis=(0, 1, 2)))
         self._stat_max = np.maximum(self._stat_max, x.max(axis=(0, 1, 2)))
@@ -399,6 +413,19 @@ class VideoRecorder:
         }
 
 
+def _replace_atomic(path: Path, write: Callable[[Path], None]) -> None:
+    """Crash-safe file rewrite: `write(tmp)` into a same-directory temp file,
+    then `os.replace` over `path` — a crash mid-write leaves the original
+    byte-identical instead of truncated. The temp file is removed on failure."""
+    tmp = path.with_name(path.name + ".tmp-attach")
+    try:
+        write(tmp)
+        os.replace(tmp, path)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
+
+
 def attach_video_metadata(root: str | Path, recorders) -> None:
     """Post-write bridge: register `recorders`' videos in a finalized
     `RecorderV3` dataset's `meta/` — THE step that turns "mp4 files on disk"
@@ -406,7 +433,9 @@ def attach_video_metadata(root: str | Path, recorders) -> None:
     until the Rust writer grows video columns.
 
     Rewrites, in crash-safe order (info.json LAST — its `video_path` doubles
-    as the commit marker and the double-attach guard):
+    as the commit marker and the double-attach guard), each file via a
+    same-directory temp + `os.replace` so a crash mid-write never truncates
+    the only copy:
       1. `meta/episodes/chunk-000/file-000.parquet`: appends the four
          `videos/{key}/...` columns per recorder (pyarrow, snappy — same
          compression the writer used). The Rust writer emits exactly one
@@ -415,11 +444,13 @@ def attach_video_metadata(root: str | Path, recorders) -> None:
       3. `meta/info.json`: adds each `features[key]` entry (dtype "video")
          and sets `video_path` to lerobot's `DEFAULT_VIDEO_PATH` template.
 
-    Validates before touching anything: episode counts must match
-    `info.total_episodes`, every referenced mp4 must exist, keys must be new
-    (a key already in `features` — e.g. recorded as dtype "image" — is an
-    error, not an upgrade), and a dataset with `video_path` already set is
-    refused.
+    Validates before touching anything: recorder fps must equal the dataset
+    fps (the timestamps in `meta/episodes` are frame-count/fps — a mismatch
+    is a silent A/V desync), episode counts must match `info.total_episodes`,
+    every episode's video frame count must equal its parquet episode length,
+    every referenced mp4 must exist, keys must be new (a key already in
+    `features` — e.g. recorded as dtype "image" — is an error, not an
+    upgrade), and a dataset with `video_path` already set is refused.
     """
     import pyarrow as pa  # lazy: lerobot-adjacent dep, not a core sidecar dep
     import pyarrow.parquet as pq
@@ -437,7 +468,14 @@ def attach_video_metadata(root: str | Path, recorders) -> None:
     if info.get("video_path"):
         raise ValueError(f"dataset already has video metadata attached: {root}")
     n_eps = int(info["total_episodes"])
+    ds_fps = int(info["fps"])
     for r in recorders:
+        if r.fps != ds_fps:
+            raise ValueError(
+                f"recorder '{r.video_key}' encoded at {r.fps} fps, dataset fps is "
+                f"{ds_fps} — attaching would silently desync video time from frame "
+                f"timestamps"
+            )
         if r.total_episodes != n_eps:
             raise ValueError(
                 f"recorder '{r.video_key}' has {r.total_episodes} episodes, "
@@ -472,6 +510,22 @@ def attach_video_metadata(root: str | Path, recorders) -> None:
     for name in table.column_names:
         if name.startswith("videos/"):
             raise ValueError(f"meta/episodes already has video columns ({name})")
+    if "episode_index" not in table.column_names or "length" not in table.column_names:
+        raise ValueError(
+            "meta/episodes lacks episode_index/length columns — not a Rust-writer "
+            "episodes parquet"
+        )
+    ep_len = dict(
+        zip(table.column("episode_index").to_pylist(), table.column("length").to_pylist())
+    )
+    for r in recorders:
+        for ep, n_frames in enumerate(r.episode_lengths):
+            if n_frames != ep_len.get(ep):
+                raise ValueError(
+                    f"recorder '{r.video_key}' episode {ep} has {n_frames} video "
+                    f"frames but the dataset episode holds {ep_len.get(ep)} frames — "
+                    f"attaching would silently desync video from the frame data"
+                )
     for r in recorders:
         meta = r.episode_metadata
         for suffix, pa_type in (
@@ -484,7 +538,9 @@ def attach_video_metadata(root: str | Path, recorders) -> None:
             table = table.append_column(
                 pa.field(col, pa_type), pa.array([m[col] for m in meta], pa_type)
             )
-    pq.write_table(table, ep_files[0], compression="snappy")
+    _replace_atomic(
+        ep_files[0], lambda tmp: pq.write_table(table, tmp, compression="snappy")
+    )
 
     stats_path = root / "meta" / "stats.json"
     stats = json.loads(stats_path.read_text())
@@ -492,10 +548,12 @@ def attach_video_metadata(root: str | Path, recorders) -> None:
         if r.video_key in stats:
             raise ValueError(f"stats.json already has an entry for '{r.video_key}'")
         stats[r.video_key] = r.feature_stats()
-    stats_path.write_text(json.dumps(dict(sorted(stats.items())), indent=2))
+    stats_text = json.dumps(dict(sorted(stats.items())), indent=2)
+    _replace_atomic(stats_path, lambda tmp: tmp.write_text(stats_text))
 
     for r in recorders:
         info["features"][r.video_key] = r.feature_info()
     info["features"] = dict(sorted(info["features"].items()))  # keep BTreeMap order
     info["video_path"] = DEFAULT_VIDEO_PATH
-    info_path.write_text(json.dumps(info, indent=2))
+    info_text = json.dumps(info, indent=2)
+    _replace_atomic(info_path, lambda tmp: tmp.write_text(info_text))

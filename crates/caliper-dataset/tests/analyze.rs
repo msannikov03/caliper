@@ -4,11 +4,18 @@
 //! cross-checks of the recomputed numbers, determinism, and serde/text
 //! rendering.
 
+use arrow::array::{Array, FixedSizeListArray, Float32Array};
+use arrow::datatypes::DataType;
 use caliper_dataset::{
     AnalyzeOptions, DataReport, DatasetSpec, DatasetWriter, FeatureSpec, Severity, analyze,
 };
+use parquet::arrow::ArrowWriter;
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use parquet::basic::Compression;
+use parquet::file::properties::WriterProperties;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 fn tmpdir(tag: &str) -> PathBuf {
     let p = std::env::temp_dir().join(format!("caliper_dataset_dr_{tag}_{}", std::process::id()));
@@ -655,6 +662,104 @@ fn image_checks_ignore_below_threshold_defects() {
     assert!(r.findings.is_empty(), "{}", r.render_text());
 }
 
+// ===== D016 non-finite values =====
+
+/// Overwrite one stored f32 in the (single) data parquet, bypassing the
+/// writer's non-finite rejection — how a foreign/older writer poisons a
+/// dataset. `column` row `row` (global), element `dof` for FixedSizeList
+/// features; `dof` is ignored for plain float columns (`timestamp`).
+fn poison_f32(root: &Path, column: &str, row: usize, dof: usize, value: f32) {
+    let path = root.join("data/chunk-000/file-000.parquet");
+    let batches: Vec<arrow::record_batch::RecordBatch> = {
+        let file = fs::File::open(&path).unwrap();
+        ParquetRecordBatchReaderBuilder::try_new(file)
+            .unwrap()
+            .build()
+            .unwrap()
+            .map(|b| b.unwrap())
+            .collect()
+    };
+    let schema = batches[0].schema();
+    let col_idx = schema.index_of(column).unwrap();
+    let mut offset = 0usize;
+    let patched: Vec<arrow::record_batch::RecordBatch> = batches
+        .into_iter()
+        .map(|batch| {
+            let n = batch.num_rows();
+            let here = (offset..offset + n).contains(&row);
+            let local = row.wrapping_sub(offset);
+            offset += n;
+            if !here {
+                return batch;
+            }
+            let mut cols = batch.columns().to_vec();
+            let arr = &cols[col_idx];
+            let new: arrow::array::ArrayRef =
+                if let Some(a) = arr.as_any().downcast_ref::<FixedSizeListArray>() {
+                    let (field, size) = match a.data_type() {
+                        DataType::FixedSizeList(f, s) => (f.clone(), *s),
+                        other => panic!("unexpected column type {other:?}"),
+                    };
+                    let vals = a.values().as_any().downcast_ref::<Float32Array>().unwrap();
+                    let flat = local * size as usize + dof;
+                    let new_vals: Float32Array = (0..vals.len())
+                        .map(|i| Some(if i == flat { value } else { vals.value(i) }))
+                        .collect();
+                    Arc::new(FixedSizeListArray::new(
+                        field,
+                        size,
+                        Arc::new(new_vals),
+                        None,
+                    ))
+                } else {
+                    let a = arr.as_any().downcast_ref::<Float32Array>().unwrap();
+                    let new_vals: Float32Array = (0..a.len())
+                        .map(|i| Some(if i == local { value } else { a.value(i) }))
+                        .collect();
+                    Arc::new(new_vals)
+                };
+            cols[col_idx] = new;
+            arrow::record_batch::RecordBatch::try_new(batch.schema(), cols).unwrap()
+        })
+        .collect();
+    let file = fs::File::create(&path).unwrap();
+    let props = WriterProperties::builder()
+        .set_compression(Compression::SNAPPY)
+        .build();
+    let mut w = ArrowWriter::try_new(file, schema, Some(props)).unwrap();
+    for b in &patched {
+        w.write(b).unwrap();
+    }
+    w.close().unwrap();
+}
+
+#[test]
+fn d016_flags_non_finite_values_and_timestamps() {
+    // Confirmed failure scenario: a NaN value (or timestamp) sailed through
+    // every D-code — NaN comparisons are all false — so a poisoned dataset
+    // got a clean bill of health.
+    let dir = tmpdir("d016");
+    let root = clean_dataset(&dir);
+    poison_f32(&root, "observation.state", 7, 1, f32::NAN);
+    poison_f32(&root, "timestamp", 3, 0, f32::INFINITY);
+    let r = run(&root);
+    let vf = r
+        .findings
+        .iter()
+        .find(|f| f.code == "D016" && f.feature.as_deref() == Some("observation.state"))
+        .expect("D016 expected for the NaN state value");
+    assert_eq!(vf.severity, Severity::Error);
+    assert_eq!(vf.dof, Some(1));
+    assert!(vf.message.contains("non-finite"), "{}", vf.message);
+    let tf = r
+        .findings
+        .iter()
+        .find(|f| f.code == "D016" && f.feature.is_none())
+        .expect("D016 expected for the inf timestamp");
+    assert_eq!(tf.episode, Some(0));
+    assert!(tf.message.contains("timestamps"), "{}", tf.message);
+}
+
 // ===== D015 cross-episode duplicates =====
 
 #[test]
@@ -687,6 +792,29 @@ fn d015_flags_an_accidental_double_record() {
     assert!(f.message.contains("episode 0"), "{}", f.message);
     assert!(f.message.contains("episode 1"), "{}", f.message);
     assert!(f.message.contains("double-record"), "{}", f.message);
+}
+
+#[test]
+fn d015_ignores_image_only_datasets() {
+    // Confirmed failure scenario: with no vector features the duplicate
+    // signature covers only episode length and the equality checks iterate
+    // zero features — two same-length episodes with DIFFERENT pixels were
+    // reported as a vacuously-true "double-record".
+    let dir = tmpdir("d015img");
+    let spec = DatasetSpec::new(50, "cam_bot", vec![FeatureSpec::image(CAM, IH, IW, 3)]);
+    let mut w = DatasetWriter::create(&dir, spec).unwrap();
+    for ep in 0..2 {
+        for i in 0..10 {
+            let png = png_rgb(&lively_pixels(ep * 100 + i));
+            w.add_frame_with_images(&[], &[(CAM, png.as_slice())])
+                .unwrap();
+        }
+        w.save_episode("t").unwrap();
+    }
+    let root = w.finalize().unwrap();
+    let r = run(&root);
+    assert!(!has_code(&r, "D015"), "{}", r.render_text());
+    assert!(r.findings.is_empty(), "{}", r.render_text());
 }
 
 // ===== report plumbing =====

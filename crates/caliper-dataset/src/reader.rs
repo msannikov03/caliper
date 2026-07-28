@@ -284,7 +284,24 @@ fn column<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a dyn Array, Error
 }
 
 fn extract_f32_rows(arr: &dyn Array, name: &str, out: &mut Vec<Vec<f32>>) -> Result<(), Error> {
+    // Null slots have NO value — `Array::value` on one returns whatever sits
+    // in the buffer (typically 0.0), silently fabricating data. Refuse loudly
+    // at both levels: null rows here, null elements in `values_of`.
+    if arr.null_count() > 0 {
+        return Err(Error::Format(format!(
+            "column '{name}': {} null rows — a null has no f32 value and would silently \
+             decode as a fabricated 0.0",
+            arr.null_count()
+        )));
+    }
     let values_of = |v: arrow::array::ArrayRef| -> Result<Vec<f32>, Error> {
+        if v.null_count() > 0 {
+            return Err(Error::Format(format!(
+                "column '{name}': {} null elements — a null has no f32 value and would \
+                 silently decode as a fabricated 0.0",
+                v.null_count()
+            )));
+        }
         if let Some(f) = v.as_any().downcast_ref::<Float32Array>() {
             Ok((0..f.len()).map(|j| f.value(j)).collect())
         } else if let Some(f) = v.as_any().downcast_ref::<Float64Array>() {

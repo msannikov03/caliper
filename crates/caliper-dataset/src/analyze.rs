@@ -3,7 +3,9 @@
 //! at record time, silent during training, and fatal to the resulting policy:
 //! stale `meta/stats.json` (the normalization killer), dead joints,
 //! contradictory demonstrations, echo/lag action labels, coverage holes,
-//! frozen tails, dead cameras, accidental double-records.
+//! frozen tails, dead cameras, accidental double-records, non-finite
+//! values/timestamps (which every other numeric check compares through
+//! silently).
 //!
 //! Entry point: [`analyze`] → [`DataReport`], a serde-serializable list of
 //! [`Finding`]s (stable `D0xx` codes, plain-English messages naming the
@@ -324,6 +326,11 @@ struct FeatAcc {
     /// Σ xᵢ·xⱼ for the upper triangle (i < j), empty when dim is 1 or above
     /// [`MAX_CORR_DIM`].
     cross: Vec<f64>,
+    /// Per-dof count of non-finite (NaN/±inf) values (D016). Non-finite
+    /// values are counted here and EXCLUDED from the Welford/cross sums —
+    /// one NaN would otherwise poison every downstream stat into NaN, and
+    /// NaN comparisons are exactly how D001/D002/D010 go blind.
+    nonfinite: Vec<u64>,
     frames: u64,
 }
 
@@ -415,6 +422,7 @@ impl<'a> Analyzer<'a> {
                     names,
                     dims: vec![Welford::new(); dim],
                     cross,
+                    nonfinite: vec![0; dim],
                     frames: 0,
                 },
             );
@@ -473,10 +481,15 @@ impl<'a> Analyzer<'a> {
                         acc.dim
                     )));
                 }
-                for (w, &v) in acc.dims.iter_mut().zip(row) {
-                    w.push(f64::from(v));
+                let row_finite = row.iter().all(|v| v.is_finite());
+                for (j, (w, &v)) in acc.dims.iter_mut().zip(row).enumerate() {
+                    if v.is_finite() {
+                        w.push(f64::from(v));
+                    } else {
+                        acc.nonfinite[j] += 1;
+                    }
                 }
-                if !acc.cross.is_empty() {
+                if !acc.cross.is_empty() && row_finite {
                     for i in 0..acc.dim {
                         for j in (i + 1)..acc.dim {
                             let k = acc.cross_idx(i, j);
@@ -503,8 +516,32 @@ impl<'a> Analyzer<'a> {
         Ok(())
     }
 
-    /// D010 — timestamp irregularity vs the declared fps.
+    /// D010 — timestamp irregularity vs the declared fps. Non-finite
+    /// timestamps are D016's business and are reported here FIRST — a NaN dt
+    /// makes every D010 comparison silently false, so the regularity check is
+    /// meaningless until the timestamps are finite.
     fn check_timestamps(&mut self, ep: &crate::EpisodeData) {
+        let bad = ep.timestamps.iter().filter(|t| !t.is_finite()).count();
+        if bad > 0 {
+            self.findings.push(Finding {
+                code: "D016".into(),
+                severity: Severity::Error,
+                feature: None,
+                episode: Some(ep.episode_index),
+                dof: None,
+                message: format!(
+                    "episode {}: {bad} of {} timestamps are non-finite (NaN/inf) — \
+                     delta-timestamp windowing pairs garbage frames, and the timestamp \
+                     regularity check (D010) is blind until this is fixed",
+                    ep.episode_index,
+                    ep.len()
+                ),
+                fix_hint: "the recording pipeline wrote invalid timestamps; re-record the \
+                           episode or rewrite its timestamps to frame_index/fps"
+                    .into(),
+            });
+            return;
+        }
         if ep.len() < 2 {
             return;
         }
@@ -816,6 +853,7 @@ impl<'a> Analyzer<'a> {
     // ---- post-pass evaluation ----
 
     fn evaluate(&mut self) -> Result<(), Error> {
+        self.eval_nonfinite();
         self.eval_variance_collapse();
         self.eval_stats_json()?;
         self.eval_action_scale();
@@ -831,6 +869,38 @@ impl<'a> Analyzer<'a> {
         match acc.names.get(j) {
             Some(n) if !n.is_empty() => format!("dof {j} ('{n}')"),
             _ => format!("dof {j}"),
+        }
+    }
+
+    /// D016 — non-finite (NaN/±inf) values in a vector feature. Every other
+    /// numeric check compares through NaN silently (NaN < x, NaN > x and
+    /// |NaN| - tol > 0 are all false), so without this check a poisoned
+    /// dataset gets a clean bill of health while training diverges on the
+    /// first batch that touches the value.
+    fn eval_nonfinite(&mut self) {
+        for (name, acc) in &self.feats {
+            for (j, &n) in acc.nonfinite.iter().enumerate() {
+                if n > 0 {
+                    self.findings.push(Finding {
+                        code: "D016".into(),
+                        severity: Severity::Error,
+                        feature: Some(name.clone()),
+                        episode: None,
+                        dof: Some(j),
+                        message: format!(
+                            "feature '{name}' {}: {n} of {} frames hold a non-finite value \
+                             (NaN/inf) — every loss touching them turns NaN and training \
+                             silently diverges; all other stats for this dof exclude them",
+                            Self::dof_label(acc, j),
+                            acc.frames
+                        ),
+                        fix_hint: "find the affected episodes and re-record or delete them; \
+                                   non-finite values usually mean a sensor dropout or a math \
+                                   error in the recording pipeline"
+                            .into(),
+                    });
+                }
+            }
         }
     }
 
@@ -1302,6 +1372,12 @@ impl<'a> Analyzer<'a> {
 
     /// D015 — cross-episode duplicates: identical state sequences.
     fn eval_duplicates(&mut self) -> Result<(), Error> {
+        // No vector features (image-only dataset): the signature covers only
+        // episode length, and the equality checks below iterate zero features
+        // — every same-length pair would be a vacuously-true "duplicate".
+        if self.feats.is_empty() {
+            return Ok(());
+        }
         let mut groups: BTreeMap<u64, Vec<usize>> = BTreeMap::new();
         for (pos, &sig) in self.signatures.iter().enumerate() {
             groups.entry(sig).or_default().push(pos);

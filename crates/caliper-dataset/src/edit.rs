@@ -17,14 +17,17 @@
 //! step 2 leaves at most a stray `.caliper-edit-tmp` sibling; a crash between
 //! steps 2 and 3 leaves the dataset at `.caliper-edit-old` (rename it back by
 //! hand); a crash between 3 and 4 leaves a stale `.caliper-edit-old` copy.
-//! Ops refuse to run while either sibling exists, so a crashed edit is always
-//! surfaced instead of silently clobbered.
+//! Ops refuse to run while either sibling exists — the tmp sibling is claimed
+//! with an atomic `create_dir` (the cross-process edit lock), so a crashed
+//! edit is always surfaced and two concurrent edits cannot interleave.
 //!
 //! # What the rewrite preserves — and what it doesn't
 //!
 //! Preserved: fps, `robot_type` (including `null`), feature set
 //! (dims/element names/per-feature fps), per-frame values and timestamps,
 //! per-frame `task_index` semantics, `data_files_size_in_mb` / `chunks_size`,
+//! any unknown top-level entries at the dataset root (README, `images/`,
+//! orphaned `videos/`, … — copied verbatim into the rewritten tree),
 //! and — via a raw-JSON merge, since [`Info`] itself **drops unknown fields**
 //! on deserialize — any unknown top-level `info.json` keys. Regenerated:
 //! episode/index numbering (dense), `meta/tasks.parquet` (unused tasks
@@ -386,16 +389,26 @@ fn rewrite(
         .ok_or_else(|| Error::Format(format!("dataset {} has no parent dir", root.display())))?;
     let tmp = parent.join(format!("{name}.caliper-edit-tmp"));
     let old = parent.join(format!("{name}.caliper-edit-old"));
-    for leftover in [&tmp, &old] {
-        if leftover.exists() {
-            return Err(Error::Edit(format!(
-                "{} exists — leftover of a crashed edit; inspect/remove it first",
-                leftover.display()
-            )));
-        }
+    if old.exists() {
+        return Err(Error::Edit(format!(
+            "{} exists — leftover of a crashed edit; inspect/remove it first",
+            old.display()
+        )));
+    }
+    // Claim the tmp sibling ATOMICALLY: `create_dir` fails if anything is
+    // already there, so this doubles as the cross-process edit lock (a bare
+    // existence probe would TOCTOU-race two concurrent Studio/CLI edits into
+    // building over each other's tmp tree).
+    if let Err(e) = fs::create_dir(&tmp) {
+        return Err(Error::Edit(format!(
+            "cannot claim {} — leftover of a crashed edit, or another edit is running \
+             right now; inspect/remove it first ({e})",
+            tmp.display()
+        )));
     }
 
-    let result = build_into(&tmp, reader, info, specs, plan, tags);
+    let result = build_into(&tmp, reader, info, specs, plan, tags)
+        .and_then(|()| preserve_unknown_root_entries(root, &tmp));
     if let Err(e) = result {
         let _ = fs::remove_dir_all(&tmp); // best-effort cleanup; original untouched
         return Err(e);
@@ -518,6 +531,47 @@ fn build_into(
 
     preserve_unknown_info_fields(tmp, reader)?;
     write_tags(tmp, tags)?;
+    Ok(())
+}
+
+/// The rewrite only creates `data/` and `meta/` — anything else at the
+/// dataset root (a README, an `images/` tree, `videos/` mp4s orphaned by a
+/// crashed attach, …) would silently vanish in the swap, because step 4
+/// deletes the whole original directory. Copy every unknown top-level entry
+/// into the rewritten tree verbatim; refuse loudly on entries a plain copy
+/// cannot preserve (symlinks, sockets, …) so an edit never destroys data it
+/// does not understand.
+fn preserve_unknown_root_entries(root: &Path, tmp: &Path) -> Result<(), Error> {
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name == "data" || name == "meta" {
+            continue;
+        }
+        copy_tree(&entry.path(), &tmp.join(&name))?;
+    }
+    Ok(())
+}
+
+/// Recursive plain-file/directory copy for [`preserve_unknown_root_entries`];
+/// anything else (symlink, fifo, …) is a loud refusal, dataset untouched.
+fn copy_tree(src: &Path, dst: &Path) -> Result<(), Error> {
+    let meta = fs::symlink_metadata(src)?;
+    if meta.is_dir() {
+        fs::create_dir_all(dst)?;
+        for entry in fs::read_dir(src)? {
+            let entry = entry?;
+            copy_tree(&entry.path(), &dst.join(entry.file_name()))?;
+        }
+    } else if meta.is_file() {
+        fs::copy(src, dst)?;
+    } else {
+        return Err(Error::Edit(format!(
+            "refusing to edit: {} is neither a plain file nor a directory — the rewrite \
+             cannot preserve it, and the swap would destroy it",
+            src.display()
+        )));
+    }
     Ok(())
 }
 

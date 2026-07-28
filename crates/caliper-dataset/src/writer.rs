@@ -348,6 +348,15 @@ impl DatasetWriter {
         if self.finalized {
             return Err(Error::State("writer already finalized".into()));
         }
+        // Timestamps are stored as f32 — reject anything that is not finite
+        // there (NaN/inf, and f64 magnitudes that overflow the cast), or
+        // delta-timestamp windowing silently pairs garbage frames.
+        if !(timestamp as f32).is_finite() {
+            return Err(Error::State(format!(
+                "timestamp {timestamp} is not a finite f32 — NaN/inf timestamps poison \
+                 delta-timestamp windowing and every timestamp stat"
+            )));
+        }
         let n_vec = self.spec.features.iter().filter(|f| !f.is_image()).count();
         let n_img = self.spec.features.len() - n_vec;
         if values.len() != n_vec {
@@ -410,6 +419,21 @@ impl DatasetWriter {
                             expected: *dim,
                             got: v.len(),
                         });
+                    }
+                    // Values are stored as f32 — reject anything non-finite
+                    // as stored (NaN/inf, and f64 magnitudes that overflow
+                    // the cast). A NaN here silently poisons stats.json and
+                    // every training loss downstream.
+                    if let Some((j, &bad)) = v
+                        .iter()
+                        .enumerate()
+                        .find(|&(_, &x)| !(x as f32).is_finite())
+                    {
+                        return Err(Error::State(format!(
+                            "feature '{}' dof {j}: value {bad} is not a finite f32 — \
+                             NaN/inf values poison stats and training losses",
+                            feat.name
+                        )));
                     }
                     ordered.push(Ordered::Vector(v));
                 }

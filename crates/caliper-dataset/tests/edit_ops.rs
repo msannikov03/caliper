@@ -139,6 +139,57 @@ fn delete_renumbers_remaps_tasks_and_recomputes_stats() {
 }
 
 #[test]
+fn edit_preserves_unknown_root_entries() {
+    // Confirmed failure scenario: the swap deleted everything build_into did
+    // not create — a README, an images/ tree, and videos/ mp4s orphaned by a
+    // crashed attach all vanished after a routine delete.
+    let root = build("preserve", [3, 3, 3]);
+    fs::write(root.join("README.md"), "hello").unwrap();
+    fs::create_dir_all(root.join("images/cam")).unwrap();
+    fs::write(root.join("images/cam/frame.bin"), [1u8, 2, 3]).unwrap();
+    fs::create_dir_all(root.join("videos/obs/chunk-000")).unwrap();
+    fs::write(root.join("videos/obs/chunk-000/file-000.mp4"), [9u8; 16]).unwrap();
+
+    delete_episodes(&root, &[1]).unwrap();
+
+    assert_eq!(fs::read_to_string(root.join("README.md")).unwrap(), "hello");
+    assert_eq!(
+        fs::read(root.join("images/cam/frame.bin")).unwrap(),
+        vec![1, 2, 3]
+    );
+    assert_eq!(
+        fs::read(root.join("videos/obs/chunk-000/file-000.mp4")).unwrap(),
+        vec![9u8; 16]
+    );
+    assert_eq!(DatasetReader::open(&root).unwrap().total_episodes(), 2);
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn edit_claims_the_tmp_sentinel_and_releases_it() {
+    // Confirmed failure scenario (TOCTOU): the tmp/old probes were bare
+    // `.exists()` checks, so two concurrent edits could both pass and build
+    // over each other. The tmp sibling is now claimed with an atomic
+    // `create_dir` — anything already there (crashed edit OR a running one)
+    // is a loud refusal that leaves the original untouched.
+    let root = build("sentinel", [3, 3, 3]);
+    let parent = root.parent().unwrap();
+    let name = root.file_name().unwrap().to_str().unwrap();
+    let tmp = parent.join(format!("{name}.caliper-edit-tmp"));
+    fs::create_dir(&tmp).unwrap();
+
+    let err = delete_episodes(&root, &[0]).unwrap_err();
+    assert!(err.to_string().contains("caliper-edit-tmp"), "{err}");
+    assert_eq!(DatasetReader::open(&root).unwrap().total_episodes(), 3);
+
+    fs::remove_dir(&tmp).unwrap();
+    delete_episodes(&root, &[0]).unwrap();
+    assert!(!tmp.exists(), "claim must be released by the swap");
+    assert_eq!(DatasetReader::open(&root).unwrap().total_episodes(), 2);
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
 fn delete_multiple_and_unknown_info_fields_survive() {
     let root = build("delete2", [4, 3, 5]);
     // inject an unknown top-level info.json field — must survive the rewrite

@@ -7,7 +7,7 @@ use caliper::hal::{
 };
 use caliper::ik::{IkOpts, analytic_ik_6r, ik};
 use caliper::kinematics::{
-    JacFrame, Jacobian, LintSeverity, SingularityParams, fk_frame, jacobian,
+    JacFrame, Jacobian, LintSeverity, SingularityKind, SingularityParams, fk_frame, jacobian,
 };
 use caliper::motion::{
     CartesianMoveOpts, MotionLimits, MotionLimitsConfig, move_c, move_j, move_l,
@@ -104,6 +104,9 @@ enum Cmd {
         /// Optional frame name; defaults to the tip frame.
         #[arg(long)]
         frame: Option<String>,
+        /// Machine-readable JSON instead of the text report.
+        #[arg(long)]
+        json: bool,
     },
     /// Plan a jerk-limited move and print sampled waypoints.
     Move {
@@ -239,6 +242,9 @@ enum Cmd {
         /// self-colliding pair.
         #[arg(long)]
         contacts: bool,
+        /// Machine-readable JSON instead of the text report.
+        #[arg(long)]
+        json: bool,
     },
     /// Plan a collision-free path to a joint goal or Cartesian --target (Phase 6).
     Plan {
@@ -326,6 +332,9 @@ enum Cmd {
         obstacle: Option<Vec<f64>>,
         #[arg(long)]
         frame: Option<String>,
+        /// Machine-readable JSON instead of the text report.
+        #[arg(long)]
+        json: bool,
     },
     /// Cycle-time + path-quality report for a jerk-limited MOVE_J (OLP table
     /// stakes): total/per-segment time, min/mean manipulability + min σ_min
@@ -462,6 +471,62 @@ enum DataCmd {
         /// Machine-readable JSON instead of the text report.
         #[arg(long)]
         json: bool,
+    },
+    /// Delete episodes (offline edit). Survivors are renumbered densely
+    /// (episode/global indices, task remap dropping now-unused tasks, stats
+    /// recomputed, tags remapped); the rewrite swaps in atomically, so the
+    /// result is always lerobot-loadable. Refuses to delete every episode.
+    Delete {
+        /// Dataset root directory (the one containing meta/ and data/).
+        root: PathBuf,
+        /// Episode indices to delete, e.g. --episodes 0,3,7.
+        #[arg(long, value_delimiter = ',', required = true)]
+        episodes: Vec<usize>,
+    },
+    /// Split one episode into two at a local frame. Both halves keep the
+    /// task and tags; the second half's timestamps restart at 0
+    /// (per-episode-relative, as v3.0 stores them).
+    Split {
+        /// Dataset root directory (the one containing meta/ and data/).
+        root: PathBuf,
+        /// Episode index to split.
+        #[arg(long)]
+        episode: usize,
+        /// Local frame the SECOND half starts at (0 < frame < length).
+        #[arg(long)]
+        frame: usize,
+    },
+    /// Merge two ADJACENT episodes (second == first + 1) into one. Tasks are
+    /// unioned (each frame keeps its own task_index); the second episode's
+    /// timestamps continue 1/fps after the first's.
+    Merge {
+        /// Dataset root directory (the one containing meta/ and data/).
+        root: PathBuf,
+        /// First episode index.
+        #[arg(long)]
+        first: usize,
+        /// Second episode index (must be first + 1).
+        #[arg(long)]
+        second: usize,
+    },
+    /// List or edit the caliper tags sidecar (`meta/caliper_tags.json` — a
+    /// caliper extension lerobot ignores; the edit verbs above remap it
+    /// automatically). Without flags, tables every tagged episode.
+    Tag {
+        /// Dataset root directory (the one containing meta/ and data/).
+        root: PathBuf,
+        /// Episode to edit (required with --add / --remove / --clear).
+        #[arg(long)]
+        episode: Option<usize>,
+        /// Tag(s) to add (comma-separate or repeat the flag).
+        #[arg(long, value_delimiter = ',')]
+        add: Vec<String>,
+        /// Tag(s) to remove (comma-separate or repeat the flag).
+        #[arg(long, value_delimiter = ',')]
+        remove: Vec<String>,
+        /// Remove EVERY tag of --episode.
+        #[arg(long)]
+        clear: bool,
     },
 }
 
@@ -709,6 +774,7 @@ fn main() -> anyhow::Result<()> {
             urdf,
             joints,
             frame,
+            json,
         } => {
             let robot = caliper::model::Robot::from_urdf(&urdf)?;
             let m = &robot.model;
@@ -726,6 +792,31 @@ fn main() -> anyhow::Result<()> {
             let (_, jac) = jacobian(m, &joints, f, JacFrame::World);
             let rep = Jacobian(jac).analyze(&SingularityParams::default());
             let tip = m.frame_name(f);
+            if json {
+                let nullspace: Vec<Vec<f64>> = (0..rep.nullspace_basis.ncols())
+                    .map(|c| rep.nullspace_basis.column(c).iter().copied().collect())
+                    .collect();
+                let v = serde_json::json!({
+                    "robot": robot.name,
+                    "frame": tip,
+                    "q": joints,
+                    "manipulability": rep.manipulability,
+                    // `null` = infinite (JSON has no inf), mirroring the text face.
+                    "condition_number": if rep.condition_number.is_finite() {
+                        serde_json::json!(rep.condition_number)
+                    } else {
+                        serde_json::Value::Null
+                    },
+                    "sigma_min": rep.sigma_min,
+                    "sigma": rep.sigma,
+                    "kind": kind_str(rep.kind),
+                    "offending_joints": rep.offending_joints,
+                    "escape_direction": rep.escape_direction.iter().copied().collect::<Vec<f64>>(),
+                    "nullspace_basis": nullspace,
+                });
+                println!("{}", serde_json::to_string_pretty(&v)?);
+                return Ok(());
+            }
             println!(
                 "ANALYZE '{}' -> frame '{}'  (q = {:?})",
                 robot.name, tip, joints
@@ -1272,6 +1363,7 @@ fn main() -> anyhow::Result<()> {
             ground,
             margin,
             contacts,
+            json,
         } => {
             let robot = caliper::model::Robot::from_urdf(&urdf)?;
             let m = &robot.model;
@@ -1294,6 +1386,42 @@ fn main() -> anyhow::Result<()> {
             }
             let cm = CollisionModel::new(model, scene, margin);
             let rep = cm.query(&joints)?;
+            if json {
+                let self_pairs: Vec<[&str; 2]> = rep
+                    .self_pairs
+                    .iter()
+                    .map(|(a, b)| [m.frame_name(*a), m.frame_name(*b)])
+                    .collect();
+                let world_hits: Vec<&str> =
+                    rep.world_hits.iter().map(|f| m.frame_name(*f)).collect();
+                let mut v = serde_json::json!({
+                    "robot": robot.name,
+                    "q": joints,
+                    "num_colliders": cm.num_colliders(),
+                    "uncovered_frames": cm.uncovered_frames(),
+                    "collision": rep.has_collision(),
+                    "self_pairs": self_pairs,
+                    "world_hits": world_hits,
+                });
+                if contacts {
+                    let cs = cm.contacts(&joints)?;
+                    v["contacts"] = serde_json::Value::Array(
+                        cs.iter()
+                            .map(|(a, b, c)| {
+                                serde_json::json!({
+                                    "frame_a": m.frame_name(*a),
+                                    "frame_b": m.frame_name(*b),
+                                    "depth": c.depth,
+                                    "normal": [c.normal.x, c.normal.y, c.normal.z],
+                                    "witness": [c.witness.x, c.witness.y, c.witness.z],
+                                })
+                            })
+                            .collect(),
+                    );
+                }
+                println!("{}", serde_json::to_string_pretty(&v)?);
+                return Ok(());
+            }
             println!(
                 "COLLIDE '{}'  ({} colliders)",
                 robot.name,
@@ -1483,6 +1611,7 @@ fn main() -> anyhow::Result<()> {
             ground,
             obstacle,
             frame,
+            json,
         } => {
             let robot = caliper::model::Robot::from_urdf(&urdf)?;
             let m = &robot.model;
@@ -1499,6 +1628,22 @@ fn main() -> anyhow::Result<()> {
                 },
             );
             let v = rc.status(&pose);
+            if json {
+                let status = match v.status {
+                    ReachStatus::Reachable => "reachable",
+                    ReachStatus::Blocked => "blocked",
+                    ReachStatus::Unreachable => "unreachable",
+                };
+                let out = serde_json::json!({
+                    "robot": robot.name,
+                    "frame": m.frame_name(f),
+                    "status": status,
+                    "residual": v.residual,
+                    "q": v.q,
+                });
+                println!("{}", serde_json::to_string_pretty(&out)?);
+                return Ok(());
+            }
             let label = match v.status {
                 ReachStatus::Reachable => "REACHABLE",
                 ReachStatus::Blocked => "BLOCKED (collision)",
@@ -1808,6 +1953,92 @@ fn main() -> anyhow::Result<()> {
                     print!("{}", report.render_text());
                 }
             }
+            DataCmd::Delete { root, episodes } => {
+                let before = DatasetReaderV3::open(&root)?.total_episodes();
+                caliper_dataset::edit::delete_episodes(&root, &episodes)?;
+                let after = DatasetReaderV3::open(&root)?.total_episodes();
+                println!(
+                    "DELETE '{}': removed {} episode(s) {:?} -> {} remain",
+                    root.display(),
+                    before - after,
+                    episodes,
+                    after
+                );
+            }
+            DataCmd::Split {
+                root,
+                episode,
+                frame,
+            } => {
+                caliper_dataset::edit::split_episode(&root, episode, frame)?;
+                let total = DatasetReaderV3::open(&root)?.total_episodes();
+                println!(
+                    "SPLIT '{}': episode {episode} at frame {frame} -> episodes {episode} + {} \
+                     ({total} total)",
+                    root.display(),
+                    episode + 1
+                );
+            }
+            DataCmd::Merge {
+                root,
+                first,
+                second,
+            } => {
+                caliper_dataset::edit::merge_episodes(&root, first, second)?;
+                let total = DatasetReaderV3::open(&root)?.total_episodes();
+                println!(
+                    "MERGE '{}': episodes {first} + {second} -> episode {first} ({total} total)",
+                    root.display()
+                );
+            }
+            DataCmd::Tag {
+                root,
+                episode,
+                add,
+                remove,
+                clear,
+            } => {
+                let editing = !add.is_empty() || !remove.is_empty() || clear;
+                let mut tags = caliper_dataset::edit::read_tags(&root)?;
+                if editing {
+                    let ep = episode.ok_or_else(|| {
+                        anyhow::anyhow!("--add / --remove / --clear need --episode <index>")
+                    })? as u64;
+                    let total = DatasetReaderV3::open(&root)?.total_episodes();
+                    anyhow::ensure!(
+                        (ep as usize) < total,
+                        "episode {ep} out of range ({total} episode(s))"
+                    );
+                    let list = tags.entry(ep).or_default();
+                    if clear {
+                        list.clear();
+                    }
+                    list.retain(|t| !remove.contains(t));
+                    for t in add {
+                        anyhow::ensure!(!t.is_empty(), "a tag must be non-empty");
+                        if !list.contains(&t) {
+                            list.push(t);
+                        }
+                    }
+                    if list.is_empty() {
+                        tags.remove(&ep);
+                    }
+                    caliper_dataset::edit::write_tags(&root, &tags)?;
+                }
+                // Both paths end on the same table — edit, then show the result.
+                if tags.is_empty() {
+                    println!("TAGS '{}': (none)", root.display());
+                } else {
+                    println!(
+                        "TAGS '{}' ({} episode(s) tagged):",
+                        root.display(),
+                        tags.len()
+                    );
+                    for (ep, list) in &tags {
+                        println!("  ep {ep}: {}", list.join(", "));
+                    }
+                }
+            }
         },
     }
     Ok(())
@@ -1897,6 +2128,16 @@ fn target_to_se3(t: &[f64]) -> anyhow::Result<Se3> {
     let rot = Matrix3::new(t[0], t[1], t[2], t[3], t[4], t[5], t[6], t[7], t[8]);
     let trans = Vector3::new(t[9], t[10], t[11]);
     Ok(Se3::from_parts(trans, UnitQuaternion::from_matrix(&rot)))
+}
+
+/// Lowercase kind tag for `analyze --json` (same spelling as the Python face).
+fn kind_str(k: SingularityKind) -> &'static str {
+    match k {
+        SingularityKind::None => "none",
+        SingularityKind::Wrist => "wrist",
+        SingularityKind::Elbow => "elbow",
+        SingularityKind::Boundary => "boundary",
+    }
 }
 
 fn fmt_vec(v: &[f64]) -> String {

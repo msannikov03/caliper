@@ -42,10 +42,12 @@ Caliper records and replays the **LeRobotDataset** format — the standard schem
 used for imitation-learning data — in two versions:
 
 - **v3.0 native** (`caliper-dataset`, the default): the layout `lerobot` >= 0.4
-  loads directly — no converter. The writer auto-finalizes on drop, so lerobot's
-  "forgot to `finalize()`" footgun can't truncate a recording. Faces:
-  `caliper record` (CLI, `--format v3` default), `RecorderV3` / `DatasetReaderV3`
-  (Python).
+  loads directly — no converter (proven against 0.4.4 AND 0.6.0; on lerobot
+  >= 0.6 install the dataset extra, `pip install "lerobot[dataset]"` — see the
+  [stability contract](../reference/stability.md)). The writer auto-finalizes
+  on drop, so lerobot's "forgot to `finalize()`" footgun can't truncate a
+  recording. Faces: `caliper record` (CLI, `--format v3` default),
+  `RecorderV3` / `DatasetReaderV3` (Python).
 - **legacy v2.1** (`caliper-hal`, feature `dataset`): kept for older toolchains
   (`--format v21`, `Recorder` / `DatasetReader`); lerobot >= 0.4 needs its
   official v2.1→v3.0 converter to load these. The Phase-7 learning sidecar's

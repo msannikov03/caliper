@@ -16,9 +16,9 @@ Faces: [CLI](../faces/cli.md) · [Python](../faces/python.md) ·
 | Capability | Engine | CLI | Python | Studio |
 |---|---|---|---|---|
 | Load URDF / xacro, summarize structure | `caliper-model` ([architecture](../architecture.md)) | `load` | `Robot.from_urdf`, `.name/.ndof/.joint_names/.joint_limits/.frame_names/.tip_frame/.has_inertia` | Open URDF… / samples / recents, ⌘O |
-| **Asset doctor** — diagnose `A001`–`A014` | [`caliper-doctor`](../capabilities/doctors.md) | `doctor` | `doctor(path)` | automatic on every load (error-banner findings) |
+| **Asset doctor** — diagnose `A001`–`A016` | [`caliper-doctor`](../capabilities/doctors.md) | `doctor` | `doctor(path)` | automatic on every load (error-banner findings) |
 | **Asset repair** — repaired copy, never in-place | [`caliper-doctor`](../capabilities/doctors.md) | `doctor --repair [--density] [--out]` | `doctor(path, repair=True, density=…)` | **Repair & reload** button |
-| MJCF (MuJoCo XML) export (+ hull-mesh assets) | [`caliper-sim-mujoco::mjcf`](../capabilities/contact-sim.md) | `mjcf` (`--hull-meshes`) | `model_to_mjcf` | ✗ |
+| MJCF (MuJoCo XML) export (+ hull-mesh assets) | [`caliper-sim-mujoco::mjcf`](../capabilities/contact-sim.md) | `mjcf` (`--hull-meshes`) | `model_to_mjcf` (no hull-mesh export — primitive colliders only) | ✗ |
 | **Robot zoo** — fetch a vendored real URDF | `caliper-cli::zoo` | `fetch <name>` / `fetch --list` | ✗ | ✗ |
 
 ## Kinematics & analysis
@@ -54,8 +54,8 @@ Faces: [CLI](../faces/cli.md) · [Python](../faces/python.md) ·
 | RNEA / CRBA / forward dynamics / gravity | [`caliper-dynamics`](../capabilities/dynamics.md) | `dyn` | `Robot.rnea` / `crba` / `forward_dynamics` / `gravity_torque` | ✗ ¹ |
 | Passive/forced time-stepped simulation | [`caliper-dynamics::Simulator`](../capabilities/dynamics.md) | `sim` | `Simulator` (step/rollout/energy) | Simulate: gravity drop |
 | MuJoCo contact simulation (props, ground) | [`caliper-sim-mujoco`](../capabilities/contact-sim.md) | ✗ (use `mjcf` + MuJoCo) | ✗ | Simulate: contact drop / hold / drive-to (mujoco builds) |
-| **Contact material presets** (`Rigid`/`Rubber`/`Foam`/`Steel`/`Wood`/`Custom`) | [`caliper-sim-mujoco::mjcf`](./../capabilities/data-factory.md) | via `mjcf` scene | ✗ | ✗ |
-| **Contact stability linter** `C001`–`C003` | [`caliper-sim-mujoco::lint`](../capabilities/data-factory.md) | ✗ | ✗ | ✗ (engine-only, mujoco feature) |
+| **Contact material presets** (`Rigid`/`Rubber`/`Foam`/`Steel`/`Wood`/`Custom`) | [`caliper-sim-mujoco::mjcf`](./../capabilities/data-factory.md) | ✗ (`mjcf` has no material flag) | `model_to_mjcf(material=…)` — preset name or custom dict | ✗ |
+| **Contact stability linter** `C001`–`C003` | [`caliper-sim-mujoco::lint`](../capabilities/data-factory.md) | ✗ | ✗ | automatic after every contact bake (findings under the Simulate badges; mujoco builds) |
 | Convex-decomposition seam (identity impl) | [`caliper-sim-mujoco`](../capabilities/data-factory.md) | ✗ | ✗ | ✗ |
 
 ## Collision & planning
@@ -81,21 +81,22 @@ Faces: [CLI](../faces/cli.md) · [Python](../faces/python.md) ·
 | Dataset record (LeRobotDataset) | [`caliper-dataset`](../capabilities/control-safety.md) | `record` (v3.0 / `--format v21`) | `RecorderV3` / `Recorder` | ✗ |
 | Dataset replay through a sim backend | `caliper-dataset` + `caliper-hal` | `replay` | ✗ (readers only) | ✗ |
 | Dataset read / browse / plot | `caliper-dataset` | ✗ | `DatasetReaderV3` / `DatasetReader` (incl. images) | Data mode (table, channel plots, thumbnails) |
-| Dataset edit: delete / split / merge / tags | `caliper-dataset::edit` | ✗ | `dataset_delete_episodes` / `dataset_split_episode` / `dataset_merge_episodes` / `dataset_read_tags` / `dataset_write_tags` | Data mode edit bar + tag chips |
-| **Dataset doctor** `D001`–`D015` | [`caliper-dataset::analyze`](../capabilities/doctors.md) | `data doctor` | `data_doctor` | Data mode: Doctor button (episode-jump findings) |
+| Dataset edit: delete / split / merge / tags | `caliper-dataset::edit` | `data delete` / `data split` / `data merge` / `data tag` | `dataset_delete_episodes` / `dataset_split_episode` / `dataset_merge_episodes` / `dataset_read_tags` / `dataset_write_tags` | Data mode edit bar + tag chips |
+| **Dataset doctor** `D001`–`D016` | [`caliper-dataset::analyze`](../capabilities/doctors.md) | `data doctor` | `data_doctor` | Data mode: Doctor button (episode-jump findings) |
 | Joint-offset calibration (Gauss-Newton) | [`caliper-calib`](../capabilities/calibration.md) | `calibrate` (incl. `--self-test`) | `calibrate_joint_offsets` | ✗ |
 | lerobot calibration-file export | Python interop | ✗ | `export_lerobot_calibration` | ✗ |
 | robomimic HDF5 export | Python interop | ✗ | `export_robomimic_hdf5` | ✗ |
 | BC learning (BC-MLP / ACT-lite / DDPM) | [`learn/caliper_learn` sidecar](../capabilities/learning.md) | ✗ | separate `caliper_learn` package (on top of these bindings) | ✗ |
+| **Deploy a lerobot checkpoint** — safetensors-only loader + closed-loop sim runner | [`caliper_learn.hub`/`runner`](../capabilities/learning.md) | ✗ ³ | `load_lerobot_policy` / `LoadedPolicy` / `run_policy` | ✗ ³ |
 | **Seeded policy eval** — Wilson-95, `E001`–`E003`, checkpoint `sweep` | [`caliper_learn.eval`](../capabilities/verdicts.md) | ✗ ³ (`caliper-learn eval`) | `evaluate` / `sweep` / `reach_eval_task` | ✗ ³ |
 | **Deploy-loop latency profile** — `L001`–`L003`, honest achievable Hz | [`caliper_learn.profile`](../capabilities/verdicts.md) | ✗ ³ (`caliper-learn profile`) | `profile_rollout` | ✗ ³ |
 | **Policy deploy debugger** `P001`–`P008` | [`caliper_learn.debugger`](../capabilities/verdicts.md) | ✗ ³ (`caliper-learn debug`) | `analyze_policy` | ✗ ³ |
 | **Policy Autopsy** — D+P+E+L under one verdict | [`caliper_learn.autopsy`](../capabilities/verdicts.md) | ✗ ³ (`caliper-learn autopsy`) | `autopsy` | ✗ ³ |
-| **Domain randomization** (CI-diffable seeded draws) | [`caliper_learn.randomize`](../capabilities/data-factory.md) | ✗ | `RandomizationSpec` / `sample` / `apply_to_mjcf` / `apply_to_env` / `VecSimEnv(randomization=)` | ✗ |
+| **Domain randomization** (CI-diffable seeded draws) | [`caliper_learn.randomize`](../capabilities/data-factory.md) | ✗ | `RandomizationSpec` / `sample_randomization` / `apply_to_mjcf` / `apply_to_env` / `VecSimEnv(randomization=)` | ✗ |
 | **Coverage generator** (doctor→generator loop) | [`caliper_learn.coverage_gen`](../capabilities/data-factory.md) | ✗ ³ (`caliper-learn coverage`) | `generate_coverage` | ✗ |
 | Vectorized sim env (gym-vector semantics) | [`caliper_learn.vec_env`](../capabilities/learning.md) | ✗ | `VecSimEnv` / `reach_task` / `rollout_random` | ✗ |
 | Sim-camera collector (offscreen → image dataset) | [`caliper_learn.sim_camera`](../capabilities/learning.md) | ✗ | `SimCameraScene` / `collect_camera_dataset` | ✗ |
-| **MP4 video features** (dtype `video`, lerobot-exact) | [`caliper_learn.video`](../capabilities/data-factory.md) | ✗ | `encode_episode_video` / `VideoRecorder` / `attach_video_metadata` / `available` | ✗ |
+| **MP4 video features** (dtype `video`, lerobot-exact) | [`caliper_learn.video`](../capabilities/data-factory.md) | ✗ | `encode_episode_video` / `VideoRecorder` / `attach_video_metadata` | ✗ |
 
 ## Dataflow graph
 
@@ -111,7 +112,7 @@ Faces: [CLI](../faces/cli.md) · [Python](../faces/python.md) ·
 |---|---|---|---|---|
 | Engine version / build info | `caliper::VERSION` | `info` / `--version` | `version()` / `__version__` | toolbar readout |
 | First-run guided tour | — (frontend) | ✗ | ✗ | 6-step overlay + palette "Show tour" |
-| Lightweight benchmark harness | — (scripts) | `scripts/measure_lightweight.sh` | ✗ | ✗ |
+| Lightweight benchmark harness | — (scripts) | ✗ (a shell script, not a verb: `scripts/measure_lightweight.sh` drives the CLI) | ✗ | ✗ |
 
 ---
 

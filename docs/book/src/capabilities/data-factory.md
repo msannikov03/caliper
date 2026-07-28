@@ -112,6 +112,18 @@ let opts = MjcfOptions {
 `dmin`/`dmax` in `(0,1)` with `dmin ≤ dmax`) — a bad tuple is rejected loudly,
 not silently clamped.
 
+From Python, the same presets ride `model_to_mjcf`'s `material=` kwarg — a
+preset name or a custom dict:
+
+```python
+xml = caliper.model_to_mjcf(robot, ground=0.0, material="rubber")
+xml = caliper.model_to_mjcf(robot, ground=0.0, material={
+    "solref": (0.01, 1.0),
+    "solimp": (0.9, 0.95, 0.001),
+    "friction": (1.2, 0.01, 0.0002),
+})
+```
+
 ## Contact stability linter
 
 With the `mujoco` feature, `lint_contact_stability` runs a settle rollout and
@@ -129,6 +141,11 @@ reports how a scene misbehaves, each finding with a concrete fix:
 blow-up). The classifier core (`classify_stability`) is pure and always
 compiled; only the rollout that produces a trace needs MuJoCo.
 
+In Studio (mujoco builds), the linter runs **automatically after every
+contact bake** — drop / hold / drive-to — over the same rollout's per-step
+trace; findings appear under the Simulate panel's contact badges (a clean
+scene shows a `stability ✓` badge).
+
 ## Convex decomposition seam
 
 A single convex hull is a poor collider for a concave part (a cup collides like
@@ -143,8 +160,9 @@ heavy algorithm is deliberately **not** vendored yet.
 
 Datasets can store camera streams as real MP4 video (dtype `video`) instead of
 per-frame PNGs — the layout modern lerobot policies expect. `caliper_learn.video`
-mirrors lerobot 0.4.4's own encode settings (`libsvtav1`, `yuv420p`, `g=2`,
-`crf=30`; H.264 alternative) so the output is byte-compatible.
+mirrors lerobot's own encode settings (`libsvtav1`, `yuv420p`, `g=2`,
+`crf=30`; H.264 alternative — 0.4.4's defaults, still 0.6.0's software-encode
+defaults) so the output is byte-compatible.
 
 ```python
 from caliper_learn.video import available, encode_episode_video, VideoRecorder

@@ -81,7 +81,7 @@ def test_doctor_finds_each_crafted_defect(fixture, expected):
 def test_doctor_single_finding_fixtures_report_nothing_else():
     # These fixtures document their finding as the ONLY one in the report.
     for fixture, code, severity in [
-        ("doctor_visual_only.urdf", "A005", "warn"),
+        ("doctor_visual_only.urdf", "A005", "warning"),
         ("doctor_onshape.urdf", "A010", "info"),
         ("doctor_zero_axis.urdf", "A008", "error"),
     ]:

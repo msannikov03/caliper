@@ -72,7 +72,7 @@ follow the links, they may have changed.
 |---|---|---|---|
 | **NVIDIA Isaac Sim** | ~10 GB-class download, 50 GB disk recommended | **RTX GPU required** (min. GeForce RTX 3070-class); 32 GB RAM min, 64 GB recommended [\[req\]](https://docs.isaacsim.omniverse.nvidia.com/latest/installation/requirements.html) | first launch compiles shaders — minutes, on qualifying hardware only |
 | **MoveIt 2** | full ROS 2 desktop install (multi-GB); prebuilt binaries are Ubuntu-via-apt, everything else is a colcon source build [\[install\]](https://moveit.ai/install-moveit2/binary/) | no GPU, but a supported Ubuntu/ROS 2 pairing | a workspace build from source is commonly tens of minutes |
-| **lerobot** (pip) | `pip install lerobot` pulls PyTorch (+CUDA wheels on Linux, ~2.5 GB for torch alone [\[pypi\]](https://pypi.org/project/torch/#files)) plus the `av` FFmpeg wheel — a multi-GB environment [\[lerobot\]](https://pypi.org/project/lerobot/) | CPU works; GPU needed for serious training | minutes of dependency resolution + download |
+| **lerobot** (pip) | `pip install "lerobot[dataset]"` (≥ 0.6 the bare install can't even load datasets) pulls PyTorch (+CUDA wheels on Linux, ~2.5 GB for torch alone [\[pypi\]](https://pypi.org/project/torch/#files)) plus the `av` FFmpeg wheel — a multi-GB environment [\[lerobot\]](https://pypi.org/project/lerobot/) | CPU works; GPU needed for serious training | minutes of dependency resolution + download |
 | **Caliper** | one 10 MB `.dmg`, one CLI binary, one abi3 wheel | **no GPU, no ROS, no CUDA** — a laptop | see the table above |
 
 To be fair to the incumbents: Isaac Sim is a photorealistic GPU simulator,

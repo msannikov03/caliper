@@ -26,6 +26,7 @@
   - [Studio (desktop app)](./faces/studio.md)
 
 - [Capability matrix](./reference/capability-matrix.md)
+- [Pose forms](./reference/pose-forms.md)
 - [Lightweight, measured](./reference/lightweight.md)
 - [Stability contract](./reference/stability.md)
 - [Headless CI recipe](./reference/headless-ci.md)

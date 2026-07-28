@@ -20,7 +20,7 @@ use caliper_dataset::{
     DatasetReader as EngineReaderV3, DatasetSpec as DatasetSpecV3, DatasetWriter as EngineWriterV3,
     FeatureSpec,
 };
-use caliper_sim_mujoco::mjcf::{MjcfOptions, mjcf_from_model};
+use caliper_sim_mujoco::mjcf::{Actuation, ContactMaterial, MjcfOptions, mjcf_from_model};
 use nalgebra::{DMatrix, Matrix3, UnitQuaternion, Vector3};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
@@ -2306,6 +2306,69 @@ fn calibrate_joint_offsets(
 
 // ===== MJCF export (module function) =====
 
+/// A contact material at the FFI boundary: a preset NAME, or a custom dict
+/// of the three raw MuJoCo per-geom solver knobs.
+#[derive(FromPyObject)]
+enum MaterialInput {
+    /// Preset name: `"rigid" | "rubber" | "foam" | "steel" | "wood"`
+    /// (case-insensitive).
+    Name(String),
+    /// Raw knobs: `{"solref": (timeconst, dampratio), "solimp": (dmin, dmax,
+    /// width), "friction": (slide, torsion, roll)}` — all three keys required.
+    Custom(std::collections::BTreeMap<String, Vec<f64>>),
+}
+
+/// [`MaterialInput`] → engine [`ContactMaterial`]. Shape errors (unknown
+/// preset, missing/unknown keys, wrong tuple lengths) are rejected here;
+/// VALUE errors (non-finite, out-of-range) are rejected by the generator's
+/// own `Custom` validation, so both faces share one rulebook.
+fn contact_material(m: &MaterialInput) -> PyResult<ContactMaterial> {
+    let err = pyo3::exceptions::PyValueError::new_err;
+    match m {
+        MaterialInput::Name(name) => match name.to_ascii_lowercase().as_str() {
+            "rigid" => Ok(ContactMaterial::Rigid),
+            "rubber" => Ok(ContactMaterial::Rubber),
+            "foam" => Ok(ContactMaterial::Foam),
+            "steel" => Ok(ContactMaterial::Steel),
+            "wood" => Ok(ContactMaterial::Wood),
+            other => Err(err(format!(
+                "unknown material preset `{other}` — expected one of rigid, rubber, foam, \
+                 steel, wood, or a custom dict {{solref, solimp, friction}}"
+            ))),
+        },
+        MaterialInput::Custom(map) => {
+            for k in map.keys() {
+                if !matches!(k.as_str(), "solref" | "solimp" | "friction") {
+                    return Err(err(format!(
+                        "unknown material key `{k}` — a custom material takes exactly \
+                         solref, solimp, friction"
+                    )));
+                }
+            }
+            let get = |key: &str, len: usize| -> PyResult<&[f64]> {
+                let v = map
+                    .get(key)
+                    .ok_or_else(|| err(format!("custom material is missing `{key}`")))?;
+                if v.len() != len {
+                    return Err(err(format!(
+                        "material {key} needs {len} values, got {}",
+                        v.len()
+                    )));
+                }
+                Ok(v.as_slice())
+            };
+            let solref = get("solref", 2)?;
+            let solimp = get("solimp", 3)?;
+            let friction = get("friction", 3)?;
+            Ok(ContactMaterial::Custom {
+                solref: (solref[0], solref[1]),
+                solimp: (solimp[0], solimp[1], solimp[2]),
+                friction: (friction[0], friction[1], friction[2]),
+            })
+        }
+    }
+}
+
 /// Generate a minimal MuJoCo MJCF document (an XML string) from a robot
 /// model: kinematic tree, hinge/slide joints, inertials, primitive collision
 /// geoms, optional ground plane. Pure string generation — nothing here links
@@ -2319,8 +2382,22 @@ fn calibrate_joint_offsets(
 ///
 /// Convex-hull (mesh) colliders are not exported to MJCF; if the model has
 /// any, a `UserWarning` reports the reduced MuJoCo collision coverage.
+///
+/// `material` stamps a contact material (`solref`/`solimp`/`friction`) on
+/// every emitted geom: a preset name (`"rigid"`, `"rubber"`, `"foam"`,
+/// `"steel"`, `"wood"`) or a custom dict
+/// `{"solref": (timeconst, dampratio), "solimp": (dmin, dmax, width),
+/// "friction": (slide, torsion, roll)}`. `None` (the default) emits no
+/// contact attributes at all — plain MuJoCo defaults, byte-identical to the
+/// material-less output.
+///
+/// `actuators=True` emits one `<position>` servo per joint (`kp`/`kv`
+/// gains — `ctrl` then holds target joint positions) instead of the default
+/// torque-direct (actuator-less) document, mirroring the CLI's
+/// `mjcf --actuators`.
 #[pyfunction]
-#[pyo3(signature = (robot, ground=None, extra_xml=None, timestep=1e-3, joint_damping=0.0))]
+#[pyo3(signature = (robot, ground=None, extra_xml=None, timestep=1e-3, joint_damping=0.0, material=None, actuators=false, kp=100.0, kv=10.0))]
+#[allow(clippy::too_many_arguments)]
 fn model_to_mjcf(
     py: Python<'_>,
     robot: &Robot,
@@ -2328,12 +2405,22 @@ fn model_to_mjcf(
     extra_xml: Option<String>,
     timestep: f64,
     joint_damping: f64,
+    material: Option<MaterialInput>,
+    actuators: bool,
+    kp: f64,
+    kv: f64,
 ) -> PyResult<String> {
     let opt = MjcfOptions {
         timestep,
         joint_damping,
         ground_plane: ground,
         extra_worldbody_xml: extra_xml,
+        actuation: if actuators {
+            Actuation::PositionServo { kp, kv }
+        } else {
+            Actuation::TorqueDirect
+        },
+        default_material: material.as_ref().map(contact_material).transpose()?,
         ..Default::default()
     };
     let doc = mjcf_from_model(&robot.inner.model, &opt)
@@ -2361,11 +2448,14 @@ fn doc_err(e: caliper_doctor::DoctorError) -> PyErr {
     pyo3::exceptions::PyValueError::new_err(e.to_string())
 }
 
-/// Lowercase severity tag for the asset-doctor dicts.
+/// Lowercase severity tag for the asset-doctor dicts. `"warning"` (not
+/// `"warn"`) — ONE spelling across the Python doctor surface: the dataset
+/// doctor and the trajectory lint already said `"warning"`, and the asset
+/// doctor was unified to match pre-1.0 (0.1.x is the window for this rename).
 fn doctor_severity_str(s: caliper_doctor::Severity) -> &'static str {
     match s {
         caliper_doctor::Severity::Error => "error",
-        caliper_doctor::Severity::Warn => "warn",
+        caliper_doctor::Severity::Warn => "warning",
         caliper_doctor::Severity::Info => "info",
     }
 }
@@ -2412,7 +2502,7 @@ fn repair_action_dict<'py>(
 /// defects, xacro leftovers (stable codes A001–A014).
 ///
 /// Returns a dict `{findings, errors, warnings, infos, clean, repair}` where
-/// each finding is `{code, severity ("error"|"warn"|"info"), message,
+/// each finding is `{code, severity ("error"|"warning"|"info"), message,
 /// fix_hint, auto_fixable}`. Findings are data, never exceptions; a
 /// `ValueError` means the file could not even be inspected.
 ///

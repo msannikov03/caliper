@@ -43,7 +43,7 @@ end, so every cell of this matrix is pinned by an oracle test that runs the
 
 | Format | Write | Read | Proof |
 |---|---|---|---|
-| **v3.0** (native) | ✓ default — `caliper record`, `RecorderV3` | ✓ `DatasetReaderV3`, `replay` auto-detects | our recording loads **directly** in lerobot 0.4.4 (windowing + padding asserted, one verified-decreasing SGD step); cross-direction: our reader reads a lerobot-written dataset; edits stay loadable — `oracle/tests/test_dataset_v3.py` |
+| **v3.0** (native) | ✓ default — `caliper record`, `RecorderV3` | ✓ `DatasetReaderV3`, `replay` auto-detects | our recording loads **directly** in lerobot **0.4.4 AND 0.6.0** — proven against both: 0.4.4 (windowing + padding asserted, one verified-decreasing SGD step) and 0.6.0 (py3.12 / torch 2.11 / datasets 4.8.5 pairing, 2026-07-28: `delta_timestamps` windowing, edge padding, task strings and a `DataLoader` batch all exactly match the recording, zero warnings); cross-direction: our reader reads a lerobot-written dataset; edits stay loadable — `oracle/tests/test_dataset_v3.py` |
 | **v2.1** (legacy) | ✓ `caliper record --format v21`, `Recorder` | ✓ `DatasetReader`, `replay` auto-detects | schema + stats validated via pyarrow (`oracle/tests/test_lerobot_dataset.py`); full round-trip through lerobot's own v2.1→v3.0 converter and back into a real `LeRobotDataset` load — `oracle/tests/test_lerobot_roundtrip.py` |
 
 The lerobot-version fine print, pinned by test rather than hoped
@@ -52,6 +52,21 @@ datasets natively; lerobot **≥ 0.4** dropped v2.x reading entirely and
 rejects them with its own `BackwardCompatibilityError` version gate — that is
 lerobot's contract, not a Caliper bug, and it is why v3.0 is the default. Any
 *other* parse error against our metadata fails the oracle.
+
+Pairing with modern lerobot, three practical notes:
+
+- **Install the dataset extra.** lerobot ≥ 0.6's *base* install drops the
+  dataset dependencies — pair with `pip install "lerobot[dataset]"`, or
+  `LeRobotDataset` imports fail on a bare install.
+- **Python floor.** lerobot ≥ 0.5 requires **Python 3.12**; a 3.10/3.11
+  environment is permanently capped at lerobot 0.4.4 (still a proven
+  pairing — see the matrix).
+- **Converter location moved.** The official v2.1→v3.0 converter lives at
+  `lerobot.scripts.convert_dataset_v21_to_v30` in lerobot ≥ 0.5 (0.4.x
+  shipped it at `lerobot.datasets.v30.convert_dataset_v21_to_v30`) and its
+  `root` semantics changed with the move — the upgrade path for v2.1
+  recordings is version-specific, not copy-paste
+  (`oracle/tests/test_lerobot_roundtrip.py` handles both).
 
 Within a minor release the on-disk bytes we write for a given format do not
 change meaning; a format-affecting change is a **Changed** entry by the policy

@@ -79,12 +79,21 @@ def calibrate_joint_offsets(
     """
     ...
 
+# A contact material: a preset name ("rigid"|"rubber"|"foam"|"steel"|"wood",
+# case-insensitive) or a custom dict {"solref": (timeconst, dampratio),
+# "solimp": (dmin, dmax, width), "friction": (slide, torsion, roll)}.
+_Material = Union[str, dict[str, Sequence[float]]]
+
 def model_to_mjcf(
     robot: "Robot",
     ground: Optional[float] = ...,
     extra_xml: Optional[str] = ...,
     timestep: float = ...,
     joint_damping: float = ...,
+    material: Optional[_Material] = ...,
+    actuators: bool = ...,
+    kp: float = ...,
+    kv: float = ...,
 ) -> str:
     """Generate a minimal MuJoCo MJCF document (XML string) from the robot.
 
@@ -93,6 +102,13 @@ def model_to_mjcf(
     verbatim inside `<worldbody>` (after the ground plane, before the robot
     bodies) — the hook for `<camera>`/`<geom>`/`<light>` elements. Convex-hull
     (mesh) colliders are not exported; a `UserWarning` reports any skipped.
+
+    `material` stamps a contact material (solref/solimp/friction attributes)
+    on every emitted geom — a preset name or a custom dict (see `_Material`);
+    `None` emits no contact attributes (plain MuJoCo defaults). With
+    `actuators=True` the document carries one `<position>` servo per joint
+    (`kp`/`kv` gains) instead of the default torque-direct layout, mirroring
+    the CLI's `mjcf --actuators`.
     """
     ...
 
@@ -145,9 +161,9 @@ def doctor(
     inertials, unresolvable meshes, duplicate mesh basenames, missing
     colliders, unusable limits, bad axes, mimic defects, xacro leftovers).
     Returns `{findings, errors, warnings, infos, clean, repair}`; each
-    finding is `{code, severity ("error"|"warn"|"info"), message, fix_hint,
-    auto_fixable}`. Findings are data — `ValueError` only when the file
-    cannot even be inspected.
+    finding is `{code, severity ("error"|"warning"|"info"), message,
+    fix_hint, auto_fixable}`. Findings are data — `ValueError` only when the
+    file cannot even be inspected.
 
     With `repair=True`, applies every mechanical repair (computed inertials
     at `density` kg/m^3, normalized axes, deduped mesh basenames,

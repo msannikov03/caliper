@@ -42,11 +42,11 @@ The prevailing workflow in robot learning is: export a URDF from CAD, record
 some demos, and — as one practitioner put it — *everybody just starts training
 and hopes for the best*. Caliper replaces hope with reports:
 
-- **Asset doctor** (`caliper doctor`, `A001`–`A014`) — inertia a converter
+- **Asset doctor** (`caliper doctor`, `A001`–`A016`) — inertia a converter
   dropped, meshes that don't resolve, limits that can't move: diagnosed in one
   pass, mechanically repaired into a *copy* on request. Runs automatically on
   every Studio load.
-- **Dataset doctor** (`caliper data doctor`, `D001`–`D015`) — variance
+- **Dataset doctor** (`caliper data doctor`, `D001`–`D016`) — variance
   collapse, stale normalization stats, contradictory demos, dead cameras —
   caught *before* the GPU bill, not after.
 - **Trajectory lint** (`caliper report`, `T001`–`T009`) — limit violations,
@@ -111,7 +111,7 @@ where a number is still `TBD`, the page says so instead of rounding hope.
 | **2 IK & singularity** | Damped-least-squares / Levenberg–Marquardt CLIK with manipulability-gated damping, step clamping, joint limits, multi-restart; **analytic 6R IK**; singular-value / manipulability / condition-number analysis |
 | **3 Motion** | Jerk-limited 7-segment S-curve trajectories; time-synchronized **MOVE_J**, Cartesian **MOVE_L / MOVE_C** (arc through a via point); **time-optimal (TOPP) retiming**; waypoint retiming; O(1) closed-form `sample(t)` |
 | **4 Dynamics** | Inverse dynamics (**RNEA**), joint-space mass matrix (**CRBA**), forward dynamics, centroidal quantities (COM / total mass), semi-implicit-Euler `Simulator` with gravity |
-| **5 Real robots** | Real `RobotBackend` contract; computed-torque `ControlLoop` (+ streaming `run_stream`); `SafetyMonitor`; teleop (leader–follower); LeRobotDataset **v3.0 native** record/replay (+ legacy v2.1) — loads directly in `lerobot` >= 0.4, no converter; feature-gated CAN / Dynamixel hardware skeletons |
+| **5 Real robots** | Real `RobotBackend` contract; computed-torque `ControlLoop` (+ streaming `run_stream`); `SafetyMonitor`; teleop (leader–follower); LeRobotDataset **v3.0 native** record/replay (+ legacy v2.1) — loads directly in `lerobot` >= 0.4 (proven vs 0.4.4 and 0.6.0; pair with `pip install "lerobot[dataset]"`), no converter; feature-gated CAN / Dynamixel hardware skeletons |
 | **6 Planning** | **RRT-Connect** + **RRT\*** + **PRM** (deterministic, seeded), shortcut smoothing, **CHOMP-style trajectory optimization** (`caliper-trajopt`), collision-aware reachability |
 | **7 Learning** | `learn/caliper_learn` — pure-PyTorch behavior-cloning sidecar (BC-MLP / ACT-lite / optional DDPM), goal-conditioned, zero `lerobot` runtime dependency |
 | **8 Studio graph** | `caliper-graph` serde dataflow IR + deterministic executor (11 node kinds) + a Simulink-style node editor face (run on all three faces) |

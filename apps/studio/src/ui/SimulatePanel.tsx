@@ -112,7 +112,22 @@ export function SimulatePanel() {
                 {ncon > 0 ? `CONTACT ×${ncon}` : "no contact"}
               </span>
               {contactClip!.settled && <span className="badge ok">settled</span>}
+              {contactClip!.lint?.length === 0 && (
+                <span className="badge ok" title="contact stability lint C001–C003: no findings">
+                  stability ✓
+                </span>
+              )}
             </div>
+          )}
+          {simTraj?.kind === "contact" && simTraj.lint && simTraj.lint.length > 0 && (
+            <ul className="lint-list">
+              {simTraj.lint.map((f) => (
+                <li key={f.code} title={f.message}>
+                  <span className="badge bad">{f.code}</span>
+                  <span className="lint-fix">{f.suggestion}</span>
+                </li>
+              ))}
+            </ul>
           )}
         </>
       ) : (

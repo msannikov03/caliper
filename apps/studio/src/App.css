@@ -891,6 +891,25 @@ input[type="range"] {
   color: var(--faint);
   font-size: 10px;
 }
+/* contact stability lint findings (C001–C003) under the contact badges */
+.sim-panel .lint-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.sim-panel .lint-list li {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+}
+.sim-panel .lint-fix {
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.35;
+}
 
 /* ============================================================
    8 · NODE BLOCK VOCABULARY (.node-card) for the graph editor

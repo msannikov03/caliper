@@ -44,6 +44,46 @@ These are documented because getting them wrong produces silently-wrong results:
   init, because the model is built before `fit` runs — call `seed_all(0)` before
   `build_policy`.
 
+## Deploying a real lerobot checkpoint (the payoff leg)
+
+The sidecar can also run a **real lerobot Hub-convention ACT checkpoint**
+closed-loop in the deterministic sim — no lerobot server, no network, CPU
+only:
+
+```python
+import caliper
+from caliper_learn import load_lerobot_policy, run_policy
+
+robot = caliper.Robot.from_urdf("robot.urdf")
+policy = load_lerobot_policy("outputs/train/act_reach/checkpoints/last/pretrained_model")
+loop = caliper.ControlLoop(robot, dt=1 / 50)   # dt MUST match the training fps
+result = run_policy(policy, loop, fps=50, ticks=400)
+print(result.warn_ticks, result.times[-1])
+```
+
+- **`load_lerobot_policy(path, device="cpu") -> LoadedPolicy`** — loads a
+  LOCAL checkpoint directory (model.safetensors + config.json +
+  policy_{pre,post}processor.json). **Safetensors only**: any pickle-format
+  file (.bin/.pt/.pth/.ckpt/.pkl/.pickle) raises `CheckpointSecurityError` —
+  pickles execute arbitrary code on load. ACT policies with state-like input
+  features are supported this wave; VISUAL features raise a named
+  `NotImplementedError`.
+- **`LoadedPolicy`** — wraps the policy + its pre/post processor pipelines
+  behind `reset()` / `predict(obs_dict) -> action`. Action chunking uses
+  lerobot's OWN `select_action` semantics (one action popped per call,
+  replan every `n_action_steps`, temporal ensembling when configured), so
+  the in-sim loop consumes chunks exactly like `lerobot-eval` would.
+- **`run_policy(policy, control_loop, *, fps, ticks, obs_builder=None)`** —
+  the closed-loop runner: builds observations from measured state, vets every
+  commanded target through the `SafetyMonitor` inside `ControlLoop`, and
+  returns a `HubRolloutResult` (times/states/actions + `warn_ticks`). Any
+  object with `reset()`/`predict()` works, so home-grown policies use the
+  same runner.
+
+This is the leg the [latency profiler and debugger](verdicts.md) judge:
+`profile_rollout` takes the same `LoadedPolicy`, and `analyze_policy` takes
+the same checkpoint directory `load_lerobot_policy` loads.
+
 ## Diagnostics on top of the pipeline
 
 The sidecar also carries the W2 verdict stack — the seeded eval harness

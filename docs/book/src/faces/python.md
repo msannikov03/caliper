@@ -45,8 +45,8 @@ findings never raise; only an uninspectable input does:
 ```python
 import caliper
 
-# Asset doctor: A001–A014 over a URDF/xacro. Findings are dicts with
-# {code, severity ("error"|"warn"|"info"), message, fix_hint, auto_fixable}.
+# Asset doctor: A001–A016 over a URDF/xacro. Findings are dicts with
+# {code, severity ("error"|"warning"|"info"), message, fix_hint, auto_fixable}.
 rep = caliper.doctor("robot.urdf")
 assert rep["clean"] or rep["errors"] == 0
 
@@ -56,7 +56,7 @@ rep = caliper.doctor("robot.urdf", repair=True, density=2700.0)
 fixed = rep["repair"]["out"]
 assert caliper.doctor(fixed)["clean"]          # findings describe the ORIGINAL
 
-# Dataset doctor: D001–D015 over a LeRobotDataset v3.0 root. Also returns the
+# Dataset doctor: D001–D016 over a LeRobotDataset v3.0 root. Also returns the
 # recomputed per-feature stats {dim, mean, std, min, max, bin_occupancy}.
 dr = caliper.data_doctor("~/datasets/pick_place")
 for f in dr["findings"]:
@@ -86,3 +86,11 @@ where it historically was, now bounds-checked).
 One legacy form is grandfathered for back-compat: `Planner.plan_to_pose` also
 accepts its original flat 12-element row-major pose (9 rotation entries then
 `tx, ty, tz`). New code should use the 4×4 form.
+
+> **⚠ `fk` output is NOT `ik` input.** `Robot.fk` (and `exp6`) return 4×4
+> **ROW-major** nested lists, while every pose *input* above is
+> **COLUMN-major** — so `robot.ik(robot.fk(q), seed)` does not round-trip: the
+> bytes silently parse as the **transpose** (rotation inverted, translation
+> read as `[0, 0, 0]`) and IK "solves" a wrong target with no error raised.
+> Transpose at the boundary: `robot.ik(np.array(robot.fk(q)).T.tolist(),
+> seed)`. Full table + details: [Pose forms](../reference/pose-forms.md).

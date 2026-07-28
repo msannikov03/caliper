@@ -137,6 +137,16 @@ export interface SimTrajectoryDto extends TrajectoryDto {
   props?: PropTrack[] | null;
   /** MuJoCo contact count at each baked sample, aligned with `times` */
   contacts?: number[] | null;
+  /** contact stability lint (C001–C003) over the same rollout; present
+   *  (possibly empty = clean) on contact bakes, absent on builtin results */
+  lint?: ContactLintFinding[] | null;
+}
+/** One contact-stability finding (mirrors the backend `ContactLintDto`). */
+export interface ContactLintFinding {
+  /** stable lint code: "C001" | "C002" | "C003" */
+  code: string;
+  message: string;
+  suggestion: string;
 }
 /** `sim_contact_run` rollout flavors (mirrors the backend mode strings). */
 export type ContactMode = "drop" | "hold" | "drive_to";

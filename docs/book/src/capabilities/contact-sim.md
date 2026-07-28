@@ -3,7 +3,11 @@
 `caliper-sim-mujoco` puts MuJoCo behind caliper's existing backend seam, so the
 same `ControlLoop` / `SafetyMonitor` / teleop / recording stack that drives
 `PhysicsSimBackend` (contact-free) can drive a full contact simulation
-unchanged. Engine-side only for now — no Studio or Python surface yet.
+unchanged. Faces: Studio's Simulate mode drives the live sim in mujoco
+builds (with the `C001`–`C003` stability lint run after every bake), and
+Python reaches the MJCF generator via `model_to_mjcf` (incl. `material=` /
+`actuators=`); the `MujocoSim`/`MujocoBackend` layer itself has no Python
+binding yet.
 
 Two layers:
 

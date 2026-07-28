@@ -6,8 +6,8 @@ pay for them:
 
 | Doctor | Input | Codes | Catches |
 |---|---|---|---|
-| **Asset doctor** (`caliper-doctor`) | a `.urdf` / `.xacro` file | `A001`–`A014` | CAD-export defects that break loading, physics, or collision coverage |
-| **Dataset doctor** (`caliper-dataset::analyze`) | a LeRobotDataset v3.0 root | `D001`–`D015` | data defects that are invisible at record time and fatal to a trained policy |
+| **Asset doctor** (`caliper-doctor`) | a `.urdf` / `.xacro` file | `A001`–`A016` | CAD-export defects that break loading, physics, or collision coverage |
+| **Dataset doctor** (`caliper-dataset::analyze`) | a LeRobotDataset v3.0 root | `D001`–`D016` | data defects that are invisible at record time and fatal to a trained policy |
 | **Trajectory lint** (`caliper-kinematics::lint_path` + face-side collision lint) | a sampled trajectory | `T001`–`T009` | limit violations and path-quality hazards before a trajectory runs |
 
 Shared contract, all three:
@@ -20,7 +20,18 @@ Shared contract, all three:
 - **Sorted most-severe-first**, with per-severity counts.
 - **Severities**: *Error* = broken or actively wrong if ignored; *Warning* =
   runs/loads but behaves worse than you think; *Info* = worth knowing, nothing
-  wrong per se.
+  wrong per se. In machine-readable output (Python dicts, `--json`) the
+  spelling is lowercase `"error" | "warning" | "info"` — the Python asset
+  doctor's historical `"warn"` was unified to `"warning"` in the pre-1.0
+  window.
+- **Exit codes — the philosophy split.** The doctors here never gate:
+  `caliper doctor`, `caliper data doctor` and `caliper report` exit 0 with
+  findings (the report is the product; opt into gating with `report
+  --strict`). The learning sidecar's verdict console (`caliper-learn
+  debug|autopsy|eval|profile`) gates **by default** — exit 1 on any
+  error-severity finding — because those commands sit at the end of a
+  training pipeline where CI is the natural caller. See
+  [Verdicts](verdicts.md).
 
 Where to run them:
 
@@ -32,7 +43,7 @@ Where to run them:
 
 ---
 
-## Asset doctor (`A001`–`A014`)
+## Asset doctor (`A001`–`A016`)
 
 Real-world URDFs — CAD exports above all — routinely carry defects that the
 rest of the stack surfaces late, one at a time, or not at all: a silently
@@ -168,7 +179,20 @@ loader but not everywhere. Repair: `inject_limits` writes the mandatory
 
 ---
 
-## Dataset doctor (`D001`–`D015`)
+**A015 — duplicate link/joint names** *(Error)*. Two links (or joints) share a
+name — lookups become ambiguous, and a name-keyed repair could write one
+link's computed inertial into another. The doctor flags every duplicate;
+repair targets links positionally so each duplicate receives the inertial
+computed from its *own* geometry. Fix: rename the duplicates in the source.
+
+**A016 — unparseable numeric attribute** *(Error, auto-fixable for revolute
+ranges)*. A `<limit>` float or `<origin>` `xyz`/`rpy` value that does not
+parse as a number. Parsers that default these to `0.0` silently change the
+robot; the doctor reports the raw text instead, and repair replaces an
+unparseable revolute range with conservative injected limits.
+
+
+## Dataset doctor (`D001`–`D016`)
 
 Pre-training diagnostics over a native LeRobotDataset v3.0. Every check
 targets a failure mode that is **invisible at record time, silent during
@@ -281,6 +305,14 @@ deleted on the spot. Any structural edit clears the report (it described the
 pre-edit bytes); run the Doctor again after editing.
 
 ---
+
+**D016 — non-finite values** *(Error)*. A feature holds NaN/inf frames, or an
+episode's timestamps are non-finite. Every statistic downstream (means, stds,
+normalization) silently propagates NaN — a single poisoned frame can zero an
+entire training run. The writer now rejects non-finite values at `add_frame`,
+so this fires only on datasets produced elsewhere. Fix: drop or repair the
+poisoned episodes (`delete` via the edit ops).
+
 
 ## Trajectory lint (`T001`–`T009`)
 

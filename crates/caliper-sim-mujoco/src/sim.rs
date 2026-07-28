@@ -1,10 +1,13 @@
 //! `MujocoSim` — a thin, deterministic, headless seam over `mujoco-rs`.
 //!
 //! Design rules:
-//! - Joint addressing is resolved by NAME through `mj_name2id` +
-//!   `jnt_qposadr`/`jnt_dofadr` at construction — never by assuming MuJoCo's
-//!   qpos order matches caliper's joint order (it does for our generated MJCF,
-//!   but the map makes that a fact, not an assumption).
+//! - Joint addressing is resolved at construction through `jnt_qposadr` /
+//!   `jnt_dofadr` — never by assuming MuJoCo's qpos order matches caliper's
+//!   joint order (it does for our generated MJCF, but the map makes that a
+//!   fact, not an assumption). Caliper builds resolve joint ids by the
+//!   SANITIZED name the generator emitted ([`mjcf::mujoco_name`] — MuJoCo
+//!   registers `left_arm` for `<joint name="left arm">`); raw-MJCF loads take
+//!   every joint by document id, so unnamed joints are fine.
 //! - Only fixed-base trees of 1-dof joints (hinge/slide) are mapped; anything
 //!   else fails loudly at load.
 //! - Determinism: MuJoCo is single-threaded per `mjData` (we never opt into
@@ -60,14 +63,28 @@ impl MujocoSim {
     }
 
     /// Build from a caliper model: generate minimal MJCF, load it, and map
-    /// caliper joint order → MuJoCo addresses by name.
+    /// caliper joint order → MuJoCo addresses by the SANITIZED name the
+    /// generator emitted ([`mjcf::mujoco_name`]); the caliper spelling stays
+    /// the user-facing one in [`joint_names`](Self::joint_names) and errors.
     pub fn from_caliper_model_with(m: &Model, opt: &MjcfOptions) -> Result<Self, MujocoError> {
         let doc = mjcf::mjcf_from_model(m, opt)?;
         let mj =
             MjModel::from_xml_string(&doc.xml).map_err(|e| MujocoError::Load(e.to_string()))?;
+        // The generator SANITIZES identifiers, so MuJoCo registered
+        // `mujoco_name(..)` of each caliper joint name (`left arm` →
+        // `left_arm`) — resolve that spelling, but keep (and report errors
+        // with) the caliper spelling the user knows.
+        let mut joint_ids = Vec::with_capacity(m.joint_names.len());
+        for name in &m.joint_names {
+            let id = mj
+                .name_to_id(MjtObj::mjOBJ_JOINT, &mjcf::mujoco_name(name))
+                .ok_or_else(|| MujocoError::MissingJoint(name.clone()))?;
+            joint_ids.push(id);
+        }
         let sim = Self::from_parts(
             mj,
             m.joint_names.clone(),
+            joint_ids,
             doc.skipped_hull_colliders,
             &doc.prop_bodies,
         )?;
@@ -79,35 +96,42 @@ impl MujocoSim {
 
     /// Load a raw MJCF string. Every joint in the document must be hinge or
     /// slide (fixed-base articulated models only); the flat `q` order is
-    /// MuJoCo's joint order.
+    /// MuJoCo's joint order. Joints are addressed by document ID, so unnamed
+    /// joints (legal MJCF) load fine — they show up in
+    /// [`joint_names`](Self::joint_names) as the placeholder `joint{id}`.
     pub fn from_mjcf(xml: &str) -> Result<Self, MujocoError> {
         let mj = MjModel::from_xml_string(xml).map_err(|e| MujocoError::Load(e.to_string()))?;
-        let names: Vec<String> = (0..mj.njnt() as usize)
+        let (names, ids): (Vec<String>, Vec<usize>) = (0..mj.njnt() as usize)
             .map(|id| {
-                mj.id_to_name(MjtObj::mjOBJ_JOINT, id)
+                let name = mj
+                    .id_to_name(MjtObj::mjOBJ_JOINT, id)
                     .map(str::to_string)
-                    .unwrap_or_else(|| format!("joint{id}"))
+                    .unwrap_or_else(|| format!("joint{id}"));
+                (name, id)
             })
-            .collect();
-        Self::from_parts(mj, names, 0, &[])
+            .unzip();
+        Self::from_parts(mj, names, ids, 0, &[])
     }
 
+    /// `joint_names[i]` is the user-facing spelling for MuJoCo joint
+    /// `joint_ids[i]` — the caller has already RESOLVED the ids (by sanitized
+    /// name for caliper builds, by document order for raw MJCF), so no name
+    /// lookup happens here.
     fn from_parts(
         mj: MjModel,
         joint_names: Vec<String>,
+        joint_ids: Vec<usize>,
         skipped_hull_colliders: usize,
         prop_bodies: &[(String, String)],
     ) -> Result<Self, MujocoError> {
+        debug_assert_eq!(joint_names.len(), joint_ids.len());
         let mut qpos_adr = Vec::with_capacity(joint_names.len());
         let mut dof_adr = Vec::with_capacity(joint_names.len());
         {
             let types = mj.jnt_type();
             let qadr = mj.jnt_qposadr();
             let dadr = mj.jnt_dofadr();
-            for name in &joint_names {
-                let id = mj
-                    .name_to_id(MjtObj::mjOBJ_JOINT, name)
-                    .ok_or_else(|| MujocoError::MissingJoint(name.clone()))?;
+            for (name, &id) in joint_names.iter().zip(&joint_ids) {
                 match types[id] {
                     MjtJoint::mjJNT_HINGE | MjtJoint::mjJNT_SLIDE => {}
                     _ => return Err(MujocoError::UnsupportedJoint(name.clone())),
@@ -122,11 +146,15 @@ impl MujocoSim {
         }
         let nu = mj.nu() as usize;
         // Resolve prop body ids by NAME while we still own the model — our
-        // MJCF emitted these bodies, so a miss is a generator bug surfaced loud.
+        // MJCF emitted these bodies, so a miss is a generator bug surfaced
+        // loud. The doc spelling in `prop_bodies` is XML-ESCAPED; MuJoCo
+        // registers the unescaped attribute value, i.e. `mujoco_name(..)` of
+        // the prop name.
         let mut props = Vec::with_capacity(prop_bodies.len());
         for (pname, bname) in prop_bodies {
+            let registered = format!("prop_{}", mjcf::mujoco_name(pname));
             let id = mj
-                .name_to_id(MjtObj::mjOBJ_BODY, bname)
+                .name_to_id(MjtObj::mjOBJ_BODY, &registered)
                 .ok_or_else(|| MujocoError::MissingBody(bname.clone()))?;
             props.push((pname.clone(), id));
         }

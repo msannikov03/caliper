@@ -894,8 +894,22 @@ fn f(x: f64) -> String {
     format!("{x:?}")
 }
 
+/// The identifier MuJoCo actually REGISTERS for a name the generator ran
+/// through `sanitize`: whitespace becomes `_` (MuJoCo names must not contain
+/// spaces), while the XML escaping `sanitize` adds is undone by the XML
+/// parser at load time — escapes never survive into the compiled model. The
+/// sim layer resolves generated joints and prop bodies by THIS spelling, so
+/// `<joint name="left arm">` in the source model round-trips through the
+/// generator's own output.
+pub fn mujoco_name(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_whitespace() { '_' } else { c })
+        .collect()
+}
+
 /// XML attribute values + MuJoCo names: escape the five XML specials and strip
-/// whitespace (MuJoCo names must not contain spaces).
+/// whitespace (MuJoCo names must not contain spaces). Keep the whitespace rule
+/// in lockstep with [`mujoco_name`] — it is the post-parse view of this.
 fn sanitize(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
@@ -1155,6 +1169,21 @@ mod tests {
             ..Default::default()
         };
         assert!(mjcf_from_model(&m, &opt).is_err(), "accepted NaN pos");
+    }
+
+    /// `mujoco_name` is the post-XML-parse view of `sanitize`: whitespace
+    /// collapses to `_` exactly like the emitted document, while XML specials
+    /// stay RAW (the parser unescapes `&amp;` back to `&` at load, so the
+    /// registered name never contains the escape).
+    #[test]
+    fn mujoco_name_matches_registered_spelling() {
+        assert_eq!(mujoco_name("left arm"), "left_arm");
+        assert_eq!(mujoco_name("a\tb\nc"), "a_b_c");
+        assert_eq!(mujoco_name("a&b"), "a&b");
+        assert_eq!(mujoco_name("plain"), "plain");
+        // lockstep with sanitize: same whitespace rule, escapes on top
+        assert_eq!(sanitize("left arm"), "left_arm");
+        assert_eq!(sanitize("a&b"), "a&amp;b");
     }
 
     /// A hull collider exports as an inline-vertex `<asset><mesh>` +

@@ -71,6 +71,21 @@ impl MujocoBackend {
     pub fn sim_mut(&mut self) -> &mut MujocoSim {
         &mut self.sim
     }
+
+    /// De-energize the actuation channels — the shared "stop driving the arm"
+    /// move behind `disable` and `estop`. Zero `qfrc_applied` (passive
+    /// dynamics remain — the arm falls under gravity, as a de-energized robot
+    /// would) and freeze `ctrl` at the CURRENT position (a zeroed servo target
+    /// would actively drive to q=0, the opposite of a stop).
+    fn neutralize_commands(&mut self) -> Result<(), Error> {
+        let zeros = vec![0.0; self.dof];
+        self.sim.set_joint_torques(&zeros)?;
+        if self.sim.nu() > 0 {
+            let hold = self.sim.qpos();
+            self.sim.set_ctrl(&hold)?;
+        }
+        Ok(())
+    }
 }
 
 fn check_len(got: usize, expected: usize) -> Result<(), Error> {
@@ -105,28 +120,23 @@ impl RobotBackend for MujocoBackend {
         self.enabled = true;
         Ok(())
     }
+    /// Disabled = DE-ENERGIZED, not just command-rejecting: commands written
+    /// while enabled are neutralized here, so a stale `qfrc_applied` (or a
+    /// stale servo target) never keeps driving the arm through later `step`s.
     fn disable(&mut self) -> Result<(), Error> {
         self.enabled = false;
-        Ok(())
+        self.neutralize_commands()
     }
     fn is_enabled(&self) -> bool {
         self.enabled
     }
 
-    /// Latching. Torque-direct: zero `qfrc_applied` (passive dynamics remain —
-    /// the arm falls under gravity, as a de-energized robot would). Servo:
-    /// freeze `ctrl` at the CURRENT position (a zeroed servo target would
-    /// actively drive to q=0, the opposite of a stop).
+    /// Latching; de-energizes exactly like `disable` (zero torques, servo
+    /// targets frozen at the current position).
     fn estop(&mut self) -> Result<(), Error> {
         self.estopped = true;
         self.enabled = false;
-        let zeros = vec![0.0; self.dof];
-        self.sim.set_joint_torques(&zeros)?;
-        if self.sim.nu() > 0 {
-            let hold = self.sim.qpos();
-            self.sim.set_ctrl(&hold)?;
-        }
-        Ok(())
+        self.neutralize_commands()
     }
     fn clear_estop(&mut self) -> Result<(), Error> {
         self.estopped = false;

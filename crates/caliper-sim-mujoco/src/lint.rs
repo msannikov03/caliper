@@ -297,7 +297,10 @@ mod rollout {
     ) -> Result<Vec<LintFinding>, MujocoError> {
         opts.validate()?;
         let h = sim.timestep();
-        let settle_steps = (opts.settle_duration / h).round() as usize;
+        // Floor at 1: a sub-timestep settle_duration used to round to ZERO
+        // settle steps, silently judging the initial transient (first impacts,
+        // falling props) and producing false C001/C002 on stable scenes.
+        let settle_steps = ((opts.settle_duration / h).round() as usize).max(1);
         let observe_steps = ((opts.observe_duration / h).round() as usize).max(2);
 
         let mut trace = StabilityTrace {

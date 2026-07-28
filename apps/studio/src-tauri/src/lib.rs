@@ -1136,6 +1136,23 @@ struct SimTrajectoryDto {
     /// MuJoCo contact count at each sample, aligned with `times`.
     #[serde(skip_serializing_if = "Option::is_none")]
     contacts: Option<Vec<u32>>,
+    /// Contact stability lint (`C001`–`C003`) over the SAME rollout — present
+    /// (possibly empty = clean) on contact bakes, absent on builtin results.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lint: Option<Vec<ContactLintDto>>,
+}
+
+/// One contact-stability finding surfaced to the Simulate panel — mirrors
+/// `caliper_sim_mujoco::lint::LintFinding` with the code stringified.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ContactLintDto {
+    /// Stable lint code (`"C001"` | `"C002"` | `"C003"`).
+    code: String,
+    /// Plain-English statement of what was measured.
+    message: String,
+    /// The concrete fix to try, most likely first.
+    suggestion: String,
 }
 
 #[derive(Deserialize)]
@@ -1271,6 +1288,7 @@ fn sim_drop_impl(
         max_jerk_ratio: 0.0,
         props: None,
         contacts: None,
+        lint: None,
     })
 }
 
@@ -1477,6 +1495,7 @@ fn control_run_impl(
         max_jerk_ratio: 0.0,
         props: None,
         contacts: None,
+        lint: None,
     })
 }
 
@@ -1631,6 +1650,7 @@ fn prop_spec(p: &PropDto) -> Result<caliper_sim_mujoco::mjcf::PropSpec, String> 
 /// Testable core of `sim_contact_run` (no tauri::State so tests can drive it).
 #[cfg(feature = "mujoco")]
 fn sim_contact_run_on(arc: Arc<Model>, req: SimContactReq) -> Result<SimTrajectoryDto, String> {
+    use caliper_sim_mujoco::lint::{classify_stability, LintOptions, StabilityTrace};
     use caliper_sim_mujoco::mjcf::MjcfOptions;
     use caliper_sim_mujoco::{MujocoBackend, MujocoSim};
 
@@ -1720,6 +1740,47 @@ fn sim_contact_run_on(arc: Arc<Model>, req: SimContactReq) -> Result<SimTrajecto
         }
     };
 
+    // Contact stability lint (C001–C003) rides the SAME rollout: a per-step
+    // trace is recorded while baking and classified afterwards (the pure
+    // classifier — no second rollout, the backend keeps owning the live sim).
+    // The settle window is capped at half the rollout so short runs still get
+    // an observe window instead of a vacuously clean lint.
+    let lint_opts = LintOptions::default();
+    let settle_steps = ((lint_opts.settle_duration / h).round() as usize).min(nsamp * spp / 2);
+    let mut trace = StabilityTrace {
+        h,
+        ..Default::default()
+    };
+    let mut lint_step = 0usize;
+    let mut observe = |trace: &mut StabilityTrace, sim: &MujocoSim| {
+        if trace.nonfinite_at.is_some() {
+            return;
+        }
+        let d = sim.mj_data();
+        let qv = d.qvel();
+        if !(d.qpos().iter().all(|x| x.is_finite()) && qv.iter().all(|x| x.is_finite())) {
+            trace.nonfinite_at = Some(lint_step);
+            return;
+        }
+        if lint_step >= settle_steps {
+            trace
+                .speeds
+                .push(qv.iter().fold(0.0f64, |a, &v| a.max(v.abs())));
+            trace
+                .energies
+                .push(0.5 * qv.iter().map(|v| v * v).sum::<f64>());
+            trace.depths.push(
+                sim.contacts()
+                    .iter()
+                    .fold(0.0f64, |a, c| a.max(c.depth.max(0.0))),
+            );
+            trace
+                .normal_forces
+                .push((0..sim.ncon()).map(|i| sim.contact_force(i)[0]).sum());
+        }
+        lint_step += 1;
+    };
+
     let mut settled = false;
     match goal {
         // "drop": passive dynamics — step MuJoCo directly, zero torque.
@@ -1732,6 +1793,7 @@ fn sim_contact_run_on(arc: Arc<Model>, req: SimContactReq) -> Result<SimTrajecto
             for _ in 0..nsamp {
                 for _ in 0..spp {
                     sim.step_once();
+                    observe(&mut trace, &sim);
                 }
                 record(&mut bake, &sim, sim.time());
             }
@@ -1752,6 +1814,7 @@ fn sim_contact_run_on(arc: Arc<Model>, req: SimContactReq) -> Result<SimTrajecto
             for _ in 0..nsamp {
                 for _ in 0..spp {
                     loopy.step(&mut sp, None).map_err(|e| e.to_string())?;
+                    observe(&mut trace, loopy.backend().sim());
                 }
                 record(&mut bake, loopy.backend().sim(), loopy.time());
                 let q = bake.q.last().expect("just recorded");
@@ -1787,6 +1850,14 @@ fn sim_contact_run_on(arc: Arc<Model>, req: SimContactReq) -> Result<SimTrajecto
     // MuJoCo energy accounting is not enabled — zeros keep the playback-union
     // shape without pretending to a drift number we did not measure.
     let energy = vec![0.0; bake.times.len()];
+    let lint = classify_stability(&trace, &lint_opts)
+        .into_iter()
+        .map(|f| ContactLintDto {
+            code: f.code.to_string(),
+            message: f.message,
+            suggestion: f.suggestion,
+        })
+        .collect();
     Ok(SimTrajectoryDto {
         kind: "contact".into(),
         duration: *bake.times.last().unwrap_or(&0.0),
@@ -1807,6 +1878,7 @@ fn sim_contact_run_on(arc: Arc<Model>, req: SimContactReq) -> Result<SimTrajecto
         max_jerk_ratio: 0.0,
         props: Some(prop_tracks),
         contacts: Some(bake.contacts),
+        lint: Some(lint),
     })
 }
 
@@ -1992,6 +2064,7 @@ fn plan_run_impl(
         max_jerk_ratio: 0.0,
         props: None,
         contacts: None,
+        lint: None,
     })
 }
 
@@ -2437,7 +2510,7 @@ struct DatasetSummary {
 }
 
 /// One plotted feature of one episode: `series[dim][point]`.
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct DatasetChannel {
     name: String,
@@ -2541,6 +2614,36 @@ fn dataset_open(path: String) -> Result<DatasetSummary, String> {
     logged("dataset_open", dataset_open_impl(&path))
 }
 
+/// Per-feature per-dim plot series from raw episode rows, sampled at `picks`.
+/// Every row of a feature must share the first row's dim — RAGGED rows (a
+/// corrupt episode parquet) used to panic the command thread on `rows[i][d]`;
+/// now they come back as a loud `Err`.
+fn episode_channels(
+    features: &std::collections::BTreeMap<String, Vec<Vec<f32>>>,
+    picks: &[usize],
+) -> Result<Vec<DatasetChannel>, String> {
+    features
+        .iter()
+        .map(|(name, rows)| {
+            let dim = rows.first().map_or(0, |r| r.len());
+            if let Some((i, row)) = rows.iter().enumerate().find(|(_, r)| r.len() != dim) {
+                return Err(format!(
+                    "feature `{name}`: ragged rows (frame {i} has {} values, \
+                     the first frame has {dim}) — the episode parquet is corrupt",
+                    row.len()
+                ));
+            }
+            let series = (0..dim)
+                .map(|d| picks.iter().map(|&i| f64::from(rows[i][d])).collect())
+                .collect();
+            Ok(DatasetChannel {
+                name: name.clone(),
+                series,
+            })
+        })
+        .collect()
+}
+
 fn dataset_episode_impl(
     path: &str,
     episode: usize,
@@ -2553,20 +2656,7 @@ fn dataset_episode_impl(
     let stride = len.div_ceil(max_points.max(2)).max(1);
     let picks: Vec<usize> = (0..len).step_by(stride).collect();
     let times: Vec<f64> = picks.iter().map(|&i| ep.timestamps[i]).collect();
-    let channels = ep
-        .features
-        .iter()
-        .map(|(name, rows)| {
-            let dim = rows.first().map_or(0, |r| r.len());
-            let series = (0..dim)
-                .map(|d| picks.iter().map(|&i| f64::from(rows[i][d])).collect())
-                .collect();
-            DatasetChannel {
-                name: name.clone(),
-                series,
-            }
-        })
-        .collect();
+    let channels = episode_channels(&ep.features, &picks)?;
     Ok(DatasetEpisodeSeries {
         episode,
         length: len,
@@ -2749,7 +2839,7 @@ fn dataset_set_tags(
 
 /// One asset-doctor finding, webview-shaped (severity as the lowercase string
 /// the Python face also uses, so the FE never matches on enum variant names).
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct DoctorFindingDto {
     /// Stable check code, `A001`…`A014`.
@@ -2764,7 +2854,7 @@ struct DoctorFindingDto {
 
 /// What a `repair: true` run did. The repaired copy is a SIBLING file — the
 /// input URDF is never modified; feed `out` back into `robot_info` to load it.
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct RepairDto {
     /// Path of the repaired copy (`<stem>.repaired.urdf` next to the input).
@@ -2778,7 +2868,7 @@ struct RepairDto {
 /// `urdf_doctor` result: the diagnosis of the INPUT file (findings sorted
 /// most-severe-first by the engine) plus, with `repair: true`, the repair
 /// outcome and a re-diagnosis of the repaired copy.
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct UrdfDoctorDto {
     findings: Vec<DoctorFindingDto>,
@@ -2820,6 +2910,32 @@ fn repaired_out_path(input: &Path) -> PathBuf {
     input.with_file_name(format!("{stem}.repaired.urdf"))
 }
 
+/// The repair output path actually WRITTEN: the default name when free,
+/// otherwise the first free `<stem>.repaired-N.urdf`. A shared directory may
+/// already hold a file under the default name (a hand-edited earlier repair,
+/// or another user's copy) — silently overwriting it would destroy that work.
+fn free_repaired_out_path(input: &Path) -> Result<PathBuf, String> {
+    let first = repaired_out_path(input);
+    if !first.exists() {
+        return Ok(first);
+    }
+    let stem = input
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("robot");
+    for n in 2..=99u32 {
+        let cand = input.with_file_name(format!("{stem}.repaired-{n}.urdf"));
+        if !cand.exists() {
+            return Ok(cand);
+        }
+    }
+    Err(format!(
+        "`{}` and 98 numbered variants already exist — clean up old repaired \
+         copies first",
+        first.display()
+    ))
+}
+
 fn urdf_doctor_impl(path: &str, repair: bool) -> Result<UrdfDoctorDto, String> {
     let p = Path::new(path);
     if !ext_ok(p) {
@@ -2840,10 +2956,37 @@ fn urdf_doctor_impl(path: &str, repair: bool) -> Result<UrdfDoctorDto, String> {
         // and a mesh-copy PLAN; the file writes are this face's job.
         let outcome = caliper_doctor::repair(p, &caliper_doctor::RepairOpts::all())
             .map_err(|e| e.to_string())?;
-        let out_path = repaired_out_path(p);
+        let out_path = free_repaired_out_path(p)?;
+        // Vet EVERY mesh-copy destination BEFORE writing anything, so a
+        // refusal never leaves a repaired URDF referencing a copy that was
+        // not made. The repaired text references `c.to` by name, so a copy
+        // cannot be renamed. If the destination already exists: identical
+        // bytes = an earlier repair already made this exact copy (skip);
+        // different bytes = someone else's file in a shared dir — refuse
+        // instead of clobbering it.
+        let mut pending_copies = Vec::new();
+        for c in &outcome.mesh_copies {
+            if c.to.exists() {
+                let src = std::fs::read(&c.from).map_err(|e| {
+                    format!("mesh copy source `{}` unreadable: {e}", c.from.display())
+                })?;
+                let dst = std::fs::read(&c.to)
+                    .map_err(|e| format!("existing file `{}` unreadable: {e}", c.to.display()))?;
+                if src == dst {
+                    continue;
+                }
+                return Err(format!(
+                    "refusing to overwrite `{}`: a different file already exists there \
+                     (the repaired URDF must reference this exact name — move the \
+                     existing file away and repair again)",
+                    c.to.display()
+                ));
+            }
+            pending_copies.push(c);
+        }
         std::fs::write(&out_path, &outcome.repaired_urdf)
             .map_err(|e| format!("failed to write `{}`: {e}", out_path.display()))?;
-        for c in &outcome.mesh_copies {
+        for c in pending_copies {
             std::fs::copy(&c.from, &c.to).map_err(|e| {
                 format!(
                     "mesh copy `{}` -> `{}` failed: {e}",
@@ -3261,6 +3404,17 @@ mod tests {
         assert_eq!(contacts.len(), dto.times.len());
         assert!(*contacts.last().unwrap() >= 1, "no contact after settling");
         assert_eq!(contacts[0], 0, "must start contact-free");
+        // The C001–C003 stability lint rides the SAME bake (possibly empty =
+        // clean); before this wiring the linter was unreachable from Studio.
+        let lint = dto.lint.expect("contact lint present on contact bakes");
+        for f in &lint {
+            assert!(f.code.starts_with('C'), "unexpected lint code {}", f.code);
+            assert!(!f.message.is_empty() && !f.suggestion.is_empty());
+        }
+        assert!(
+            lint.iter().all(|f| f.code != "C001"),
+            "a settling tabletop drop must not read as an explosion"
+        );
     }
 
     /// Contact-sim "hold": the existing computed-torque loop drives the MuJoCo
@@ -3688,6 +3842,143 @@ mod tests {
         );
         // the input file was never modified
         assert_eq!(std::fs::read_to_string(&urdf).unwrap(), text);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Ragged episode rows (a corrupt parquet) come back as `Err`, not a
+    /// command-thread panic: `rows[i][d]` used to index every row by the
+    /// FIRST row's dim.
+    #[test]
+    fn episode_channels_ragged_rows_error_not_panic() {
+        use std::collections::BTreeMap;
+        let mut ragged: BTreeMap<String, Vec<Vec<f32>>> = BTreeMap::new();
+        ragged.insert(
+            "observation.state".into(),
+            vec![vec![0.1, 0.2], vec![0.3]], // frame 1 lost a value
+        );
+        let err = episode_channels(&ragged, &[0, 1]).unwrap_err();
+        assert!(err.contains("ragged"), "unexpected message: {err}");
+        assert!(
+            err.contains("observation.state"),
+            "names the feature: {err}"
+        );
+        // well-formed rows still transpose into per-dim series
+        let mut ok: BTreeMap<String, Vec<Vec<f32>>> = BTreeMap::new();
+        ok.insert("action".into(), vec![vec![1.0, 2.0], vec![3.0, 4.0]]);
+        let ch = episode_channels(&ok, &[0, 1]).unwrap();
+        assert_eq!(ch.len(), 1);
+        assert_eq!(ch[0].series, vec![vec![1.0, 3.0], vec![2.0, 4.0]]);
+    }
+
+    /// Repair NEVER overwrites an existing `<stem>.repaired.urdf` (someone's
+    /// hand-edited copy, or another robot's output in a shared dir) — it
+    /// writes the first free numbered sibling instead and leaves the
+    /// existing file byte-identical.
+    #[test]
+    fn urdf_doctor_repair_never_overwrites_existing_output() {
+        let dir = std::env::temp_dir().join(format!("studio_doctor_keep_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let urdf = dir.join("repairme.urdf");
+        std::fs::write(
+            &urdf,
+            r#"<?xml version="1.0"?>
+<robot name="repairme">
+  <link name="base">
+    <inertial><origin xyz="0 0 0"/><mass value="2.0"/>
+      <inertia ixx="0.02" ixy="0" ixz="0" iyy="0.02" iyz="0" izz="0.02"/></inertial>
+  </link>
+  <link name="l1">
+    <collision><origin xyz="0 0 0"/><geometry><box size="0.1 0.1 0.1"/></geometry></collision>
+  </link>
+  <joint name="j1" type="revolute">
+    <parent link="base"/><child link="l1"/>
+    <origin xyz="0 0 0.1"/><axis xyz="0 0 2"/>
+  </joint>
+</robot>
+"#,
+        )
+        .unwrap();
+        // Someone's file already sits at the default output name.
+        let sentinel = "PRECIOUS HAND-EDITED CONTENT";
+        let default_out = repaired_out_path(&urdf);
+        std::fs::write(&default_out, sentinel).unwrap();
+
+        let dto = urdf_doctor_impl(urdf.to_str().unwrap(), true).unwrap();
+        let rep = dto.repair.expect("repair outcome present");
+        assert!(
+            rep.out.ends_with("repairme.repaired-2.urdf"),
+            "expected the numbered sibling, got `{}`",
+            rep.out
+        );
+        // the pre-existing file is untouched, the numbered copy really loads
+        assert_eq!(std::fs::read_to_string(&default_out).unwrap(), sentinel);
+        assert!(Model::from_urdf(Path::new(&rep.out)).unwrap().has_inertia);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A planned mesh-copy destination that already exists with DIFFERENT
+    /// content refuses loudly (nothing is clobbered, and no repaired URDF is
+    /// left behind referencing the unmade copy); identical content is fine
+    /// (an earlier repair's own copy) and repair proceeds.
+    #[test]
+    fn urdf_doctor_repair_refuses_conflicting_mesh_copy() {
+        let dir = std::env::temp_dir().join(format!("studio_doctor_mesh_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("a")).unwrap();
+        std::fs::create_dir_all(dir.join("b")).unwrap();
+        // Two DIFFERENT resolvable meshes sharing one basename → the repair
+        // plans a disambiguation copy `b/m2__mesh.stl`.
+        std::fs::write(dir.join("a/mesh.stl"), "solid a\nendsolid a\n").unwrap();
+        std::fs::write(dir.join("b/mesh.stl"), "solid b\nendsolid b\n").unwrap();
+        let urdf = dir.join("dup.urdf");
+        std::fs::write(
+            &urdf,
+            r#"<?xml version="1.0"?>
+<robot name="dup">
+  <link name="base">
+    <inertial><origin xyz="0 0 0"/><mass value="1.0"/>
+      <inertia ixx="0.01" ixy="0" ixz="0" iyy="0.01" iyz="0" izz="0.01"/></inertial>
+  </link>
+  <link name="l1">
+    <inertial><origin xyz="0 0 0"/><mass value="1.0"/>
+      <inertia ixx="0.01" ixy="0" ixz="0" iyy="0.01" iyz="0" izz="0.01"/></inertial>
+    <visual><origin xyz="0 0 0"/><geometry><mesh filename="a/mesh.stl"/></geometry></visual>
+    <visual><origin xyz="0 0 0"/><geometry><mesh filename="b/mesh.stl"/></geometry></visual>
+  </link>
+  <joint name="j1" type="revolute">
+    <parent link="base"/><child link="l1"/>
+    <origin xyz="0 0 0.1"/><axis xyz="0 0 1"/>
+    <limit lower="-1" upper="1" effort="10" velocity="2"/>
+  </joint>
+</robot>
+"#,
+        )
+        .unwrap();
+        // An UNRELATED file already occupies the planned copy destination.
+        let clash = dir.join("b/m2__mesh.stl");
+        std::fs::write(&clash, "solid unrelated\nendsolid unrelated\n").unwrap();
+
+        let err = urdf_doctor_impl(urdf.to_str().unwrap(), true).unwrap_err();
+        assert!(
+            err.contains("refusing to overwrite"),
+            "unexpected error: {err}"
+        );
+        // nothing was clobbered, and no half-repair was written
+        assert_eq!(
+            std::fs::read_to_string(&clash).unwrap(),
+            "solid unrelated\nendsolid unrelated\n"
+        );
+        assert!(
+            !repaired_out_path(&urdf).exists(),
+            "half-repair left behind"
+        );
+
+        // With the clash holding IDENTICAL bytes the copy is a no-op and the
+        // repair succeeds.
+        std::fs::write(&clash, "solid b\nendsolid b\n").unwrap();
+        let dto = urdf_doctor_impl(urdf.to_str().unwrap(), true).unwrap();
+        assert!(dto.repair.is_some());
         std::fs::remove_dir_all(&dir).ok();
     }
 

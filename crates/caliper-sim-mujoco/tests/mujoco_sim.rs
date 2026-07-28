@@ -65,6 +65,86 @@ fn raw_mjcf_loads_and_steps() {
     assert!(sim.step(0.0015).is_err());
 }
 
+/// Raw-MJCF entry, UNNAMED joint: legal MJCF that used to die with
+/// `MissingJoint("joint0")` because the placeholder fallback name can never
+/// resolve through `name_to_id` — joints are now addressed by document id.
+#[test]
+fn raw_mjcf_unnamed_joint_resolves_by_id() {
+    let xml = r#"
+      <mujoco model="anon">
+        <compiler angle="radian"/>
+        <option timestep="0.001"/>
+        <worldbody>
+          <body name="a" pos="0 0 0.1">
+            <joint type="hinge" axis="0 1 0"/>
+            <inertial pos="0 0 0.1" mass="1" diaginertia="0.01 0.01 0.002"/>
+            <body name="b" pos="0 0 0.2">
+              <joint name="jb" type="slide" axis="0 0 1"/>
+              <inertial pos="0 0 0.1" mass="1" diaginertia="0.01 0.01 0.002"/>
+            </body>
+          </body>
+        </worldbody>
+      </mujoco>"#;
+    let mut sim = MujocoSim::from_mjcf(xml).expect("unnamed joints are valid MJCF");
+    assert_eq!(sim.ndof(), 2);
+    assert_eq!(sim.joint_names(), ["joint0", "jb"]);
+    sim.set_state(&[0.2, 0.05], &[0.0, 0.0]).unwrap();
+    sim.step(0.05).unwrap();
+    assert!(sim.qpos().iter().all(|x| x.is_finite()));
+}
+
+/// Sanitization seam: the generator emits `left_arm` for
+/// `<joint name="left arm">` (and unescapes `&amp;` at XML parse), so the sim
+/// must resolve the REGISTERED spelling — building from the generator's own
+/// output used to fail with `MissingJoint`. The caliper spelling stays the
+/// user-facing one.
+#[test]
+fn sanitized_joint_and_prop_names_resolve() {
+    let urdf = r#"<?xml version="1.0"?>
+      <robot name="spacey">
+        <link name="base"/>
+        <link name="arm link">
+          <inertial><origin xyz="0 0 0.2" rpy="0 0 0"/><mass value="0.5"/>
+            <inertia ixx="0.007" ixy="0" ixz="0" iyy="0.007" iyz="0" izz="0.0002"/></inertial>
+        </link>
+        <joint name="left arm" type="revolute">
+          <parent link="base"/><child link="arm link"/>
+          <origin xyz="0 0 0" rpy="0 0 0"/><axis xyz="0 1 0"/>
+          <limit lower="-3.14" upper="3.14" effort="50" velocity="20"/>
+        </joint>
+      </robot>"#;
+    let path = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("spacey.urdf");
+    std::fs::write(&path, urdf).unwrap();
+    let m = Model::from_urdf(&path).unwrap();
+    assert_eq!(m.joint_names, ["left arm"], "fixture premise");
+    let opt = MjcfOptions {
+        props: vec![PropSpec {
+            name: "my ball".into(), // whitespace in a prop name too
+            shape: PropShape::Sphere { r: 0.05 },
+            pos: [0.5, 0.0, 0.3],
+            quat: None,
+            mass: 0.1,
+            rgba: None,
+            material: None,
+        }],
+        ..Default::default()
+    };
+    let mut sim = MujocoSim::from_caliper_model_with(&m, &opt)
+        .expect("the generator's own output must resolve");
+    assert_eq!(
+        sim.joint_names(),
+        ["left arm"],
+        "caliper spelling preserved"
+    );
+    assert_eq!(sim.prop_names(), ["my ball"]);
+    sim.set_state(&[0.3], &[0.0]).unwrap();
+    sim.step(0.05).unwrap();
+    assert!(sim.qpos()[0].is_finite());
+    // the prop rides along under its MuJoCo-registered body name
+    assert!(sim.body_pose("prop_my_ball").is_ok());
+    assert_eq!(sim.prop_poses().len(), 1);
+}
+
 /// (a) An arm under gravity with zero torque sags: qpos changes, stays finite.
 #[test]
 fn gravity_sag_zero_torque() {
@@ -297,6 +377,57 @@ fn position_servo_variant() {
             "servo did not track: q={q:?} target={target:?}"
         );
     }
+}
+
+/// disable() DE-ENERGIZES, not just latches: a torque commanded while enabled
+/// used to stay in `qfrc_applied` and keep driving the arm through later
+/// `step`s — after disable the motion must be bit-identical to a
+/// never-commanded backend.
+#[test]
+fn disable_clears_stale_torques() {
+    let m = model("dyn_pendulum2.urdf");
+    let mut b = MujocoBackend::new(&m).unwrap();
+    b.enable().unwrap();
+    b.command_joint_torques(&[3.0, -2.0]).unwrap();
+    b.disable().unwrap();
+    assert!(
+        b.sim().mj_data().qfrc_applied().iter().all(|&f| f == 0.0),
+        "stale applied torques survive disable()"
+    );
+    let mut passive = MujocoBackend::new(&m).unwrap();
+    for _ in 0..200 {
+        b.step(1e-3).unwrap();
+        passive.step(1e-3).unwrap();
+    }
+    assert_eq!(
+        b.joint_positions(),
+        passive.joint_positions(),
+        "disabled backend still driven by pre-disable torque"
+    );
+}
+
+/// Servo variant of the same semantic: disable freezes `ctrl` at the CURRENT
+/// position, so a stale target commanded before disable stops pulling.
+#[test]
+fn disable_freezes_servo_target() {
+    let m = model("dyn_pendulum2.urdf");
+    let opt = MjcfOptions {
+        actuation: Actuation::PositionServo { kp: 30.0, kv: 3.0 },
+        ..Default::default()
+    };
+    let mut b = MujocoBackend::with_options(&m, &opt).unwrap();
+    b.enable().unwrap();
+    b.command_joint_positions(&[0.8, -0.6]).unwrap();
+    for _ in 0..100 {
+        b.step(1e-3).unwrap(); // partway toward the target
+    }
+    b.disable().unwrap();
+    let q_hold = b.joint_positions();
+    assert_eq!(
+        b.sim().mj_data().ctrl(),
+        q_hold.as_slice(),
+        "ctrl not frozen at the disable pose"
+    );
 }
 
 /// (f) PROPS: a free box dropped above the ground plane settles ON it

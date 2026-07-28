@@ -160,3 +160,31 @@ fn bad_lint_options_rejected_at_entry() {
     assert!(lint_contact_stability(&mut sim, &bad).is_err());
     assert_eq!(sim.time(), 0.0, "rejected options must not step the sim");
 }
+
+/// A sub-timestep `settle_duration` must still settle at least ONE step: it
+/// used to round to ZERO settle steps, silently judging the initial transient
+/// (first impacts, falling props) and producing false C001/C002 on stable
+/// scenes. Observable seam: the rollout advances settle + observe steps.
+#[test]
+fn sub_timestep_settle_floors_at_one_step() {
+    let m = model("dyn_pendulum2.urdf");
+    let opt = MjcfOptions {
+        ground_plane: Some(0.0),
+        joint_damping: 0.5,
+        ..Default::default()
+    };
+    let mut sim = MujocoSim::from_caliper_model_with(&m, &opt).unwrap();
+    let h = sim.timestep();
+    let lint_opts = LintOptions {
+        settle_duration: 0.4 * h, // rounded to 0 settle steps before the fix
+        observe_duration: 2.0 * h,
+        ..Default::default()
+    };
+    lint_contact_stability(&mut sim, &lint_opts).unwrap();
+    let expect = 3.0 * h; // 1 settle step (floored) + 2 observe steps
+    assert!(
+        (sim.time() - expect).abs() < 1e-9,
+        "settle window silently dropped: t = {} (expected {expect})",
+        sim.time()
+    );
+}

@@ -1,5 +1,7 @@
 import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
+import type { UnlistenFn } from "@tauri-apps/api/event";
 import { applyNodeChanges, applyEdgeChanges, addEdge } from "@xyflow/react";
 import type { Connection, NodeChange, EdgeChange } from "@xyflow/react";
 import type {
@@ -16,6 +18,14 @@ import { defaultParams, outPortType, inPortTypes, PORT_COLORS, NODE_SPECS } from
 import { serializeGraph, parseGraph } from "./graph/serialize";
 import { hasContactEngine, withProp } from "./sim/props";
 import type { PropKind, PropTrack, SimProp } from "./sim/props";
+import {
+  classifyLiveState,
+  liveEndedPatch,
+  liveFlushFate,
+  liveInfoFromStarted,
+  liveStatePatch,
+} from "./sim/live";
+import type { LiveEndedEvent, LiveInfo, LiveStartedDto, LiveStateEvent } from "./sim/live";
 import type { DataDoctorReport, DoctorReport } from "./doctor/doctor";
 
 // ---- wire types: mirror the serde structs in src-tauri/src/lib.rs exactly ----
@@ -318,6 +328,25 @@ export interface StudioState {
    *  tracks + contact counts riding alongside the baked robot frames. */
   runContactSim: (mode: ContactMode, target?: number[]) => Promise<void>;
 
+  // live sim session — a background physics thread integrates continuously and
+  // streams "live://state" at ~emitHz. NOT a clip: there is nothing baked, so
+  // playback (traj/simTraj/playhead) is cleared for the duration and `q`/
+  // `frames` are driven straight off the stream instead.
+  /** the running session (identity + latest scalars), or null when idle */
+  live: LiveInfo | null;
+  /** latest streamed `[x,y,z,qw,qx,qy,qz]` per prop, indexed like `live.props`
+   *  (build order, NOT time) — empty with no session */
+  livePropPoses: number[][];
+  /** Start a session at the current pose (mujoco when the build has it, else
+   *  builtin). Drops any baked clip: the session owns the pose from here. */
+  startLive: () => Promise<void>;
+  /** Ask the backend to stop; the "live://ended" event does the teardown. */
+  stopLive: () => Promise<void>;
+  /** Freeze/unfreeze integration (the backend echoes a state event back). */
+  pauseLive: (paused: boolean) => Promise<void>;
+  /** Restart the session at its original q0 (tick and t restart at 0). */
+  resetLive: () => Promise<void>;
+
   // control + collision (Phase 5)
   collision: CollisionDto | null;
   runControl: (goal: number[]) => Promise<void>;
@@ -419,6 +448,8 @@ export const useStore = create<StudioState>((set, get) => ({
   simEngines: ["builtin"],
   simEngine: "builtin",
   simProps: [],
+  live: null,
+  livePropPoses: [],
   collision: null,
   graphNodes: [],
   graphEdges: [],
@@ -768,6 +799,8 @@ export const useStore = create<StudioState>((set, get) => ({
   // ---- simulation (Phase 4) ----
   setMode(m) {
     stopClock();
+    // a live session is simulate-mode-only: leaving the mode ends it
+    if (m !== "simulate" && get().live) void get().stopLive();
     set({ mode: m, traj: null, simTraj: null, playing: false, playhead: 0 });
     void get().refreshFrames();
   },
@@ -843,6 +876,67 @@ export const useStore = create<StudioState>((set, get) => ({
       set({ simTraj, traj: null, playhead: 0, playing: false });
       get()._applyTrajAt(0);
       get().play();
+    } catch (e) {
+      set({ error: String(e) });
+    }
+  },
+
+  // ---- live sim session (streamed, not baked) ----
+  async startLive() {
+    const { q, robot, simProps, simEngines, live } = get();
+    if (!robot || live) return; // one session at a time (the backend agrees)
+    if (!robot.hasInertia) {
+      set({ error: "this robot has no inertial data" });
+      return;
+    }
+    // props are a contact-engine feature; builtin rejects them outright
+    const engine = hasContactEngine(simEngines) ? "mujoco" : "builtin";
+    // the session owns the pose: drop any baked clip and its playback clock
+    stopClock();
+    set({ traj: null, simTraj: null, playing: false, playhead: 0 });
+    liveStartsInFlight += 1;
+    try {
+      // subscribe BEFORE the invoke — the first state event can beat the reply
+      // through the event loop, and classifyLiveState stashes it either way
+      await subscribeLive(get, set);
+      const dto = await invoke<LiveStartedDto>("live_start", {
+        req: { q0: q, engine, props: engine === "mujoco" ? simProps : [] },
+      });
+      set({ live: liveInfoFromStarted(dto), livePropPoses: [], error: null });
+      // an event for this session may already be stashed ("keep" until now)
+      scheduleLiveFlush(get, set);
+    } catch (e) {
+      set({ error: String(e) });
+      if (!get().live) stopLiveStream(); // never adopted → drop the listeners
+    } finally {
+      liveStartsInFlight -= 1;
+    }
+  },
+  async stopLive() {
+    if (!get().live && !liveSubscribed) return;
+    try {
+      await invoke("live_stop");
+      // teardown rides the "live://ended" event the backend emits in reply
+    } catch (e) {
+      // the session is unreachable — tear down here so the UI can't wedge
+      set({ error: String(e) });
+      stopLiveStream();
+      set({ live: null, livePropPoses: [] });
+    }
+  },
+  async pauseLive(paused) {
+    if (!get().live) return;
+    try {
+      await invoke("live_pause", { paused });
+      // the flag lands via the state event the transition emits, not from here
+    } catch (e) {
+      set({ error: String(e) });
+    }
+  },
+  async resetLive() {
+    if (!get().live) return;
+    try {
+      await invoke("live_reset", { q0: null });
     } catch (e) {
       set({ error: String(e) });
     }
@@ -1640,4 +1734,110 @@ function tick(get: () => StudioState, set: (p: Partial<StudioState>) => void) {
   set({ playhead: t });
   get()._applyTrajAt(t);
   rafId = requestAnimationFrame(() => tick(get, set));
+}
+
+// ---- live-session stream coalescer (event-driven; deliberately SEPARATE from
+// the playback clock above: nothing here is baked and there is no timeline to
+// advance — the backend pushes state and this only rate-limits it to a frame) ----
+let liveRafId = 0;
+/** the newest un-applied "live://state" payload; REPLACED, never queued */
+let liveLatest: LiveStateEvent | null = null;
+/** unlisten handles for the two live channels (empty = not subscribed) */
+let liveUnlisten: UnlistenFn[] = [];
+/** set synchronously so a second subscribeLive can't race the awaits */
+let liveSubscribed = false;
+/** live_start invokes awaiting a reply — lets events that beat it be stashed */
+let liveStartsInFlight = 0;
+
+async function subscribeLive(
+  get: () => StudioState,
+  set: (p: Partial<StudioState>) => void,
+): Promise<void> {
+  if (liveSubscribed) return;
+  liveSubscribed = true;
+  try {
+    liveUnlisten = await Promise.all([
+      listen<LiveStateEvent>("live://state", (e) => onLiveState(e.payload, get, set)),
+      listen<LiveEndedEvent>("live://ended", (e) => onLiveEnded(e.payload, get, set)),
+    ]);
+  } catch (e) {
+    liveSubscribed = false;
+    throw e;
+  }
+}
+
+function onLiveState(
+  ev: LiveStateEvent,
+  get: () => StudioState,
+  set: (p: Partial<StudioState>) => void,
+) {
+  if (classifyLiveState(get().live, ev.sessionId, liveStartsInFlight) === "drop") return;
+  liveLatest = ev; // latest-wins: an unflushed older event is simply overwritten
+  scheduleLiveFlush(get, set);
+}
+
+function onLiveEnded(
+  ev: LiveEndedEvent,
+  get: () => StudioState,
+  set: (p: Partial<StudioState>) => void,
+) {
+  const cur = get().live;
+  // an end for a session we already replaced (or never had) says nothing about
+  // the one running now — the "superseded" end of a restarted session arrives
+  // exactly this way
+  if (cur ? ev.sessionId < cur.sessionId : liveStartsInFlight === 0) return;
+  stopLiveStream();
+  set(liveEndedPatch(ev.reason));
+}
+
+function scheduleLiveFlush(get: () => StudioState, set: (p: Partial<StudioState>) => void) {
+  if (!liveRafId) liveRafId = requestAnimationFrame(() => flushLive(get, set));
+}
+
+/** One frame's worth of streamed state → one set(). */
+function flushLive(get: () => StudioState, set: (p: Partial<StudioState>) => void) {
+  liveRafId = 0;
+  const cur = get().live;
+  const ev = liveLatest;
+  switch (liveFlushFate(cur, ev)) {
+    case "apply":
+      liveLatest = null;
+      // bump _reqId exactly like _applyTrajAt does: an in-flight get_frames or
+      // solve_ik reply must not clobber the pose this event just installed
+      set({ ...liveStatePatch(cur!, ev!), _reqId: get()._reqId + 1 });
+      break;
+    case "keep":
+      // the owning session is still being adopted (live_start reply in flight);
+      // startLive re-schedules too, but keep trying so no frame is dropped
+      scheduleLiveFlush(get, set);
+      break;
+    case "drop":
+      liveLatest = null;
+      break;
+  }
+}
+
+/** Tear the stream down: no pending flush, no stashed event, no listeners.
+ *  Leaves the STORE alone — callers decide what the slice becomes. */
+function stopLiveStream(): void {
+  if (liveRafId) {
+    cancelAnimationFrame(liveRafId);
+    liveRafId = 0;
+  }
+  liveLatest = null;
+  for (const un of liveUnlisten) un();
+  liveUnlisten = [];
+  liveSubscribed = false;
+}
+
+/** Apply the stashed state event NOW instead of on the next frame (test helper
+ *  only — the app path always goes through the rAF above). */
+export function _flushLive(): void {
+  flushLive(useStore.getState, useStore.setState);
+}
+
+/** Drop all module-level live stream state (test helper only). */
+export function _resetLive(): void {
+  stopLiveStream();
+  liveStartsInFlight = 0;
 }

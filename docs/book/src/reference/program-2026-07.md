@@ -59,6 +59,16 @@ so there is no Studio autopsy panel. Stated plainly in the chapter.
 | MP4 video encoding | ✅ `caliper_learn.video` (dtype `video`, lerobot-exact, real round-trip); ◑ video meta columns via a pyarrow post-write bridge until the Rust writer grows them natively |
 | Data factory docs + this audit | ✅ Data factory chapter, capability-matrix rows, this page |
 
+## Follow-on — human demonstration loop (in progress)
+
+The next program replaces bake-then-replay with hands-on interaction inside
+Studio. Only what is built is listed as built:
+
+| Phase | Status |
+|---|---|
+| **A1 — live sim session** | ✅ built — Studio's Simulate mode steps the sim (MuJoCo, or the builtin integrator in default builds) live in a background thread: fixed 1 ms timestep, PD hold target, ~60 Hz state stream, pause-as-freeze, deterministic reset, live contact count ([details](../capabilities/contact-sim.md#live-session-studio)) |
+| Input devices (drive the arm by hand) · teleop episode recording into LeRobotDataset v3.0 | ⏳ next phases — not built yet |
+
 ## Deliberately not built (traps the research flagged)
 
 - **A ROS bridge / ROS-compat layer** — the mined value is *escape from* ROS;

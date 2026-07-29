@@ -123,7 +123,9 @@ where a number is still `TBD`, the page says so instead of rounding hope.
 **Studio daily-driver features:** ⌘K command palette + keyboard shortcuts,
 File → Open any URDF with recents, session resume (window + robot + pose + mode),
 rotating file logs + panic capture, graph editor with delete/duplicate/fit and
-shareable `.caliper-graph.json` file export/import.
+shareable `.caliper-graph.json` file export/import, live stepped sim session in
+Simulate (fixed 1 ms physics + PD hold target streamed at ~60 Hz, with
+pause/deterministic-reset/stop and a live contact count on MuJoCo builds).
 
 ---
 

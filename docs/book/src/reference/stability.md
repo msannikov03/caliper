@@ -107,7 +107,9 @@ runs in CI:
 ## What is *not* promised (pre-1.0)
 
 Honesty cuts both ways: Rust API shapes, CLI human-readable (non-`--json`)
-output text, Studio UI layout, and the learning sidecar's Python internals
+output text, Studio UI layout, Studio-internal IPC (the Tauri commands and
+events behind the UI, including the `live_*`/`live://` session surface), and
+the learning sidecar's Python internals
 may all change at minor releases — with changelog receipts, per the policy
 above. If you are scripting against the CLI, prefer the `--json` outputs;
 their fields only grow within a minor.

@@ -15,11 +15,26 @@
 //  - duplicateGraphSelection: fresh ids, +24/+24, deep params, edges untouched
 //  - deleteGraphSelection: node removal takes its edges; edge-only removal
 //  - exportGraph / importGraph: save_graph_file/load_graph_file seam + banner
+//  - live session: start/adopt/flush, ended-with-error, stale-event guard,
+//    mode switch tears the session down
 
 // vi.mock calls are hoisted before imports by Vitest.
 import { vi, describe, it, expect, beforeEach } from "vitest";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
+
+// The live-session event channels. listen() records the store's handler under
+// its channel name so a test can push a payload the way the backend would;
+// hoisted because the mock factory below is hoisted above the imports.
+const { liveHandlers } = vi.hoisted(() => ({
+  liveHandlers: {} as Record<string, (e: { payload: unknown }) => void>,
+}));
+vi.mock("@tauri-apps/api/event", () => ({
+  listen: vi.fn(async (name: string, cb: (e: { payload: unknown }) => void) => {
+    liveHandlers[name] = cb;
+    return () => delete liveHandlers[name];
+  }),
+}));
 
 // Replace xyflow utilities with minimal pure implementations.
 // applyNodeChanges / applyEdgeChanges are only used in the pass-through change
@@ -40,8 +55,11 @@ import {
   clampQ,
   sessionRestorePlan,
   _resetNodeSeq,
+  _flushLive,
+  _resetLive,
 } from "./store";
 import type { RobotInfo, TrajectoryDto, StudioState } from "./store";
+import type { LiveStartedDto, LiveStateEvent } from "./sim/live";
 import { serializeGraph } from "./graph/serialize";
 import { defaultParams } from "./graph/spec";
 import type { KindName } from "./graph/spec";
@@ -148,12 +166,15 @@ const STORE_RESET = {
   graphName: "",
   _graphRunId: 0,
   recentUrdfs: [] as string[],
+  live: null,
+  livePropPoses: [] as number[][],
 };
 
 beforeEach(() => {
   vi.clearAllMocks();
   useStore.setState(STORE_RESET);
   _resetNodeSeq();
+  _resetLive(); // module-level stream state outlives the store otherwise
 });
 
 // ---- mergeRecent (recents dedupe / cap / most-recent-first) ----
@@ -818,5 +839,221 @@ describe("runGraph success", () => {
     expect(s.traj?.kind).toBe("moveJ");
     expect(s.playing).toBe(true);
     expect(s.simTraj).toBeNull();
+  });
+});
+
+// ---- live sim session (store side of src/sim/live.ts) ----
+
+describe("live session — store wiring", () => {
+  function mockStarted(over: Partial<LiveStartedDto> = {}): LiveStartedDto {
+    return {
+      sessionId: 1,
+      engine: "mujoco",
+      h: 0.002,
+      emitHz: 59.5,
+      ndof: 2,
+      props: [],
+      ...over,
+    };
+  }
+
+  function mockState(over: Partial<LiveStateEvent> = {}): LiveStateEvent {
+    return {
+      sessionId: 1,
+      tick: 300,
+      t: 0.6,
+      q: [0.1, 0.2],
+      qd: [0, 0],
+      frames: [[1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]],
+      tip: [0.3, 0, 0.2],
+      ncon: 2,
+      props: [[0, 0, 0.05, 1, 0, 0, 0]],
+      paused: false,
+      target: [0, 0],
+      ...over,
+    };
+  }
+
+  /** Only live_start answers with a DTO; every other command resolves empty. */
+  function backend(dto: LiveStartedDto) {
+    mockInvoke.mockImplementation(async (cmd: string) =>
+      cmd === "live_start" ? dto : undefined,
+    );
+  }
+
+  /** Push one backend event through the recorded listen() handler. */
+  function emit(channel: string, payload: unknown) {
+    liveHandlers[channel]({ payload });
+  }
+
+  beforeEach(() => {
+    useStore.setState({
+      robot: MOCK_ROBOT,
+      q: [0, 0],
+      mode: "simulate",
+      simEngines: ["builtin", "mujoco"],
+      simProps: [],
+    });
+  });
+
+  it("starts on the contact engine and adopts the session the backend returns", async () => {
+    backend(mockStarted({ sessionId: 3 }));
+
+    await useStore.getState().startLive();
+
+    expect(mockInvoke).toHaveBeenCalledWith("live_start", {
+      req: { q0: [0, 0], engine: "mujoco", props: [] },
+    });
+    const s = useStore.getState();
+    expect(s.live).toMatchObject({ sessionId: 3, engine: "mujoco", t: 0, paused: false });
+    // the session owns the pose: no baked clip survives it
+    expect(s.simTraj).toBeNull();
+    expect(s.traj).toBeNull();
+    expect(s.playing).toBe(false);
+  });
+
+  it("falls back to the builtin engine (and sends no props) without mujoco", async () => {
+    useStore.setState({ simEngines: ["builtin"] });
+    backend(mockStarted({ engine: "builtin" }));
+
+    await useStore.getState().startLive();
+
+    expect(mockInvoke).toHaveBeenCalledWith("live_start", {
+      req: { q0: [0, 0], engine: "builtin", props: [] },
+    });
+  });
+
+  it("refuses a robot with no inertial data and never reaches the backend", async () => {
+    useStore.setState({ robot: { ...MOCK_ROBOT, hasInertia: false } });
+
+    await useStore.getState().startLive();
+
+    expect(mockInvoke).not.toHaveBeenCalled();
+    expect(useStore.getState().live).toBeNull();
+    expect(useStore.getState().error).toBe("this robot has no inertial data");
+  });
+
+  it("applies a streamed state event on flush, not on arrival", async () => {
+    backend(mockStarted());
+    await useStore.getState().startLive();
+    const reqIdBefore = useStore.getState()._reqId;
+
+    emit("live://state", mockState());
+    // stashed only — the coalescer owns when it lands
+    expect(useStore.getState().q).toEqual([0, 0]);
+
+    _flushLive();
+
+    const s = useStore.getState();
+    expect(s.q).toEqual([0.1, 0.2]);
+    expect(s.frames).toHaveLength(1);
+    expect(s.live).toMatchObject({ t: 0.6, tick: 300, ncon: 2, paused: false });
+    expect(s.livePropPoses).toEqual([[0, 0, 0.05, 1, 0, 0, 0]]);
+    // fences any in-flight get_frames reply, exactly like _applyTrajAt
+    expect(s._reqId).toBeGreaterThan(reqIdBefore);
+  });
+
+  it("collapses a burst of events into the last one (latest-wins)", async () => {
+    backend(mockStarted());
+    await useStore.getState().startLive();
+
+    emit("live://state", mockState({ t: 0.1, q: [1, 1] }));
+    emit("live://state", mockState({ t: 0.2, q: [2, 2] }));
+    emit("live://state", mockState({ t: 0.3, q: [3, 3] }));
+    _flushLive();
+
+    expect(useStore.getState().q).toEqual([3, 3]);
+    expect(useStore.getState().live?.t).toBe(0.3);
+  });
+
+  it("ignores a state event from a session we already moved past", async () => {
+    backend(mockStarted({ sessionId: 5 }));
+    await useStore.getState().startLive();
+
+    emit("live://state", mockState({ sessionId: 4, q: [9, 9] }));
+    _flushLive();
+
+    const s = useStore.getState();
+    expect(s.q).toEqual([0, 0]);
+    expect(s.live?.sessionId).toBe(5);
+  });
+
+  it("clears the session silently when it ends benignly", async () => {
+    backend(mockStarted());
+    await useStore.getState().startLive();
+    emit("live://state", mockState());
+    _flushLive();
+
+    emit("live://ended", { sessionId: 1, reason: "stopped" });
+
+    const s = useStore.getState();
+    expect(s.live).toBeNull();
+    expect(s.livePropPoses).toEqual([]);
+    expect(s.error).toBeNull();
+  });
+
+  it("surfaces the error banner when the session dies on the backend", async () => {
+    backend(mockStarted());
+    await useStore.getState().startLive();
+
+    emit("live://ended", { sessionId: 1, reason: "error: mujoco step diverged" });
+
+    const s = useStore.getState();
+    expect(s.live).toBeNull();
+    expect(s.error).toBe("live sim ended — error: mujoco step diverged");
+  });
+
+  it("keeps running when an end arrives for an older, superseded session", async () => {
+    backend(mockStarted({ sessionId: 6 }));
+    await useStore.getState().startLive();
+
+    emit("live://ended", { sessionId: 5, reason: "superseded" });
+
+    expect(useStore.getState().live?.sessionId).toBe(6);
+  });
+
+  it("surfaces a failed start and leaves nothing adopted", async () => {
+    mockInvoke.mockRejectedValueOnce("no live session available");
+
+    await useStore.getState().startLive();
+
+    const s = useStore.getState();
+    expect(s.live).toBeNull();
+    expect(s.error).toBe("no live session available");
+  });
+
+  it("routes pause/reset to the backend without guessing the new state", async () => {
+    backend(mockStarted());
+    await useStore.getState().startLive();
+
+    await useStore.getState().pauseLive(true);
+    expect(mockInvoke).toHaveBeenCalledWith("live_pause", { paused: true });
+    // the flag lands via the state event the transition emits, not optimistically
+    expect(useStore.getState().live?.paused).toBe(false);
+
+    await useStore.getState().resetLive();
+    expect(mockInvoke).toHaveBeenCalledWith("live_reset", { q0: null });
+  });
+
+  it("stops the session when the mode leaves simulate", async () => {
+    backend(mockStarted());
+    await useStore.getState().startLive();
+
+    useStore.getState().setMode("jog");
+
+    expect(mockInvoke).toHaveBeenCalledWith("live_stop");
+  });
+
+  it("tears the session down locally when live_stop itself fails", async () => {
+    backend(mockStarted());
+    await useStore.getState().startLive();
+    mockInvoke.mockRejectedValueOnce("backend gone");
+
+    await useStore.getState().stopLive();
+
+    const s = useStore.getState();
+    expect(s.live).toBeNull();
+    expect(s.livePropPoses).toEqual([]);
+    expect(s.error).toBe("backend gone");
   });
 });

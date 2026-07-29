@@ -62,6 +62,14 @@ not releases); from `0.1.0` on, every release gets a proper entry.
   and a convex-decomposition seam (identity impl) — `caliper-sim-mujoco`.
 - Build-program audit page and Data-factory chapter; capability matrix updated
   for the zoo, materials, randomization, coverage, and video.
+- **Studio live sim session** (Simulate mode): a background thread steps the
+  contact sim (MuJoCo — props + live contact count; the builtin gravity
+  integrator in MuJoCo-free builds) at a fixed 1 ms timestep with a PD hold
+  target, streaming state to the viewport at ~60 Hz, with Start Live / Pause
+  (a freeze, not a de-energize) / deterministic Reset (full MuJoCo reset,
+  warmstart included) / Stop. Bake-then-replay stays for reproducible clips
+  and the stability lint. First phase of the human-demonstration-loop
+  program.
 
 ### Changed
 - `caliper record` default dataset format is **v3.0** (was v2.1); the legacy

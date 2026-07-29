@@ -47,6 +47,54 @@ model is built:
 - `step(dt)` only accepts integer multiples of the model timestep — no silent
   remainder drift.
 
+## Live session (Studio)
+
+Studio's Simulate mode can also run the sim **live** instead of baking a clip:
+a background thread owns a `ControlLoop` over the `MujocoBackend` (or, in
+MuJoCo-free builds, the builtin contact-free integrator) and steps it at a
+fixed **1 ms** physics timestep while a PD servo holds a live-mutable joint
+target. Each emitted state carries the joint positions/velocities, world
+frames, tip position, prop poses, and the **live contact count**; it streams
+to the viewport at render rate — nominally 60 Hz, actually
+1/(17 · 1 ms) ≈ 58.8 Hz after decimating to a whole number of physics steps.
+
+Design points, stated plainly:
+
+- **Fixed timestep, wall-clock paced.** An accumulator converts elapsed wall
+  time into whole physics steps; catch-up debt is capped at 0.25 s — beyond
+  that, excess time is dropped rather than spiraling into ever-larger step
+  batches.
+- **Pause freezes; it does not de-energize.** Pausing stops stepping *and*
+  stops accumulating wall time, with the servo target untouched — the arm
+  holds exactly where it is. This is deliberately not `estop()`/`disable()`:
+  those de-energize, and a de-energized arm falls.
+- **Reset rides the determinism anchor.** Reset reseeds the backend —
+  `MujocoSim::reset()`, the full `mj_resetData` (warmstart included, the same
+  mechanism behind the bitwise-reproducibility test above) — and rebuilds the
+  control loop at the reset pose, so the session clock and tick counter
+  restart at zero. Reset works while paused and still emits one state, so the
+  viewport always matches the sim.
+- **Errors end the session loudly.** A step error or a non-finite state ends
+  the session with an `error: …` reason; there is no silent freeze.
+- **Builtin fallback.** MuJoCo-free builds run the identical session on
+  `PhysicsSimBackend` — gravity only: no contacts, no ground reaction, and
+  props are rejected with a clear error rather than silently dropped.
+
+**Live vs. bake — both exist because they answer different questions.** A bake
+is a fixed command sequence through the deterministic sim: reproducible
+clip-for-clip, and the `C001`–`C003` stability lint runs over the finished
+rollout. A live session is paced by the wall clock and driven by whatever the
+UI sends, so it is for *watching and interacting*, not for reproducible
+artifacts. Driving the robot by hand during a live session and recording
+teleop episodes into native LeRobotDataset v3.0 datasets are the next phases
+of the [build program](../reference/program-2026-07.md).
+
+The `live_*` Tauri commands and `live://` events behind this are
+**Studio-internal IPC, not a public API** — they fall in the same not-promised
+bucket as Studio UI layout in the
+[stability contract](../reference/stability.md). Script against the CLI/Python
+faces instead.
+
 ## Verification
 
 Feature-gated integration tests cover: MJCF round-trips through the real

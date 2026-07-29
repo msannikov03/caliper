@@ -37,6 +37,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tauri::Manager;
 
+mod live;
+
 /// Loaded robot, shared across commands. `None` until `robot_info` succeeds.
 #[derive(Default)]
 struct AppState {
@@ -46,6 +48,8 @@ struct AppState {
     /// meshes. `read_mesh` serves ONLY these — the webview can never read an
     /// arbitrary file. Rebuilt on every `robot_info` load.
     mesh_allowlist: Mutex<HashSet<PathBuf>>,
+    /// The live sim session (A1), if one is running. See [`live`].
+    live: Mutex<Option<live::LiveSession>>,
 }
 
 // ===== wire types (serde-facing; all kinematics live in the engine) =====
@@ -3180,7 +3184,13 @@ pub fn run() {
             dataset_merge_episodes,
             dataset_set_tags,
             urdf_doctor,
-            dataset_doctor
+            dataset_doctor,
+            live::live_start,
+            live::live_set_target,
+            live::live_pause,
+            live::live_reset,
+            live::live_stop,
+            live::live_status
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

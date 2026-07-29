@@ -24,6 +24,11 @@ export function SimulatePanel() {
   const addSimProp = useStore((s) => s.addSimProp);
   const removeSimProp = useStore((s) => s.removeSimProp);
   const runContactSim = useStore((s) => s.runContactSim);
+  const live = useStore((s) => s.live);
+  const startLive = useStore((s) => s.startLive);
+  const stopLive = useStore((s) => s.stopLive);
+  const pauseLive = useStore((s) => s.pauseLive);
+  const resetLive = useStore((s) => s.resetLive);
   if (mode !== "simulate" || !robot) return null;
   const noInertia = !robot.hasInertia;
   const driftPct = simTraj ? (simTraj.energyDrift * 100).toFixed(3) : null;
@@ -38,6 +43,12 @@ export function SimulatePanel() {
   const ncon = contactClip
     ? contactClip.contacts![frameIndexAt(playhead, contactClip.dt, contactClip.contacts!.length)]
     : null;
+  // a live session streams the pose in; baking a clip over it would fight the
+  // stream, so every rollout button goes inert until it is stopped
+  const liveEngine = mujoco ? "mujoco" : "builtin";
+  const bakeOff = noInertia || live !== null;
+  const bakeTitle = (ready: string) =>
+    live ? "stop live to bake" : noInertia ? "robot has no inertial data" : ready;
   return (
     <aside className="sim-panel">
       <h3>Simulate</h3>
@@ -54,6 +65,44 @@ export function SimulatePanel() {
           </button>
         </div>
       )}
+      <div className="live-block">
+        <div className="sim-badges">
+          {live && <span className="badge live">● LIVE</span>}
+          <span className="badge" title="engine backing a live session">
+            {live ? live.engine : liveEngine}
+          </span>
+          {live && <span className="badge">t {live.t.toFixed(1)}s</span>}
+          {live && live.engine === "mujoco" && (
+            <span className={live.ncon > 0 ? "badge bad" : "badge ok"}>
+              {live.ncon > 0 ? `CONTACT ×${live.ncon}` : "no contact"}
+            </span>
+          )}
+        </div>
+        {live ? (
+          <div className="live-controls">
+            <button
+              title={live.paused ? "resume integration" : "freeze integration"}
+              onClick={() => void pauseLive(!live.paused)}
+            >
+              {live.paused ? "▶ Resume" : "⏸ Pause"}
+            </button>
+            <button title="restart at the starting pose" onClick={() => void resetLive()}>
+              ↺ Reset
+            </button>
+            <button title="end the session" onClick={() => void stopLive()}>
+              ■ Stop
+            </button>
+          </div>
+        ) : (
+          <button
+            disabled={noInertia}
+            title={noInertia ? "robot has no inertial data" : "stream physics live from this pose"}
+            onClick={() => void startLive()}
+          >
+            ◉ Start live
+          </button>
+        )}
+      </div>
       {contactView ? (
         <>
           <div className="prop-add">
@@ -86,22 +135,22 @@ export function SimulatePanel() {
             </ul>
           )}
           <button
-            disabled={noInertia}
-            title={noInertia ? "robot has no inertial data" : "passive drop with contacts"}
+            disabled={bakeOff}
+            title={bakeTitle("passive drop with contacts")}
             onClick={() => void runContactSim("drop")}
           >
             ⤓ Gravity drop
           </button>
           <button
-            disabled={noInertia}
-            title={noInertia ? "robot has no inertial data" : "computed-torque hold at this pose"}
+            disabled={bakeOff}
+            title={bakeTitle("computed-torque hold at this pose")}
             onClick={() => void runContactSim("hold")}
           >
             ⊙ Hold pose
           </button>
           <button
-            disabled={noInertia}
-            title={noInertia ? "robot has no inertial data" : "computed-torque drive to home"}
+            disabled={bakeOff}
+            title={bakeTitle("computed-torque drive to home")}
             onClick={() => void runContactSim("drive_to", new Array(robot.ndof).fill(0))}
           >
             ⌖ Drive to home
@@ -132,24 +181,19 @@ export function SimulatePanel() {
         </>
       ) : (
         <>
-          <button
-            disabled={noInertia}
-            title={noInertia ? "robot has no inertial data" : ""}
-            onClick={() => void run()}
-          >
+          <button disabled={bakeOff} title={bakeTitle("")} onClick={() => void run()}>
             ⤓ Gravity drop
           </button>
           <button
-            disabled={noInertia}
-            title={
-              noInertia ? "robot has no inertial data" : "computed-torque control back to home"
-            }
+            disabled={bakeOff}
+            title={bakeTitle("computed-torque control back to home")}
             onClick={() => void runControl(new Array(robot.ndof).fill(0))}
           >
             ⌖ Drive to home
           </button>
           <button
-            title="collision-free RRT plan back to home"
+            disabled={live !== null}
+            title={live ? "stop live to bake" : "collision-free RRT plan back to home"}
             onClick={() => void runPlan(new Array(robot.ndof).fill(0))}
           >
             ⛬ Plan to home

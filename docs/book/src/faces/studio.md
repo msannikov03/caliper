@@ -11,7 +11,9 @@ persistent 3D canvas (⌘1…⌘5, or the ⌘K command palette):
   transport.
 - **Simulate** — gravity drop, computed-torque drive-to-goal, RRT plan,
   collision check, dynamics readout; MuJoCo contact sim in `--features
-  mujoco` builds ([contact simulation](../capabilities/contact-sim.md)).
+  mujoco` builds ([contact simulation](../capabilities/contact-sim.md)); a
+  **live session** (Start Live / Pause / Reset / Stop) stepping the sim in
+  real time — see below.
 - **Graph** — the Simulink-style dataflow editor backed by the
   [dataflow graph](../capabilities/studio-graph.md) (run/validate,
   save/load, file import/export, live scopes).
@@ -42,6 +44,31 @@ lint](../capabilities/doctors.md)):
   that names an episode is clickable and jumps the episode table to it, so a
   bad take can be split or deleted on the spot. Structural edits clear the
   report (it described the pre-edit bytes).
+
+## Live session (Simulate)
+
+Alongside the baked rollouts, Simulate mode runs a **live stepped session**:
+
+- **Start Live** spawns a background thread that steps the sim at a fixed
+  1 ms physics timestep with a PD servo holding a live-mutable joint target,
+  and streams state to the viewport at render rate (~60 Hz). In `mujoco`
+  builds this is the full contact sim — free props supported, contact count
+  shown live; default builds fall back to the builtin gravity integrator
+  (no contacts, props rejected with a clear error).
+- **Pause** freezes the sim — stepping and the wall clock both stop, and the
+  arm holds its pose. It is a freeze, not an e-stop: nothing is de-energized,
+  so nothing falls.
+- **Reset** returns deterministically to the start pose (on MuJoCo, a full
+  `mj_resetData` including the warmstart) with the session clock back at
+  zero; it works while paused and updates the viewport immediately.
+- **Stop** ends the session. A stepping error also ends it, with the reason
+  surfaced rather than a silent freeze.
+
+Bake-then-replay stays for what it is good at — reproducible clips and the
+`C001`–`C003` stability lint. Live is for watching and interacting; driving
+the robot by hand and recording teleop episodes into LeRobotDataset v3.0 are
+the next phases of the build program. Details and honest constraints:
+[Live session](../capabilities/contact-sim.md#live-session-studio).
 
 ## Launch
 

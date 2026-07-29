@@ -128,6 +128,13 @@ impl<B: RobotBackend> ControlLoop<B> {
     pub fn backend_mut(&mut self) -> &mut B {
         &mut self.backend
     }
+    /// Tear the loop down and hand the backend back. Lets a caller reseed the
+    /// backend state and build a FRESH loop around the same backend (fresh
+    /// tick/time and a safety monitor re-anchored at the new pose) — the clean
+    /// reset path for a long-lived interactive session.
+    pub fn into_backend(self) -> B {
+        self.backend
+    }
     pub fn monitor(&self) -> &SafetyMonitor {
         &self.monitor
     }

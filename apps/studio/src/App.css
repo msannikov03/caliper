@@ -886,6 +886,33 @@ input[type="range"] {
   color: var(--singular);
   border-color: rgba(255, 92, 108, 0.3);
 }
+/* --- live session block: streamed state, no baked clip ---
+   Its transport buttons are secondary chrome (the accent-filled .sim-panel
+   button belongs to the rollouts below), same treatment as .prop-add. */
+.sim-panel .live-block {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.sim-panel .live-controls {
+  display: flex;
+  gap: 6px;
+}
+.sim-panel .live-controls button {
+  flex: 1;
+  background: var(--raised);
+  border: 1px solid var(--border-2);
+  color: var(--text);
+  font-weight: 500;
+  padding: 4px 0;
+}
+.sim-panel .live-controls button:hover:not(:disabled) {
+  background: var(--raised-2);
+}
+.sim-panel .badge.live {
+  color: var(--accent);
+  border-color: var(--accent-glow);
+}
 .sim-panel .hint {
   margin: 0;
   color: var(--faint);

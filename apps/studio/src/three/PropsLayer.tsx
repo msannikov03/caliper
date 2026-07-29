@@ -19,9 +19,9 @@ import type { PropTrack } from "../sim/props";
 /** Neutral accent for props without an rgba (matches the joint-marker teal). */
 const PROP_NEUTRAL = "#36c6d4";
 
-function PropNode({ track, k }: { track: PropTrack; k: number }) {
+function PropNode({ track, pose }: { track: PropTrack; pose: number[] }) {
   const ref = useRef<THREE.Group>(null!);
-  const f = track.frames[k];
+  const f = pose;
 
   useLayoutEffect(() => {
     if (!ref.current || !f || f.length !== 7) return;
@@ -81,24 +81,32 @@ function PropNode({ track, k }: { track: PropTrack; k: number }) {
   );
 }
 
-/** Free props of the active contact clip, following playback time. Renders
- *  nothing for builtin rollouts / motion clips / no-mujoco builds (a contact
- *  clip is the ONLY source of prop tracks). */
+/** Free props of the running LIVE session (streamed poses, one row per prop) or
+ *  — with nothing live — of the active contact clip, following playback time.
+ *  Renders nothing for builtin rollouts / motion clips / no-mujoco builds
+ *  (a live session and a contact clip are the ONLY sources of prop tracks). */
 export function PropsLayer() {
   const simTraj = useStore((s) => s.simTraj);
   const playhead = useStore((s) => s.playhead);
+  const live = useStore((s) => s.live);
+  const livePropPoses = useStore((s) => s.livePropPoses);
   const matrix = useMemo(() => DISPLAY_UP.clone(), []);
-  const tracks = simTraj?.kind === "contact" ? (simTraj.props ?? []) : [];
+  // a live session owns the scene while it runs; a baked clip owns it otherwise
+  const baked = simTraj?.kind === "contact" ? simTraj : null;
+  const tracks = live ? live.props : (baked?.props ?? []);
   if (tracks.length === 0) return null;
-  const dt = simTraj!.dt;
   return (
     <group matrixAutoUpdate={false} matrix={matrix}>
-      {tracks.map(
-        (tr) =>
-          tr.frames.length > 0 && (
-            <PropNode key={tr.name} track={tr} k={frameIndexAt(playhead, dt, tr.frames.length)} />
-          ),
-      )}
+      {tracks.map((tr, i) => {
+        // live poses are indexed by BUILD ORDER (the latest streamed state row);
+        // baked poses by the playback instant, same rounding as the robot's
+        const pose = live
+          ? livePropPoses[i]
+          : tr.frames.length > 0
+            ? tr.frames[frameIndexAt(playhead, baked!.dt, tr.frames.length)]
+            : undefined;
+        return pose ? <PropNode key={tr.name} track={tr} pose={pose} /> : null;
+      })}
     </group>
   );
 }

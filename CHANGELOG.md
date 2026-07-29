@@ -86,6 +86,25 @@ not releases); from `0.1.0` on, every release gets a proper entry.
   session finalizes the open dataset. Verified end-to-end: a Studio-recorded
   dataset loads in real lerobot 0.6.0. Adds an additive
   `DatasetWriter::discard_buffered` to `caliper-dataset`.
+- **Gripper channel + weld attach-on-grasp** (live session): gripper joints
+  auto-detect by joint *or child-link* name (mimic joints skipped; explicit
+  override supported), open/close rides the same PD hold target as every
+  other input (`G`, gamepad X, or the panel button), and closing on a
+  touching prop welds it to the attach link with its relative pose captured
+  at activation (snap-free, measured < 1 mm) — the standard sim-teleop
+  heuristic, labeled as such, not finger physics. Opening releases; reset
+  releases and reopens. New `caliper_model::gripper` detection module, MJCF
+  inactive-weld emission behind `MjcfOptions::attach_link`, runtime weld
+  (de)activation on `MujocoSim`.
+- **Success predicates** (`caliper_learn.success`): `Lifted` /
+  `PlacedInZone` / `AllOf` / `AnyOf` with an exact JSON round-trip schema;
+  `VecSimEnv(success=…)` reports `info["success"]`/`info["final_success"]`
+  per the final-observation convention; the eval harness scores
+  predicate-based success (wilson intervals unchanged) and the autopsy
+  verdict names the criterion. En route, the vectorized env's dof addressing
+  became name-resolved — a prop free-joint in `extra_xml` previously landed
+  *before* the robot in qpos order, so scene props would have silently
+  received the arm's commands; props now also render in image observations.
 
 ### Changed
 - `caliper record` default dataset format is **v3.0** (was v2.1); the legacy

@@ -156,6 +156,41 @@
   background: var(--raised-2);
 }
 
+/* --- simulate panel: gripper + grasp (B) ---
+   Same secondary chrome as the live transport; a CLOSED jaw fills with the
+   accent so the panel reads its command state at a glance, and the held prop
+   rides beside it as a badge (the weld is a heuristic, never a measurement). */
+.sim-panel .grip-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.sim-panel .grip-row button.grip {
+  flex: 1;
+  background: var(--raised);
+  border: 1px solid var(--border-2);
+  color: var(--text);
+  font-weight: 500;
+  padding: 4px 9px;
+}
+.sim-panel .grip-row button.grip:hover:not(:disabled) {
+  background: var(--raised-2);
+}
+.sim-panel .grip-row button.grip.closed {
+  background: var(--accent-dim);
+  border-color: var(--accent-glow);
+  color: var(--accent);
+  font-weight: 600;
+}
+.sim-panel .grip-row .badge.held {
+  color: var(--accent);
+  border-color: var(--accent-glow);
+  max-width: 45%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap; /* a long prop name elides; the title carries it */
+}
+
 /* --- simulate panel: teleop recording (A3) ---
    Sits under the live transport and borrows its secondary-chrome treatment;
    the ONE exception is the record control, which is red and pulses while a

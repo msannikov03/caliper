@@ -1,0 +1,63 @@
+<?xml version="1.0"?>
+<!-- gripper_arm — a 3-dof arm that HANGS DOWN over the origin and ends in a
+     named `gripper` joint, built for the grasp (weld attach-on-grasp) tests.
+
+     Geometry is chosen so a box prop of half-extent 0.05 resting on a ground
+     plane at z=0 (its top face at z=0.10) is already touched by the jaw at
+     q=[0,0,0], with no free-fall race to lose:
+
+       j1 axis Y at z=0.50          upper: box half (0.03,0.03,0.15) at z=-0.15
+       j2 axis Y at z=0.20          wrist: box half 0.03 at the joint origin
+       gripper (prismatic, Y) at z=0.129
+                                    jaw:   box half 0.03  →  bottom at z=0.099
+
+     i.e. 1 mm of penetration into the prop's top face: a contact from tick 0,
+     with the contact normal straight up through both hinge axes, so the PD
+     hold is not fighting a lever arm. Swinging j1 lifts the jaw (and anything
+     welded to it) clear of the ground.
+
+     Inertials on every movable link (has_inertia must hold for any dynamics
+     backend); the `gripper` joint carries BOTH limits, which the gripper
+     channel needs for its open/closed targets. -->
+<robot name="gripper_arm">
+  <link name="base"/>
+
+  <link name="upper">
+    <inertial><origin xyz="0 0 -0.15" rpy="0 0 0"/><mass value="1.0"/>
+      <inertia ixx="0.01" ixy="0" ixz="0" iyy="0.01" iyz="0" izz="0.001"/></inertial>
+    <collision><origin xyz="0 0 -0.15" rpy="0 0 0"/>
+      <geometry><box size="0.06 0.06 0.30"/></geometry></collision>
+  </link>
+
+  <link name="wrist">
+    <inertial><origin xyz="0 0 0" rpy="0 0 0"/><mass value="0.4"/>
+      <inertia ixx="0.001" ixy="0" ixz="0" iyy="0.001" iyz="0" izz="0.001"/></inertial>
+    <collision><origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><box size="0.06 0.06 0.06"/></geometry></collision>
+  </link>
+
+  <link name="jaw">
+    <inertial><origin xyz="0 0 0" rpy="0 0 0"/><mass value="0.2"/>
+      <inertia ixx="0.0005" ixy="0" ixz="0" iyy="0.0005" iyz="0" izz="0.0005"/></inertial>
+    <collision><origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><box size="0.06 0.06 0.06"/></geometry></collision>
+  </link>
+
+  <joint name="j1" type="revolute">
+    <parent link="base"/><child link="upper"/>
+    <origin xyz="0 0 0.5" rpy="0 0 0"/><axis xyz="0 1 0"/>
+    <limit lower="-1.5" upper="1.5" effort="200" velocity="5"/>
+  </joint>
+
+  <joint name="j2" type="revolute">
+    <parent link="upper"/><child link="wrist"/>
+    <origin xyz="0 0 -0.3" rpy="0 0 0"/><axis xyz="0 1 0"/>
+    <limit lower="-1.5" upper="1.5" effort="100" velocity="5"/>
+  </joint>
+
+  <joint name="gripper" type="prismatic">
+    <parent link="wrist"/><child link="jaw"/>
+    <origin xyz="0 0 -0.071" rpy="0 0 0"/><axis xyz="0 1 0"/>
+    <limit lower="0" upper="0.04" effort="20" velocity="0.5"/>
+  </joint>
+</robot>

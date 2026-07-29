@@ -3187,6 +3187,7 @@ pub fn run() {
             dataset_doctor,
             live::live_start,
             live::live_set_target,
+            live::live_gripper,
             live::live_pause,
             live::live_reset,
             live::live_stop,

@@ -69,6 +69,10 @@ Alongside the baked rollouts, Simulate mode runs a **live stepped session**:
 - **Stop** ends the session. A stepping error also ends it, with the reason
   surfaced rather than a silent freeze.
 
+- **Grasp props** — robots with a gripper joint (auto-detected by name, or
+  named explicitly) get a gripper open/close control (button, `G`, or gamepad
+  X); closing on a touching prop welds it to the gripper — the standard sim
+  teleop heuristic, labeled as such — and a `HELD` badge names what's carried.
 - **Record teleop episodes** — while live, pick a dataset folder, set a task
   label and fps (default 50), and record takes straight into a native
   LeRobotDataset v3.0: stop-and-save or discard per take, episode counter,

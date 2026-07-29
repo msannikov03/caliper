@@ -8,6 +8,9 @@ applies and merges them into a single `AutopsyReport`:
 - P-section  `debugger.analyze_policy` on the checkpoint, dataset-aware.
 - E-section  `eval.evaluate` — seeded closed-loop success rate with a Wilson
   95% interval. Only when `robot` AND `task` are given (rollouts need a sim).
+  When the task carries a `success_predicate`, its plain-English sentence
+  rides along into the verdict, so the rate is never quoted without saying
+  what counted as success.
 - L-section  `profile.profile_rollout` — per-stage latency + the honest
   achievable Hz, on a fresh `caliper.ControlLoop`. Same gating.
 
@@ -179,6 +182,9 @@ def _verdict(
             f"closed-loop: {e.n_success}/{e.n_episodes} episodes succeeded "
             f"(95% CI [{e.ci95_low:.2f}, {e.ci95_high:.2f}])"
         )
+        if e.success_criterion is not None:
+            # Never state a rate without stating what it is a rate OF.
+            clause += f", where success = {e.success_criterion}"
         if e.n_success == 0:
             clause += " — the policy never solved the task"
         sentences.append(clause)

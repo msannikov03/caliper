@@ -61,6 +61,25 @@ policy produce a byte-identical `to_json(result)`; a policy with its own
 unseeded RNG breaks that — seed it in `reset()`, the way the diffusion head
 does.
 
+**Manipulation success predicates.** For grasp/place tasks, "the
+termination fired" is the wrong success definition — you care whether the
+*object* ended up where it should. `caliper_learn.success` provides
+composable predicates: `Lifted(prop, height)` (relative to the prop's
+episode-start pose, or absolute), `PlacedInZone(prop, zone)` (axis-aligned
+box, inclusive faces, optional settled-speed requirement — which *raises* on
+a velocity-less state rather than silently passing a fly-through), and
+`AllOf`/`AnyOf` combinators. Every predicate round-trips exactly through a
+JSON schema (`{"kind": "lifted", …}`) — unknown kinds *and* unknown keys
+raise, so a typo in a task file can never silently weaken the success test.
+Set `EvalTask.success_predicate` (with `extra_xml` putting the prop in the
+scene) and the predicate becomes the episode's success source — it ends the
+episode when it fires, so steps-to-success stays meaningful; a
+`termination_fn` still ends episodes, but ending is not succeeding. Wilson
+aggregation is unchanged, and the report's `success:` line prints the
+predicate's plain-english description. `VecSimEnv(success=…)` reports the
+same predicates per step in `info["success"]` (terminal verdicts move to
+`info["final_success"]` on auto-reset, matching the `final_*` convention).
+
 `sweep(checkpoints, task, cfg)` is the checkpoint-selection answer: every
 candidate — Hub checkpoint directories *and* in-memory policies or scripted
 callables, in one table — is evaluated under the **same seeds** and ranked by

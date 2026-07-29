@@ -98,8 +98,9 @@ export default function App() {
   // and deliberately lets these chords fall through.
   //
   // A RUNNING live session claims the unmodified drive keys on top: Space
-  // freezes, `[`/`]` pick the jogged joint, `-`/`=`/↑/↓ jog it (held, so the
-  // store's per-frame drive step integrates them). preventDefault on Space
+  // freezes, G opens/closes the gripper, `[`/`]` pick the jogged joint,
+  // `-`/`=`/↑/↓ jog it (held, so the store's per-frame drive step integrates
+  // them). preventDefault on Space
   // matters twice — it stops the page scrolling AND stops a focused transport
   // button from re-firing its own click.
   useEffect(() => {
@@ -115,6 +116,10 @@ export default function App() {
           e.preventDefault();
           if (act === "freeze") {
             if (!e.repeat) void st.pauseLive(!st.live.paused);
+          } else if (act === "gripper") {
+            // one press is one toggle: auto-repeat would flap the jaw open
+            // and shut for as long as the key is down
+            if (!e.repeat) void st.toggleGripper();
           } else if (act === "jog") {
             st.liveJogKey(e.key, true);
           } else {

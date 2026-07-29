@@ -126,9 +126,10 @@ rotating file logs + panic capture, graph editor with delete/duplicate/fit and
 shareable `.caliper-graph.json` file export/import, live stepped sim session in
 Simulate (fixed 1 ms physics + PD hold target streamed at ~60 Hz, with
 pause/deterministic-reset/stop and a live contact count on MuJoCo builds) —
-drivable by hand via sliders, IK gizmo, keyboard jog, or gamepad tip drive,
-and recordable: teleop takes stream straight into a native LeRobotDataset
-v3.0 at exact tick decimation (loads in real lerobot 0.6.0).
+drivable by hand via sliders, IK gizmo, keyboard jog, or gamepad tip drive —
+gripper open/close with honest weld-heuristic grasping included — and
+recordable: teleop takes stream straight into a native LeRobotDataset v3.0
+at exact tick decimation (loads in real lerobot 0.6.0).
 
 ---
 

@@ -20,6 +20,7 @@ import {
   jogRate,
   liveKeyAction,
   stepJoint,
+  withSlot,
   GAMEPAD_DEADBAND,
   JOG_RATE_PRISMATIC,
   JOG_RATE_REVOLUTE,
@@ -91,6 +92,28 @@ describe("clampJoint / applyJog — the target never leaves the limits", () => {
   });
 });
 
+describe("withSlot — one slot of a target vector, by copy", () => {
+  it("copies rather than writing through (the vector is also the store's)", () => {
+    const v = [0.1, 0.2];
+    const out = withSlot(v, 1, 0.9);
+    expect(out).toEqual([0.1, 0.9]);
+    expect(v).toEqual([0.1, 0.2]);
+    expect(out).not.toBe(v);
+  });
+
+  it("returns the SAME vector when the slot already holds that value", () => {
+    const v = [0.1, 0.2];
+    expect(withSlot(v, 1, 0.2)).toBe(v);
+  });
+
+  it("passes a null or out-of-range write straight through", () => {
+    expect(withSlot(null, 0, 1)).toBeNull();
+    const v = [0.1];
+    expect(withSlot(v, 3, 1)).toBe(v);
+    expect(withSlot(v, -1, 1)).toBe(v);
+  });
+});
+
 describe("axisResponse — deadband + cubic curve", () => {
   it("reads exactly zero inside the deadband (a resting stick cannot creep)", () => {
     expect(axisResponse(0)).toBe(0);
@@ -158,6 +181,24 @@ describe("gamepadIntent — sticks to tip velocity, buttons to edges", () => {
   it("treats a first-ever poll (no previous frame) as a press edge", () => {
     expect(gamepadIntent([], [true], []).togglePause).toBe(true);
   });
+
+  it("fires X/square once per press for the gripper, and never for its neighbours", () => {
+    const down = gamepadIntent([], [false, false, true], [false, false, false]);
+    expect(down.toggleGripper).toBe(true);
+    expect(down.togglePause).toBe(false);
+    expect(down.reset).toBe(false);
+    // held down: the edge already fired, and a flapping jaw is the bug here
+    expect(gamepadIntent([], [false, false, true], [false, false, true]).toggleGripper).toBe(false);
+    // released, then pressed again = a fresh edge
+    const up = gamepadIntent([], [false, false, false], [false, false, true]);
+    expect(up.toggleGripper).toBe(false);
+    expect(gamepadIntent([], [false, false, true], [false, false, false]).toggleGripper).toBe(true);
+  });
+
+  it("stays idle on a pad reporting fewer buttons than we read", () => {
+    expect(gamepadIntent([], [true], [false]).toggleGripper).toBe(false);
+    expect(gamepadIntent([], [], []).toggleGripper).toBe(false);
+  });
 });
 
 describe("applyTipVelocity — cartesian goal integrator", () => {
@@ -208,6 +249,8 @@ describe("keyboard — direction, selection, and what a key means", () => {
   it("classifies the drive keys and ignores everything else", () => {
     expect(liveKeyAction(" ")).toBe("freeze");
     expect(liveKeyAction("Spacebar")).toBe("freeze"); // older webviews
+    expect(liveKeyAction("g")).toBe("gripper");
+    expect(liveKeyAction("G")).toBe("gripper"); // shift held, or caps lock on
     expect(liveKeyAction("[")).toBe("prev-joint");
     expect(liveKeyAction("]")).toBe("next-joint");
     expect(liveKeyAction("=")).toBe("jog");

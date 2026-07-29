@@ -18,6 +18,32 @@
 //! one frame, so per-episode timestamps are exactly `frame_index / fps` with no
 //! resampling. The [`DatasetWriter`] lives in the session thread; commands hand
 //! it work through [`LiveShared`] and wait for a reply slot.
+//!
+//! # Grasping (B1/B2), and what is honest about it
+//!
+//! A session detects the robot's GRIPPER JOINT
+//! ([`caliper::model::gripper`]) and exposes it as one extra control:
+//! `live_gripper(closed)` moves that joint's slot in the same PD hold target
+//! every other input writes — there is no second command path, and on the
+//! builtin engine that is ALL it does.
+//!
+//! On the MuJoCo engine the gripper additionally drives a WELD heuristic, and
+//! it is labeled as a heuristic everywhere it surfaces: caliper does not
+//! simulate finger friction (that needs actuated fingers and contact-rich
+//! tuning nobody's teleop rig actually runs). Instead, when the gripper is
+//! commanded CLOSED and has either reached the closed target or stalled
+//! against something while closing, and some prop is genuinely in contact with
+//! a robot geom, that prop is WELDED to the gripper's link — the same
+//! attach-on-grasp trick teleop data-collection rigs use. Opening releases the
+//! weld and the prop falls naturally. The prop's identity streams out as
+//! `held`; it is NOT written into recorded datasets in this phase (state and
+//! action stay pure joints).
+//!
+//! Two limits worth stating plainly. The contact test accepts a prop touching
+//! ANY robot geom, not specifically the jaw — a prop resting against the
+//! forearm when the gripper closes will be taken. And a MuJoCo weld is a soft
+//! constraint, so a carried prop sags a millimetre or two under a hard swing
+//! rather than tracking rigidly.
 
 use crate::{bake_frame_row, logged, AppState, PropDto, PropTrackDto};
 use caliper::hal::{ControlLoop, Frame, Gains, PhysicsSimBackend, TeleopSetpoint};
@@ -40,6 +66,19 @@ const DEFAULT_RECORD_FPS: u32 = 50;
 /// still short enough that a wedged thread surfaces as an error, not a hang.
 const REC_REPLY_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// How close to the closed target — as a fraction of the open→closed span —
+/// the gripper counts as CLOSED.
+const GRASP_CLOSE_FRAC: f64 = 0.25;
+
+/// Per-tick gripper motion below this fraction of the span counts as "not
+/// advancing" for the blocked-gripper test.
+const GRASP_STALL_EPS_FRAC: f64 = 1e-5;
+
+/// Consecutive non-advancing ticks that mean a closing gripper is BLOCKED.
+/// 50 ticks = 50 ms at the 1 kHz tick rate: long enough not to fire on PD
+/// overshoot, short enough that a grab feels immediate.
+const GRASP_STALL_TICKS: u32 = 50;
+
 /// Monotonic session ids across the process lifetime.
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -61,6 +100,13 @@ pub struct LiveStartReq {
     /// Requested state-event rate; clamped to [10, 120] then snapped to an
     /// integer step decimation (the DTO echoes the ACTUAL rate).
     emit_hz: Option<f64>,
+    /// Override the auto-detected gripper joint BY NAME (Err if the robot has
+    /// no such joint, or it has no limits to open/close between). `None` =
+    /// auto-detect; a robot with no gripper simply gets no channel.
+    gripper_joint: Option<String>,
+    /// Which end of the gripper joint's range CLOSES it: `"lo"` (the default,
+    /// and the usual convention) or `"hi"`.
+    gripper_closed: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -76,6 +122,38 @@ pub struct LiveStartedDto {
     /// Static prop shape/color info in build order; `frames` empty (live poses
     /// arrive per-event, not baked).
     props: Vec<PropTrackDto>,
+    /// The gripper channel this session found, or `null` when the robot has no
+    /// gripper joint — in which case `live_gripper` errors and `held` is
+    /// always `null`.
+    gripper: Option<GripperDto>,
+}
+
+/// The gripper channel of a live session: which joint it drives and the two
+/// hold-target values `live_gripper` writes into that joint's slot.
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct GripperDto {
+    /// Caliper joint name.
+    joint: String,
+    /// Index of that joint in `q` / `target` / `action`.
+    index: usize,
+    /// Hold target for OPEN — the joint limit at the open end, pulled 2% of
+    /// the range inward so the PD target never slams the mechanical stop.
+    open_target: f64,
+    /// Hold target for CLOSED, inset the same way.
+    closed_target: f64,
+}
+
+/// Live gripper state, streamed on every `live://state`.
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct GripperStateEvent {
+    /// The last `live_gripper` intent (true = commanded closed). This is the
+    /// COMMAND, not the measurement — a gripper closed on a prop reads
+    /// `closed: true` with `q` still short of `closedTarget`.
+    closed: bool,
+    /// Measured position of the gripper joint.
+    q: f64,
 }
 
 #[derive(Serialize, Clone)]
@@ -99,6 +177,13 @@ pub struct LiveStateEvent {
     recording: bool,
     /// Frames captured in the current take; 0 when not recording.
     rec_frames: u64,
+    /// Gripper command + measurement (B1); `null` when the session has no
+    /// gripper channel.
+    gripper: Option<GripperStateEvent>,
+    /// Name of the prop currently WELDED to the gripper (B2), or `null` when
+    /// nothing is held. Always `null` on the builtin engine, which has no
+    /// contacts to grasp with.
+    held: Option<String>,
 }
 
 #[derive(Serialize, Clone)]
@@ -272,6 +357,14 @@ pub(crate) struct LiveShared {
     rec_mirror: Mutex<Option<RecMirror>>,
     recording: AtomicBool,
     rec_frames: AtomicU64,
+    /// Grasp INTENT: the last `live_gripper` call. The matching hold-target
+    /// move is written by the same command, so `target` stays the single
+    /// source of truth for what the arm is commanded to do — this flag only
+    /// says which way the human meant it.
+    grasp_closed: AtomicBool,
+    /// Prop the session thread currently has welded (B2); thread-owned,
+    /// mirrored here for state events. Always `None` on builtin.
+    held: Mutex<Option<String>>,
 }
 
 impl LiveShared {
@@ -290,7 +383,28 @@ impl LiveShared {
             rec_mirror: Mutex::new(None),
             recording: AtomicBool::new(false),
             rec_frames: AtomicU64::new(0),
+            grasp_closed: AtomicBool::new(false),
+            held: Mutex::new(None),
         }
+    }
+}
+
+/// The resolved gripper channel: one joint, two hold-target values. Built in
+/// `live_start` (so a bad override fails before any thread exists) and shared
+/// by the command side and the session thread.
+#[derive(Clone, Debug)]
+pub(crate) struct GripperChannel {
+    index: usize,
+    name: String,
+    open_target: f64,
+    closed_target: f64,
+}
+
+impl GripperChannel {
+    /// Distance between the two targets — the span every grasp threshold is a
+    /// fraction of. Always positive.
+    fn span(&self) -> f64 {
+        (self.open_target - self.closed_target).abs()
     }
 }
 
@@ -304,6 +418,8 @@ pub(crate) struct LiveSession {
     h: f64,
     /// Initial pose — the `live_reset(None)` restore point.
     q0: Vec<f64>,
+    /// The gripper channel, when this robot has one (B1).
+    gripper: Option<GripperChannel>,
     shared: Arc<LiveShared>,
     join: Option<JoinHandle<()>>,
 }
@@ -342,6 +458,65 @@ impl Pacer {
     fn clear(&mut self) {
         self.acc = 0.0;
     }
+}
+
+// ===== grasp heuristic (B2) =====
+
+/// Per-tick gripper history the blocked test needs. Reset whenever the intent
+/// flips or a prop is taken, so a stall only ever describes the CURRENT close.
+#[derive(Default)]
+struct GraspTracker {
+    /// Gripper position at the previous tick.
+    last_q: Option<f64>,
+    /// Consecutive ticks the gripper failed to advance toward closed.
+    stalled: u32,
+}
+
+impl GraspTracker {
+    fn clear(&mut self) {
+        self.last_q = None;
+        self.stalled = 0;
+    }
+
+    /// Feed one tick's measured gripper position; returns the running stall
+    /// count. "Advancing" is motion toward the closed target by more than
+    /// `GRASP_STALL_EPS_FRAC` of the span — a gripper resting on a prop moves
+    /// by far less than that per millisecond.
+    fn observe(&mut self, q: f64, g: &GripperChannel) -> u32 {
+        let toward_closed = match self.last_q {
+            Some(prev) => (prev - q) * (g.open_target - g.closed_target).signum(),
+            None => f64::INFINITY, // first tick: nothing to compare, assume moving
+        };
+        self.last_q = Some(q);
+        if toward_closed > GRASP_STALL_EPS_FRAC * g.span() {
+            self.stalled = 0;
+        } else {
+            self.stalled = self.stalled.saturating_add(1);
+        }
+        self.stalled
+    }
+}
+
+/// Is a gripper commanded closed actually closed ON something?
+///
+/// Two ways to qualify, because a gripper that has caught a prop NEVER reaches
+/// its closed target — the prop is in the way:
+/// 1. it got within [`GRASP_CLOSE_FRAC`] of the span of the closed target, or
+/// 2. it is past the halfway point toward closed AND has stopped advancing for
+///    [`GRASP_STALL_TICKS`] — i.e. it is pressing on something.
+///
+/// Pure: no sim, no clock. The CONTACT half of the grasp condition is checked
+/// separately against the engine.
+fn gripper_engaged(q: f64, g: &GripperChannel, stalled: u32) -> bool {
+    let span = g.span();
+    if span <= 0.0 {
+        return false;
+    }
+    if (q - g.closed_target).abs() <= GRASP_CLOSE_FRAC * span {
+        return true;
+    }
+    let past_half = (q - g.closed_target).abs() < (q - g.open_target).abs();
+    past_half && stalled >= GRASP_STALL_TICKS
 }
 
 // ===== the engine =====
@@ -397,6 +572,36 @@ impl LiveEngine {
                     .collect();
                 (sim.qpos(), sim.qvel(), sim.ncon() as u32, props)
             }
+        }
+    }
+
+    /// Weld the first prop that is genuinely touching a robot geom, and return
+    /// its name. `None` = nothing to grab (and always `None` on builtin, which
+    /// has no contacts at all). The weld captures the CURRENT relative pose,
+    /// so the prop does not snap when it is taken.
+    fn attach_first_touching(&mut self) -> Result<Option<String>, String> {
+        match self {
+            LiveEngine::Builtin(_) => Ok(None),
+            #[cfg(feature = "mujoco")]
+            LiveEngine::Mujoco(l) => {
+                let sim = l.backend_mut().sim_mut();
+                let Some(prop) = sim.props_touching_robot().first().map(|s| s.to_string()) else {
+                    return Ok(None);
+                };
+                sim.set_weld_active(&prop, true, true)
+                    .map_err(|e| e.to_string())?;
+                Ok(Some(prop))
+            }
+        }
+    }
+
+    /// Release every grasp weld. A released prop keeps its current state and
+    /// falls naturally. Idempotent, and a no-op on builtin.
+    fn release_all(&mut self) {
+        match self {
+            LiveEngine::Builtin(_) => {}
+            #[cfg(feature = "mujoco")]
+            LiveEngine::Mujoco(l) => l.backend_mut().sim_mut().deactivate_all_welds(),
         }
     }
 
@@ -648,6 +853,63 @@ fn close_recorder(shared: &LiveShared, rec: &mut Option<Recorder>) {
     publish_rec(shared, None);
 }
 
+// ===== grasp (thread-side) =====
+
+/// Publish what the session thread currently holds, for state events and
+/// status. Called only on transitions.
+fn publish_held(shared: &LiveShared, held: Option<&str>) {
+    if let Ok(mut h) = shared.held.lock() {
+        *h = held.map(str::to_string);
+    }
+}
+
+/// One tick of the weld heuristic. Runs on EVERY tick (not per emit batch) so
+/// a grab lands on the exact tick the conditions are met — a grasp that
+/// depended on the event decimation would be a different grasp at a different
+/// emit rate.
+///
+/// Costs nothing on the common path: it only looks at contacts when the human
+/// is holding the gripper closed, nothing is held yet, and the gripper is
+/// engaged. Once a prop is taken it is kept until the intent flips to open —
+/// one prop at a time, first match wins.
+fn service_grasp(
+    shared: &LiveShared,
+    engine: &mut LiveEngine,
+    g: &GripperChannel,
+    tracker: &mut GraspTracker,
+    held: &mut Option<String>,
+    frame: &Frame,
+) -> Result<(), String> {
+    let want_closed = shared.grasp_closed.load(Ordering::Relaxed);
+    if !want_closed {
+        tracker.clear();
+        if held.take().is_some() {
+            engine.release_all();
+            publish_held(shared, None);
+        }
+        return Ok(());
+    }
+    if held.is_some() {
+        return Ok(());
+    }
+    let Some(&q) = frame.measured.get(g.index) else {
+        return Ok(());
+    };
+    let stalled = tracker.observe(q, g);
+    if !gripper_engaged(q, g, stalled) {
+        return Ok(());
+    }
+    if let Some(prop) = engine.attach_first_touching()? {
+        log::info!(
+            target: "studio::live",
+            "gripper closed on `{prop}` — welded to the attach link (heuristic grasp)"
+        );
+        *held = Some(prop);
+        publish_held(shared, held.as_deref());
+    }
+    Ok(())
+}
+
 /// Physics ticks per recorded frame. The tick rate must be an exact integer
 /// multiple of `fps`: anything else would drift the real sample times away from
 /// the `frame_index / fps` timestamps the dataset stores.
@@ -691,6 +953,7 @@ fn state_event(
     shared: &LiveShared,
     session_id: u64,
     paused: bool,
+    gripper: Option<&GripperChannel>,
 ) -> Option<LiveStateEvent> {
     let (q, qd, ncon, props) = engine.snapshot();
     if !(q.iter().all(|x| x.is_finite()) && qd.iter().all(|x| x.is_finite())) {
@@ -702,6 +965,13 @@ fn state_event(
         .lock()
         .map(|t| t.clone())
         .unwrap_or_else(|_| q.clone());
+    let gripper = gripper.and_then(|g| {
+        Some(GripperStateEvent {
+            closed: shared.grasp_closed.load(Ordering::Relaxed),
+            q: *q.get(g.index)?,
+        })
+    });
+    let held = shared.held.lock().ok().and_then(|h| h.clone());
     Some(LiveStateEvent {
         session_id,
         tick: engine.tick(),
@@ -716,6 +986,8 @@ fn state_event(
         target,
         recording: shared.recording.load(Ordering::Relaxed),
         rec_frames: shared.rec_frames.load(Ordering::Relaxed),
+        gripper,
+        held,
     })
 }
 
@@ -731,11 +1003,21 @@ fn run_session<E: LiveEmitter>(
     emit_every: u64,
     session_id: u64,
     shared: Arc<LiveShared>,
+    gripper: Option<GripperChannel>,
     emitter: E,
 ) {
     let mut rec: Option<Recorder> = None;
     let reason = session_loop(
-        engine, &model, gains, h, emit_every, session_id, &shared, &emitter, &mut rec,
+        engine,
+        &model,
+        gains,
+        h,
+        emit_every,
+        session_id,
+        &shared,
+        gripper.as_ref(),
+        &emitter,
+        &mut rec,
     );
     close_recorder(&shared, &mut rec);
     emitter.ended(&LiveEndedEvent { session_id, reason });
@@ -754,6 +1036,7 @@ fn session_loop<E: LiveEmitter>(
     emit_every: u64,
     session_id: u64,
     shared: &Arc<LiveShared>,
+    gripper: Option<&GripperChannel>,
     emitter: &E,
     rec: &mut Option<Recorder>,
 ) -> String {
@@ -773,6 +1056,8 @@ fn session_loop<E: LiveEmitter>(
     let mut last_wall = Instant::now();
     let mut last_paused = shared.paused.load(Ordering::Relaxed);
     let mut since_emit: u64 = 0;
+    let mut grasp = GraspTracker::default();
+    let mut held: Option<String> = None;
 
     macro_rules! die {
         ($detail:expr) => {{
@@ -782,7 +1067,7 @@ fn session_loop<E: LiveEmitter>(
     }
     macro_rules! emit_state_or_die {
         ($paused:expr) => {
-            match state_event(&engine, model, shared, session_id, $paused) {
+            match state_event(&engine, model, shared, session_id, $paused, gripper) {
                 Some(ev) => {
                     set_status(shared, $paused, ev.t, ev.tick);
                     emitter.state(&ev);
@@ -823,6 +1108,14 @@ fn session_loop<E: LiveEmitter>(
                 Ok(e) => e,
                 Err(e) => die!(format!("reset failed: {e}")),
             };
+            // A reset is a fresh epoch: nothing is held, and the gripper goes
+            // back to OPEN intent so the flag agrees with the q0 hold target
+            // the reset just installed.
+            engine.release_all();
+            held = None;
+            grasp.clear();
+            shared.grasp_closed.store(false, Ordering::Relaxed);
+            publish_held(shared, None);
             if let Ok(mut t) = shared.target.lock() {
                 *t = qr.clone();
             }
@@ -868,6 +1161,12 @@ fn session_loop<E: LiveEmitter>(
                 Ok(f) => f,
                 Err(e) => die!(e),
             };
+            if let Some(g) = gripper {
+                if let Err(e) = service_grasp(shared, &mut engine, g, &mut grasp, &mut held, &frame)
+                {
+                    die!(format!("grasp failed: {e}"));
+                }
+            }
             record_tick(shared, rec, &frame);
             since_emit += 1;
             if since_emit >= emit_every {
@@ -882,6 +1181,12 @@ fn session_loop<E: LiveEmitter>(
 // ===== engine construction (inside the command; errors before any thread) =====
 
 /// Engine + its physics timestep. Validation errors return before any spawn.
+///
+/// `attach_link` (the gripper's own link) turns on the per-prop grasp welds in
+/// the generated MJCF; `None` — no gripper channel, or the builtin engine —
+/// emits no welds at all, so a session that cannot grasp carries no machinery
+/// for it.
+#[allow(clippy::too_many_arguments)]
 fn build_engine(
     model: &Arc<Model>,
     engine_name: &str,
@@ -889,6 +1194,7 @@ fn build_engine(
     props: &[PropDto],
     ground: f64,
     gains: Gains,
+    attach_link: Option<String>,
 ) -> Result<(LiveEngine, f64), String> {
     let zeros = vec![0.0; q0.len()];
     match engine_name {
@@ -896,6 +1202,7 @@ fn build_engine(
             if !props.is_empty() {
                 return Err("props need the mujoco engine — builtin has no contact".into());
             }
+            let _ = attach_link; // no contacts, so nothing to weld to
             let h = 1e-3;
             let mut backend = PhysicsSimBackend::new(model.clone()).map_err(|e| e.to_string())?;
             backend.set_sim_hmax(h);
@@ -917,6 +1224,7 @@ fn build_engine(
                 let opt = MjcfOptions {
                     ground_plane: Some(ground),
                     props: specs,
+                    attach_link,
                     ..Default::default() // torque-direct, Earth gravity, 1 ms timestep
                 };
                 let h = opt.timestep;
@@ -930,12 +1238,65 @@ fn build_engine(
             }
             #[cfg(not(feature = "mujoco"))]
             {
-                let _ = ground;
+                let _ = (ground, attach_link);
                 Err("contact sim not compiled — build studio with --features mujoco".into())
             }
         }
         other => Err(format!("unknown engine `{other}` (mujoco|builtin)")),
     }
+}
+
+/// Resolve the session's gripper channel: the explicit `gripperJoint`
+/// override, else auto-detection ([`caliper::model::gripper`]).
+///
+/// An override that names a joint the robot does not have — or one with no
+/// limits to open and close between — is an ERROR, because the human asked for
+/// that specific channel. Auto-detection finding nothing is NOT an error: most
+/// robots have no gripper, and they simply get no channel.
+fn resolve_gripper(
+    model: &Model,
+    joint: Option<&str>,
+    closed_end: Option<&str>,
+) -> Result<Option<GripperChannel>, String> {
+    let closed_at_lo = match closed_end {
+        None | Some("lo") => true,
+        Some("hi") => false,
+        Some(other) => {
+            return Err(format!(
+                "unknown gripperClosed `{other}` — which limit CLOSES the gripper (lo|hi)"
+            ));
+        }
+    };
+    let index = match joint {
+        Some(name) => match model.joint_names.iter().position(|j| j == name) {
+            Some(i) => i,
+            None => {
+                return Err(format!(
+                    "`{name}` is not a joint of this robot ({})",
+                    model.joint_names.join(", ")
+                ));
+            }
+        },
+        None => match caliper::model::gripper::find_gripper_joint(model) {
+            Some(i) => i,
+            None => return Ok(None),
+        },
+    };
+    let Some((open_target, closed_target)) =
+        caliper::model::gripper::gripper_targets(model, index, closed_at_lo)
+    else {
+        return Err(format!(
+            "joint `{}` has no usable limits — a gripper channel needs both, to know \
+             where open and closed are",
+            model.joint_names[index]
+        ));
+    };
+    Ok(Some(GripperChannel {
+        index,
+        name: model.joint_names[index].clone(),
+        open_target,
+        closed_target,
+    }))
 }
 
 // ===== command impls (take &AppState so tests drive them without tauri) =====
@@ -993,7 +1354,30 @@ pub(crate) fn live_start_on<E: LiveEmitter>(
     }
     let gains = Gains { kp, kd };
 
-    let (engine, h) = build_engine(&arc, engine_name, &req.q0, &req.props, ground, gains)?;
+    // The channel is resolved BEFORE the engine is built: a bad override must
+    // fail with nothing constructed, and the attach link comes from it.
+    let gripper = resolve_gripper(
+        &arc,
+        req.gripper_joint.as_deref(),
+        req.gripper_closed.as_deref(),
+    )?;
+    // Props weld to the gripper's OWN link; the tip link is the fallback for a
+    // channel whose child link somehow cannot be named.
+    let attach_link = gripper.as_ref().map(|g| {
+        caliper::model::gripper::child_link_name(&arc, g.index)
+            .unwrap_or_else(|| arc.frame_name(arc.tip_frame()))
+            .to_string()
+    });
+
+    let (engine, h) = build_engine(
+        &arc,
+        engine_name,
+        &req.q0,
+        &req.props,
+        ground,
+        gains,
+        attach_link,
+    )?;
     let every = emit_every(clamp_emit_hz(req.emit_hz), h);
     let actual_hz = 1.0 / (every as f64 * h);
 
@@ -1004,6 +1388,7 @@ pub(crate) fn live_start_on<E: LiveEmitter>(
     let shared = Arc::new(LiveShared::new(req.q0.clone()));
     let thread_shared = shared.clone();
     let thread_model = arc.clone();
+    let thread_gripper = gripper.clone();
     let join = std::thread::Builder::new()
         .name(format!("live-sim-{session_id}"))
         .spawn(move || {
@@ -1015,6 +1400,7 @@ pub(crate) fn live_start_on<E: LiveEmitter>(
                 every,
                 session_id,
                 thread_shared,
+                thread_gripper,
                 emitter,
             )
         })
@@ -1026,6 +1412,7 @@ pub(crate) fn live_start_on<E: LiveEmitter>(
         ndof: n,
         h,
         q0: req.q0,
+        gripper: gripper.clone(),
         shared,
         join: Some(join),
     });
@@ -1050,6 +1437,12 @@ pub(crate) fn live_start_on<E: LiveEmitter>(
         emit_hz: actual_hz,
         ndof: n,
         props,
+        gripper: gripper.map(|g| GripperDto {
+            joint: g.name,
+            index: g.index,
+            open_target: g.open_target,
+            closed_target: g.closed_target,
+        }),
     })
 }
 
@@ -1081,6 +1474,40 @@ pub(crate) fn live_set_target_impl(state: &AppState, q: &[f64]) -> Result<(), St
         }
         let mut t = s.shared.target.lock().map_err(|_| "state lock poisoned")?;
         *t = q.to_vec();
+        Ok(())
+    })
+}
+
+/// Command the gripper open or closed.
+///
+/// This is a TARGET MOVE, not a second control path: it writes the gripper
+/// joint's slot in the same PD hold target the sliders, the IK gizmo and the
+/// keyboard jog write, so there is exactly one thing telling the arm what to
+/// do. The grasp-intent flag it also raises is what the weld heuristic (and
+/// the `gripper.closed` field of `live://state`) reads.
+pub(crate) fn live_gripper_impl(state: &AppState, closed: bool) -> Result<(), String> {
+    with_live(state, |s| {
+        let g = s.gripper.as_ref().ok_or(
+            "this robot has no gripper channel — no joint named like a gripper \
+             (gripper/finger/jaw/claw/hand) with both limits",
+        )?;
+        let mut t = s.shared.target.lock().map_err(|_| "state lock poisoned")?;
+        let slot = t
+            .get_mut(g.index)
+            .ok_or("the gripper joint is out of range for this session's target")?;
+        *slot = if closed {
+            g.closed_target
+        } else {
+            g.open_target
+        };
+        drop(t);
+        // The target move and the intent flag are two separate writes, and the
+        // session thread can land between them either way round — neither
+        // order can produce a wrong grasp. Intent-before-target: the gripper is
+        // still measured open, so the engagement test declines and the grab
+        // happens a tick later. Target-before-intent: the grasp stays open,
+        // which is what "not yet commanded closed" means.
+        s.shared.grasp_closed.store(closed, Ordering::Relaxed);
         Ok(())
     })
 }
@@ -1353,6 +1780,13 @@ pub fn live_set_target(q: Vec<f64>, state: tauri::State<'_, AppState>) -> Result
     live_set_target_impl(&state, &q)
 }
 
+/// Open/close the gripper: moves the gripper joint's hold target and raises
+/// the grasp intent the weld heuristic reads.
+#[tauri::command]
+pub fn live_gripper(closed: bool, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    logged("live_gripper", live_gripper_impl(&state, closed))
+}
+
 /// Freeze/unfreeze stepping (the arm holds mid-physics; never de-energized).
 #[tauri::command]
 pub fn live_pause(paused: bool, state: tauri::State<'_, AppState>) -> Result<(), String> {
@@ -1435,6 +1869,15 @@ mod tests {
         state
     }
 
+    /// A 3-dof arm whose last joint is literally named `gripper`, hanging over
+    /// the origin so it already touches a 5 cm cube resting on the ground.
+    fn gripper_state() -> AppState {
+        let state = AppState::default();
+        let m = Model::from_urdf(&fixture("gripper_arm.urdf")).expect("fixture loads");
+        *state.model.lock().unwrap() = Some(m);
+        state
+    }
+
     #[derive(Clone, Default)]
     struct Collect {
         states: Arc<Mutex<Vec<LiveStateEvent>>>,
@@ -1472,6 +1915,8 @@ mod tests {
                 kp: None,
                 kd: None,
                 emit_hz: None,
+                gripper_joint: None,
+                gripper_closed: None,
             },
             em.clone(),
         )
@@ -1627,6 +2072,8 @@ mod tests {
                 kp: Some(400.0),
                 kd: Some(40.0),
                 emit_hz: None,
+                gripper_joint: None,
+                gripper_closed: None,
             },
             em.clone(),
         )
@@ -1683,6 +2130,8 @@ mod tests {
                 kp: None,
                 kd: None,
                 emit_hz: None,
+                gripper_joint: None,
+                gripper_closed: None,
             },
             em,
         )
@@ -1718,6 +2167,222 @@ mod tests {
         assert!(live_pause_impl(&state, true).is_err());
         assert!(live_reset_impl(&state, None).is_err());
         live_stop_impl(&state).unwrap(); // idempotent no-op
+    }
+
+    // -- gripper channel (B1) --
+
+    /// A `LiveStartReq` with everything defaulted but the gripper knobs.
+    fn gripper_req(q0: Vec<f64>, joint: Option<&str>, closed: Option<&str>) -> LiveStartReq {
+        LiveStartReq {
+            q0,
+            engine: Some("builtin".into()),
+            props: vec![],
+            ground: None,
+            kp: Some(400.0),
+            kd: Some(40.0),
+            emit_hz: None,
+            gripper_joint: joint.map(str::to_string),
+            gripper_closed: closed.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn engaged_needs_the_gripper_at_or_stalled_against_closed() {
+        // open 0.04 → closed 0.0, span 0.04, so "near closed" is q <= 0.01.
+        let g = GripperChannel {
+            index: 2,
+            name: "gripper".into(),
+            open_target: 0.04,
+            closed_target: 0.0,
+        };
+        assert!(gripper_engaged(0.0, &g, 0));
+        assert!(gripper_engaged(0.01, &g, 0));
+        assert!(!gripper_engaged(0.02, &g, 0), "half open is not closed");
+        assert!(!gripper_engaged(0.04, &g, 999), "wide open is never closed");
+        // Blocked: past halfway toward closed and no longer advancing. This is
+        // the case that matters — a gripper holding a prop never reaches its
+        // closed target, so a threshold alone would never fire.
+        assert!(!gripper_engaged(0.015, &g, GRASP_STALL_TICKS - 1));
+        assert!(gripper_engaged(0.015, &g, GRASP_STALL_TICKS));
+        assert!(
+            !gripper_engaged(0.03, &g, 10_000),
+            "stalled on the OPEN side is not a grasp"
+        );
+        // A degenerate channel can never engage.
+        let flat = GripperChannel {
+            open_target: 0.0,
+            ..g.clone()
+        };
+        assert!(!gripper_engaged(0.0, &flat, 10_000));
+    }
+
+    #[test]
+    fn tracker_counts_only_non_advancing_ticks() {
+        let g = GripperChannel {
+            index: 2,
+            name: "gripper".into(),
+            open_target: 0.04,
+            closed_target: 0.0,
+        };
+        let mut t = GraspTracker::default();
+        assert_eq!(t.observe(0.040, &g), 0); // first tick: no history
+        assert_eq!(t.observe(0.030, &g), 0); // closing fast
+        assert_eq!(t.observe(0.020, &g), 0);
+        assert_eq!(t.observe(0.020, &g), 1); // stopped
+        assert_eq!(t.observe(0.020, &g), 2);
+        assert_eq!(t.observe(0.010, &g), 0); // moving again resets
+        assert_eq!(t.observe(0.011, &g), 1); // moving the WRONG way is not advancing
+        t.clear();
+        assert_eq!(t.observe(0.011, &g), 0);
+    }
+
+    #[test]
+    fn gripper_channel_is_detected_and_reported() {
+        let state = gripper_state();
+        let em = Collect::default();
+        let dto = live_start_on(
+            &state,
+            gripper_req(vec![0.0, 0.0, 0.02], None, None),
+            em.clone(),
+        )
+        .expect("live_start");
+        let g = dto.gripper.expect("gripper_arm has a `gripper` joint");
+        assert_eq!(g.joint, "gripper");
+        assert_eq!(g.index, 2);
+        // limits 0..0.04, inset 2% of the range, closed at `lo` by default
+        assert!((g.closed_target - 0.0008).abs() < 1e-12, "{g:?}");
+        assert!((g.open_target - 0.0392).abs() < 1e-12, "{g:?}");
+
+        sleep_ms(80);
+        let s = em.last_state();
+        let gs = s.gripper.expect("state events carry the gripper");
+        assert!(!gs.closed, "a session starts with the gripper open");
+        assert!((gs.q - 0.02).abs() < 0.01, "measured q {}", gs.q);
+        assert!(s.held.is_none(), "builtin can never hold anything");
+
+        live_stop_impl(&state).unwrap();
+    }
+
+    #[test]
+    fn live_gripper_moves_the_hold_target_and_nothing_else() {
+        let state = gripper_state();
+        let em = Collect::default();
+        let dto = live_start_on(
+            &state,
+            gripper_req(vec![0.1, 0.0, 0.02], None, None),
+            em.clone(),
+        )
+        .unwrap();
+        let g = dto.gripper.unwrap();
+        sleep_ms(60);
+        let before = em.last_state().target;
+
+        live_gripper_impl(&state, true).unwrap();
+        sleep_ms(120);
+        let s = em.last_state();
+        assert_eq!(s.target[g.index], g.closed_target);
+        assert_eq!(
+            &s.target[..g.index],
+            &before[..g.index],
+            "other joints moved"
+        );
+        assert!(s.gripper.unwrap().closed);
+        // and the arm actually tracks it
+        assert!(
+            (s.q[g.index] - g.closed_target).abs() < 0.01,
+            "gripper did not close: q = {}",
+            s.q[g.index]
+        );
+        // builtin has no contacts, so a closed gripper still holds nothing
+        assert!(s.held.is_none());
+
+        live_gripper_impl(&state, false).unwrap();
+        sleep_ms(120);
+        let s = em.last_state();
+        assert_eq!(s.target[g.index], g.open_target);
+        assert!(!s.gripper.unwrap().closed);
+
+        live_stop_impl(&state).unwrap();
+    }
+
+    #[test]
+    fn a_robot_without_a_gripper_has_no_channel() {
+        let state = pendulum_state();
+        let em = Collect::default();
+        let dto =
+            live_start_on(&state, gripper_req(vec![0.0, 0.0], None, None), em.clone()).unwrap();
+        assert!(dto.gripper.is_none(), "dyn_pendulum2 has no gripper");
+        sleep_ms(60);
+        let s = em.last_state();
+        assert!(s.gripper.is_none() && s.held.is_none());
+
+        let err = live_gripper_impl(&state, true).unwrap_err();
+        assert!(err.contains("no gripper channel"), "got: {err}");
+        live_stop_impl(&state).unwrap();
+    }
+
+    #[test]
+    fn the_gripper_override_wins_and_fails_loudly() {
+        let state = pendulum_state();
+        let em = Collect::default();
+        // An explicit override needs no gripper-ish NAME — the human asked for
+        // this joint.
+        let dto = live_start_on(
+            &state,
+            gripper_req(vec![0.0, 0.0], Some("j2"), Some("hi")),
+            em.clone(),
+        )
+        .unwrap();
+        let g = dto.gripper.expect("the override installs a channel");
+        assert_eq!(g.joint, "j2");
+        // limits -3.14..3.14, closed at `hi`
+        assert!(g.closed_target > g.open_target, "{g:?}");
+        live_stop_impl(&state).unwrap();
+
+        for (joint, closed, want) in [
+            (Some("nope"), None, "not a joint of this robot"),
+            (Some("j1"), Some("sideways"), "unknown gripperClosed"),
+        ] {
+            let err = live_start_on(
+                &state,
+                gripper_req(vec![0.0, 0.0], joint, closed),
+                Collect::default(),
+            )
+            .map(|_| ())
+            .unwrap_err();
+            assert!(err.contains(want), "got: {err}");
+            assert!(
+                live_status_impl(&state).unwrap().is_none(),
+                "a refused start must leave no session"
+            );
+        }
+    }
+
+    #[test]
+    fn reset_reopens_the_gripper() {
+        let state = gripper_state();
+        let em = Collect::default();
+        let dto = live_start_on(
+            &state,
+            gripper_req(vec![0.0, 0.0, 0.02], None, None),
+            em.clone(),
+        )
+        .unwrap();
+        let g = dto.gripper.unwrap();
+        live_gripper_impl(&state, true).unwrap();
+        sleep_ms(100);
+        assert!(em.last_state().gripper.unwrap().closed);
+
+        live_reset_impl(&state, None).unwrap();
+        sleep_ms(100);
+        let s = em.last_state();
+        assert!(
+            !s.gripper.unwrap().closed,
+            "a reset returns the gripper to OPEN intent"
+        );
+        assert_eq!(s.target[g.index], 0.02, "and the target back to q0");
+        assert!(s.held.is_none());
+        live_stop_impl(&state).unwrap();
     }
 
     // -- teleop recording (A3) --
@@ -2104,6 +2769,8 @@ mod tests {
                     kp: None,
                     kd: None,
                     emit_hz: None,
+                    gripper_joint: None,
+                    gripper_closed: None,
                 },
                 em.clone(),
             )
@@ -2131,6 +2798,149 @@ mod tests {
             assert_eq!(em.ended()[0].reason, "stopped");
         }
 
+        /// The 5 cm cube the `gripper_arm` fixture is built around: resting on
+        /// the ground with the jaw already 1 mm into its top face.
+        fn cube_prop() -> PropDto {
+            PropDto {
+                name: "cube".into(),
+                kind: "box".into(),
+                half_extents: Some([0.05; 3]),
+                radius: None,
+                length: None,
+                pos: [0.0, 0.0, 0.05],
+                quat: None,
+                mass: Some(0.05),
+                rgba: None,
+            }
+        }
+
+        fn start_grasp_session(state: &AppState) -> (Collect, LiveStartedDto) {
+            let em = Collect::default();
+            let dto = live_start_on(
+                state,
+                LiveStartReq {
+                    q0: vec![0.0, 0.0, 0.02],
+                    engine: Some("mujoco".into()),
+                    props: vec![cube_prop()],
+                    ground: Some(0.0),
+                    kp: Some(400.0),
+                    kd: Some(40.0),
+                    emit_hz: None,
+                    gripper_joint: None,
+                    gripper_closed: None,
+                },
+                em.clone(),
+            )
+            .expect("mujoco live_start with a gripper");
+            (em, dto)
+        }
+
+        /// Poll the stream until `f` holds, up to `ms`. Returns whether it did.
+        fn wait_for(em: &Collect, ms: u64, f: impl Fn(&LiveStateEvent) -> bool) -> bool {
+            let deadline = Instant::now() + Duration::from_millis(ms);
+            while Instant::now() < deadline {
+                if em.states().last().is_some_and(&f) {
+                    return true;
+                }
+                sleep_ms(10);
+            }
+            false
+        }
+
+        /// The whole grasp loop through the live session: close on a prop in
+        /// contact, carry it off the ground, release it, and see it fall.
+        #[test]
+        fn gripper_grabs_carries_and_releases_a_prop() {
+            let state = gripper_state();
+            let (em, dto) = start_grasp_session(&state);
+            let g = dto.gripper.expect("gripper_arm has a gripper channel");
+            assert_eq!(g.joint, "gripper");
+
+            // Idle: touching the cube, but an OPEN gripper holds nothing.
+            sleep_ms(150);
+            let s = em.last_state();
+            assert!(
+                s.held.is_none(),
+                "nothing is held before the gripper closes"
+            );
+            assert!(s.ncon > 0, "the jaw should already be touching the cube");
+            let rest_z = s.props[0][2];
+
+            // Close: the weld takes the cube it is in contact with.
+            live_gripper_impl(&state, true).unwrap();
+            assert!(
+                wait_for(&em, 2000, |s| s.held.as_deref() == Some("cube")),
+                "the gripper never took the cube (last state: {:?})",
+                em.last_state().held
+            );
+
+            // Carry: swing j1 up; a welded cube must leave the ground with it.
+            live_set_target_impl(&state, &[0.7, 0.0, g.closed_target]).unwrap();
+            assert!(
+                wait_for(&em, 3000, |s| s.props[0][2] > rest_z + 0.05),
+                "the cube never left the ground (z {rest_z} → {})",
+                em.last_state().props[0][2]
+            );
+            let s = em.last_state();
+            assert_eq!(s.held.as_deref(), Some("cube"), "still held while carried");
+            assert!(
+                s.props[0][0].abs() > 0.05,
+                "the cube should have swung sideways with the arm, x = {}",
+                s.props[0][0]
+            );
+            let carried_z = s.props[0][2];
+
+            // Release: the cube keeps its state and falls.
+            live_gripper_impl(&state, false).unwrap();
+            assert!(
+                wait_for(&em, 1000, |s| s.held.is_none()),
+                "releasing did not clear `held`"
+            );
+            assert!(
+                wait_for(&em, 2000, |s| s.props[0][2] < carried_z - 0.03),
+                "the released cube did not fall (z {carried_z} → {})",
+                em.last_state().props[0][2]
+            );
+
+            live_stop_impl(&state).unwrap();
+        }
+
+        /// A reset drops whatever the gripper was holding.
+        #[test]
+        fn reset_releases_a_held_prop() {
+            let state = gripper_state();
+            let (em, _dto) = start_grasp_session(&state);
+            sleep_ms(150);
+            live_gripper_impl(&state, true).unwrap();
+            assert!(
+                wait_for(&em, 2000, |s| s.held.as_deref() == Some("cube")),
+                "the gripper never took the cube"
+            );
+
+            live_reset_impl(&state, None).unwrap();
+            assert!(
+                wait_for(&em, 1000, |s| s.held.is_none()
+                    && s.gripper.as_ref().is_some_and(|g| !g.closed)),
+                "reset must drop the prop and reopen the gripper"
+            );
+            live_stop_impl(&state).unwrap();
+        }
+
+        /// An open gripper never grabs, however long it sits in contact.
+        #[test]
+        fn contact_alone_is_not_a_grasp() {
+            let state = gripper_state();
+            let (em, _dto) = start_grasp_session(&state);
+            sleep_ms(400);
+            let s = em.last_state();
+            assert!(
+                s.ncon > 0,
+                "the rig must be in contact for this to prove anything"
+            );
+            assert!(s.held.is_none(), "an open gripper grabbed something");
+            live_stop_impl(&state).unwrap();
+        }
+
         #[test]
         fn mujoco_reset_is_bitwise_deterministic() {
             // Drives LiveEngine directly (no wall clock): reset + N identical
@@ -2142,7 +2952,8 @@ mod tests {
                 kd: 20.0,
             };
             let q0 = vec![0.3, -0.2];
-            let (engine, h) = build_engine(&m, "mujoco", &q0, &[box_prop()], 0.0, gains).unwrap();
+            let (engine, h) =
+                build_engine(&m, "mujoco", &q0, &[box_prop()], 0.0, gains, None).unwrap();
             let run = |mut e: LiveEngine| -> (Vec<f64>, LiveEngine) {
                 e = e.reset(&q0, &m, gains, h).unwrap();
                 let mut sp = TeleopSetpoint::new(vec![0.1, 0.0]).with_tick_budget(u64::MAX);

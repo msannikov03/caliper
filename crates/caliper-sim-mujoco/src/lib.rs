@@ -87,6 +87,13 @@ pub enum MujocoError {
     MissingJoint(String),
     #[error("body `{0}` missing from the compiled MuJoCo model")]
     MissingBody(String),
+    /// A grasp weld was addressed for a prop that has none — either the model
+    /// was built without [`mjcf::MjcfOptions::attach_link`], or the name is
+    /// not one of its props.
+    #[error(
+        "no grasp weld for prop `{0}` (build the model with MjcfOptions::attach_link to get one)"
+    )]
+    MissingWeld(String),
     /// A raw MJCF model contains a joint kind the seam cannot map onto the
     /// flat `q`/`qd` vectors (free/ball joints — fixed-base 1-dof trees only).
     #[error("unsupported MuJoCo joint type for `{0}` (only hinge/slide are mapped)")]

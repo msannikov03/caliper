@@ -53,6 +53,11 @@ obs = env.reset()                 # each env gets its own draw
 env.randomization_draws           # the 8 draws, also in info['randomization']
 ```
 
+`VecSimEnv` also takes `success=` — the
+[manipulation success predicates](./verdicts.md) — reporting
+`info["success"]` / `info["final_success"]` per step, and composes with
+randomization.
+
 Model-level draws recompile that env's `MjModel` from the randomized MJCF at
 reset. That is a real cost — one model plus one XML compile per env per reset —
 documented in the module so you size `num_envs` accordingly. Runtime-only

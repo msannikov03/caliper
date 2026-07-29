@@ -11,7 +11,39 @@
 // frame turns it into a single set() (liveFlushFate + liveStatePatch).
 // ============================================================
 
-import type { PropTrack } from "./props";
+import type { PropTrack, SimProp } from "./props";
+
+/** Camel-case mirror of `LiveStartReq` — what `live_start` is asked with. */
+export interface LiveStartReq {
+  q0: number[];
+  engine: string;
+  props: SimProp[];
+  /** override the auto-detected gripper joint by caliper joint name (the
+   *  backend Errs with the joint list when the name is unknown); omitted =
+   *  auto-detect, and a robot with no gripper simply gets no channel */
+  gripperJoint?: string | null;
+  /** which end of that joint's range CLOSES it; omitted = "lo" */
+  gripperClosed?: "lo" | "hi" | null;
+}
+
+/** Camel-case mirror of `GripperDto` — the session's gripper channel: one
+ *  joint and the two hold-target values `live_gripper` writes into its slot
+ *  (the joint's limits, inset 2% so the PD never slams the stop). */
+export interface GripperInfo {
+  joint: string;
+  /** index of that joint in `q` / `target` */
+  index: number;
+  openTarget: number;
+  closedTarget: number;
+}
+
+/** Camel-case mirror of `GripperStateEvent` — what the stream reports about
+ *  the jaw. `closed` is the last COMMAND, not a measurement: a gripper
+ *  squeezing a prop reads `closed: true` with `q` short of `closedTarget`. */
+export interface GripperState {
+  closed: boolean;
+  q: number;
+}
 
 /** Camel-case mirror of `LiveStartedDto` (src-tauri/src/live.rs). */
 export interface LiveStartedDto {
@@ -26,6 +58,9 @@ export interface LiveStartedDto {
   /** static prop shape/color rows in build order; `frames` empty (live
    *  poses arrive per-event, not baked) — reuses the PropTrack shape */
   props: PropTrack[];
+  /** the gripper channel this session found; null/absent = no channel, and
+   *  then `live_gripper` errors and `held` is always null */
+  gripper?: GripperInfo | null;
 }
 
 /** Camel-case mirror of `LiveStateEvent` ("live://state"). */
@@ -47,6 +82,11 @@ export interface LiveStateEvent {
   recording: boolean;
   /** frames captured in the current take; 0 when not recording */
   recFrames: number;
+  /** gripper command + measurement; null/absent with no gripper channel */
+  gripper?: GripperState | null;
+  /** prop currently WELDED to the gripper (grasp heuristic), else null —
+   *  always null on builtin, which has no contacts to grasp with */
+  held?: string | null;
 }
 
 /** Camel-case mirror of `LiveRecordStartedDto` (reply to `live_record_start`).
@@ -95,6 +135,13 @@ export interface LiveInfo {
   tick: number;
   ncon: number;
   props: PropTrack[];
+  /** the STATIC gripper channel, like `props` — null with no gripper joint */
+  gripper: GripperInfo | null;
+  /** latest streamed jaw command + measurement; null until the first event
+   *  (and forever on a session with no channel) */
+  gripperState: GripperState | null;
+  /** prop welded to the gripper right now, null when nothing is held */
+  held: string | null;
 }
 
 /** Fresh live slice for a session the backend just started. */
@@ -107,7 +154,72 @@ export function liveInfoFromStarted(dto: LiveStartedDto): LiveInfo {
     tick: 0,
     ncon: 0,
     props: dto.props,
+    gripper: dto.gripper ?? null,
+    gripperState: null,
+    held: null,
   };
+}
+
+/** The panel's gripper control, decided in one place: what the button says,
+ *  what it explains, and whether there is a channel to press it against.
+ *  `closed` is the COMMAND intent the stream reports, never a measurement. */
+export interface GripperControl {
+  label: string;
+  title: string;
+  disabled: boolean;
+  closed: boolean;
+}
+
+/** Why the control is off when a session found no jaw joint (the backend's
+ *  auto-detect and its override are the two ways out). */
+export const NO_GRIPPER_TITLE =
+  "no gripper joint detected — name one 'gripper'/'finger'/'jaw' or pass an override";
+
+export function gripperControl(
+  ch: GripperInfo | null,
+  st: GripperState | null,
+): GripperControl {
+  if (!ch) {
+    return { label: "gripper: none", title: NO_GRIPPER_TITLE, disabled: true, closed: false };
+  }
+  // a session starts with the jaw OPEN, which is also what it reads before the
+  // first state event lands
+  const closed = st?.closed ?? false;
+  return {
+    label: closed ? "gripper: closed ▸ open" : "gripper: open ▸ close",
+    title: `${closed ? "open" : "close"} the gripper (G · pad X) — joint ${ch.joint}`,
+    disabled: false,
+    closed,
+  };
+}
+
+/** How far off its commanded target the jaw may sit and still count as having
+ *  ARRIVED there, as a fraction of the open→closed span. */
+export const GRIP_SEATED_EPS_FRAC = 0.1;
+
+/** Is the jaw where the command asked it to go? False while it is still
+ *  travelling AND while it is stopped short on a prop — the panel shows the
+ *  measurement then instead of letting the command speak for it. */
+export function gripperSeated(ch: GripperInfo, st: GripperState | null): boolean {
+  if (!st || !Number.isFinite(st.q)) return false;
+  const goal = st.closed ? ch.closedTarget : ch.openTarget;
+  const span = Math.abs(ch.closedTarget - ch.openTarget);
+  return Math.abs(st.q - goal) <= span * GRIP_SEATED_EPS_FRAC;
+}
+
+/** Reconcile a streamed gripper report against a `live_gripper` we sent but
+ *  have not seen come back. An event emitted BEFORE the command still carries
+ *  the old intent, so until the stream agrees the command wins — otherwise the
+ *  button would flip back for a frame, and (worse) the drive loop would adopt
+ *  a jaw value the backend has already moved past. `settled` is the caller's
+ *  cue to drop the pending intent: the stream has caught up. */
+export function reconcileGripper(
+  ev: GripperState | null,
+  pending: boolean | null,
+): { state: GripperState | null; settled: boolean } {
+  if (pending === null || !ev) return { state: ev, settled: false };
+  if (ev.closed === pending) return { state: ev, settled: true };
+  return { state: { ...ev, closed: pending }, settled: false };
 }
 
 /** The store's recording slice: the OPEN dataset plus the take running into it,
@@ -221,7 +333,18 @@ export function liveStatePatch(
   return {
     q: ev.q,
     frames: ev.frames,
-    live: { ...prev, paused: ev.paused, t: ev.t, tick: ev.tick, ncon: ev.ncon },
+    live: {
+      ...prev,
+      paused: ev.paused,
+      t: ev.t,
+      tick: ev.tick,
+      ncon: ev.ncon,
+      // the channel itself is static (it rides `prev`); these two are the
+      // per-event half of it — a backend without them reads as "no gripper",
+      // which is exactly what an older one means
+      gripperState: ev.gripper ?? null,
+      held: ev.held ?? null,
+    },
     livePropPoses: ev.props,
   };
 }

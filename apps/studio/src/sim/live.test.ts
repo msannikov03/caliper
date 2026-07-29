@@ -12,6 +12,8 @@
 import { describe, it, expect } from "vitest";
 import {
   classifyLiveState,
+  gripperControl,
+  gripperSeated,
   liveEndedPatch,
   liveFlushFate,
   liveInfoFromStarted,
@@ -19,8 +21,16 @@ import {
   liveRecFromStarted,
   liveRecPatch,
   liveStatePatch,
+  reconcileGripper,
+  NO_GRIPPER_TITLE,
 } from "./live";
-import type { LiveInfo, LiveRecInfo, LiveStartedDto, LiveStateEvent } from "./live";
+import type {
+  GripperInfo,
+  LiveInfo,
+  LiveRecInfo,
+  LiveStartedDto,
+  LiveStateEvent,
+} from "./live";
 import type { PropTrack } from "./props";
 
 /** Static prop shape row as `live_start` returns it: no baked frames. */
@@ -36,6 +46,12 @@ function mockPropTrack(name: string): PropTrack {
   };
 }
 
+/** A gripper channel as `live_start` reports it: the jaw joint's limits inset
+ *  2%, closing toward `lo` (the usual convention). */
+function mockChannel(over: Partial<GripperInfo> = {}): GripperInfo {
+  return { joint: "gripper", index: 1, openTarget: 0.04, closedTarget: 0.0, ...over };
+}
+
 function mockStarted(over: Partial<LiveStartedDto> = {}): LiveStartedDto {
   return {
     sessionId: 1,
@@ -44,6 +60,7 @@ function mockStarted(over: Partial<LiveStartedDto> = {}): LiveStartedDto {
     emitHz: 59.5,
     ndof: 2,
     props: [mockPropTrack("box0")],
+    gripper: null,
     ...over,
   };
 }
@@ -57,6 +74,9 @@ function mockInfo(over: Partial<LiveInfo> = {}): LiveInfo {
     tick: 250,
     ncon: 0,
     props: [mockPropTrack("box0")],
+    gripper: null,
+    gripperState: null,
+    held: null,
     ...over,
   };
 }
@@ -94,6 +114,20 @@ describe("liveInfoFromStarted", () => {
   it("carries the static prop rows through by reference (they never change)", () => {
     const dto = mockStarted();
     expect(liveInfoFromStarted(dto).props).toBe(dto.props);
+  });
+
+  it("adopts the gripper channel and starts with nothing commanded or held", () => {
+    const ch = mockChannel();
+    const info = liveInfoFromStarted(mockStarted({ gripper: ch }));
+    expect(info.gripper).toBe(ch);
+    expect(info.gripperState).toBeNull();
+    expect(info.held).toBeNull();
+  });
+
+  it("reads a session with no gripper (or an older backend) as no channel", () => {
+    expect(liveInfoFromStarted(mockStarted({ gripper: null })).gripper).toBeNull();
+    const { gripper: _dropped, ...noField } = mockStarted();
+    expect(liveInfoFromStarted(noField).gripper).toBeNull();
   });
 });
 
@@ -164,6 +198,124 @@ describe("liveStatePatch", () => {
     liveStatePatch(prev, mockEvent({ t: 9, ncon: 5 }));
     expect(prev.t).toBe(0.5);
     expect(prev.ncon).toBe(0);
+  });
+
+  it("carries the streamed gripper command + held prop into the slice", () => {
+    const ch = mockChannel();
+    const prev = mockInfo({ gripper: ch });
+    const ev = mockEvent({ gripper: { closed: true, q: 0.031 }, held: "box0" });
+    const patch = liveStatePatch(prev, ev);
+    // the CHANNEL is static and rides through; only the command/measurement move
+    expect(patch.live.gripper).toBe(ch);
+    expect(patch.live.gripperState).toEqual({ closed: true, q: 0.031 });
+    expect(patch.live.held).toBe("box0");
+  });
+
+  it("reports a released prop and a re-opened jaw, not the last state that was true", () => {
+    const prev = mockInfo({
+      gripper: mockChannel(),
+      gripperState: { closed: true, q: 0.031 },
+      held: "box0",
+    });
+    const ev = mockEvent({ gripper: { closed: false, q: 0.04 }, held: null });
+    const patch = liveStatePatch(prev, ev);
+    expect(patch.live.gripperState).toEqual({ closed: false, q: 0.04 });
+    expect(patch.live.held).toBeNull();
+  });
+
+  it("reads an event with no gripper fields (builtin, older backend) as neither", () => {
+    const prev = mockInfo({ gripperState: { closed: true, q: 0 }, held: "box0" });
+    const patch = liveStatePatch(prev, mockEvent());
+    expect(patch.live.gripperState).toBeNull();
+    expect(patch.live.held).toBeNull();
+  });
+});
+
+// ---- gripper + grasp (B): the command, the measurement, and the button ----
+
+describe("gripperControl — what the panel's gripper button says and does", () => {
+  it("offers the closing half of the toggle while the jaw is commanded open", () => {
+    const c = gripperControl(mockChannel(), { closed: false, q: 0.04 });
+    expect(c.label).toBe("gripper: open ▸ close");
+    expect(c.closed).toBe(false);
+    expect(c.disabled).toBe(false);
+    expect(c.title).toContain("close the gripper");
+    expect(c.title).toContain("gripper"); // and names the joint it drives
+  });
+
+  it("offers the opening half once it is commanded closed", () => {
+    const c = gripperControl(mockChannel({ joint: "jaw" }), { closed: true, q: 0.031 });
+    expect(c.label).toBe("gripper: closed ▸ open");
+    expect(c.closed).toBe(true);
+    expect(c.title).toContain("open the gripper");
+    expect(c.title).toContain("jaw");
+  });
+
+  it("reads a jaw squeezing a prop as CLOSED — the flag is the command, not the position", () => {
+    // short of closedTarget because something is in the way; the button must
+    // still offer "open", or the human could not let go
+    expect(gripperControl(mockChannel(), { closed: true, q: 0.028 }).label).toBe(
+      "gripper: closed ▸ open",
+    );
+  });
+
+  it("starts open before the first state event lands", () => {
+    expect(gripperControl(mockChannel(), null).closed).toBe(false);
+  });
+
+  it("disables itself and says WHY on a robot with no gripper joint", () => {
+    const c = gripperControl(null, null);
+    expect(c.disabled).toBe(true);
+    expect(c.title).toBe(NO_GRIPPER_TITLE);
+    expect(c.title).toMatch(/gripper.*finger.*jaw|override/);
+  });
+});
+
+describe("gripperSeated — did the jaw reach what was commanded?", () => {
+  const ch = mockChannel(); // open 0.04 → closed 0.0, span 0.04
+
+  it("is seated at (and within a tenth of the span of) the commanded target", () => {
+    expect(gripperSeated(ch, { closed: true, q: 0 })).toBe(true);
+    expect(gripperSeated(ch, { closed: true, q: 0.004 })).toBe(true);
+    expect(gripperSeated(ch, { closed: false, q: 0.04 })).toBe(true);
+  });
+
+  it("is NOT seated while the jaw is stopped short (travelling, or on a prop)", () => {
+    expect(gripperSeated(ch, { closed: true, q: 0.028 })).toBe(false);
+    expect(gripperSeated(ch, { closed: false, q: 0.01 })).toBe(false);
+  });
+
+  it("claims nothing with no measurement at all", () => {
+    expect(gripperSeated(ch, null)).toBe(false);
+    expect(gripperSeated(ch, { closed: true, q: NaN })).toBe(false);
+  });
+});
+
+describe("reconcileGripper — our command outranks an event that predates it", () => {
+  it("passes the stream through when nothing is pending", () => {
+    const ev = { closed: true, q: 0.03 };
+    const out = reconcileGripper(ev, null);
+    expect(out.state).toBe(ev);
+    expect(out.settled).toBe(false);
+  });
+
+  it("settles the moment the stream reports the intent we sent", () => {
+    const ev = { closed: true, q: 0.03 };
+    const out = reconcileGripper(ev, true);
+    expect(out.state).toBe(ev);
+    expect(out.settled).toBe(true);
+  });
+
+  it("holds our intent over an older event, keeping its measurement", () => {
+    // the event was emitted before live_gripper landed: it still says open
+    const out = reconcileGripper({ closed: false, q: 0.04 }, true);
+    expect(out.state).toEqual({ closed: true, q: 0.04 });
+    expect(out.settled).toBe(false);
+  });
+
+  it("has nothing to reconcile on a session with no gripper channel", () => {
+    expect(reconcileGripper(null, true)).toEqual({ state: null, settled: false });
+    expect(reconcileGripper(null, null)).toEqual({ state: null, settled: false });
   });
 });
 

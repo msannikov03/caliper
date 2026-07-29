@@ -90,6 +90,7 @@ Faces: [CLI](../faces/cli.md) · [Python](../faces/python.md) ·
 | BC learning (BC-MLP / ACT-lite / DDPM) | [`learn/caliper_learn` sidecar](../capabilities/learning.md) | ✗ | separate `caliper_learn` package (on top of these bindings) | ✗ |
 | **Deploy a lerobot checkpoint** — safetensors-only loader + closed-loop sim runner | [`caliper_learn.hub`/`runner`](../capabilities/learning.md) | ✗ ³ | `load_lerobot_policy` / `LoadedPolicy` / `run_policy` | ✗ ³ |
 | **Seeded policy eval** — Wilson-95, `E001`–`E003`, checkpoint `sweep` | [`caliper_learn.eval`](../capabilities/verdicts.md) | ✗ ³ (`caliper-learn eval`) | `evaluate` / `sweep` / `reach_eval_task` | ✗ ³ |
+| **Manipulation success predicates** — `lifted` / `placed_in_zone` / combinators, exact JSON schema | [`caliper_learn.success`](../capabilities/verdicts.md) | ✗ ³ | `Lifted` / `PlacedInZone` / `AllOf` / `AnyOf` / `VecSimEnv(success=)` / `EvalTask.success_predicate` | ✗ (Studio grasps via the live weld channel) |
 | **Deploy-loop latency profile** — `L001`–`L003`, honest achievable Hz | [`caliper_learn.profile`](../capabilities/verdicts.md) | ✗ ³ (`caliper-learn profile`) | `profile_rollout` | ✗ ³ |
 | **Policy deploy debugger** `P001`–`P008` | [`caliper_learn.debugger`](../capabilities/verdicts.md) | ✗ ³ (`caliper-learn debug`) | `analyze_policy` | ✗ ³ |
 | **Policy Autopsy** — D+P+E+L under one verdict | [`caliper_learn.autopsy`](../capabilities/verdicts.md) | ✗ ³ (`caliper-learn autopsy`) | `autopsy` | ✗ ³ |

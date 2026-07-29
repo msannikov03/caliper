@@ -20,9 +20,25 @@
 use crate::MujocoError;
 use crate::mjcf::{self, MjcfOptions};
 use caliper_model::Model;
+use mujoco_rs::mujoco_c::mjNEQDATA;
 use mujoco_rs::wrappers::mj_data::MjData;
 use mujoco_rs::wrappers::mj_model::{MjModel, MjtJoint, MjtObj};
+use nalgebra::{Quaternion, UnitQuaternion, Vector3};
 use std::sync::Arc;
+
+/// Numbers per equality constraint in `mjModel::eq_data`. For a WELD they are
+/// laid out `[anchor(3), relpose position(3), relpose quaternion w,x,y,z(4),
+/// torquescale(1)]` — verified against MuJoCo 3.9.0 by round-tripping an MJCF
+/// weld with distinct values through the compiler.
+const NEQDATA: usize = mjNEQDATA as usize;
+
+/// Offset of a weld's relative-pose block within its `eq_data` row.
+const WELD_RELPOSE: usize = 3;
+
+/// MuJoCo world quaternion (`[w, x, y, z]`) → nalgebra unit quaternion.
+fn unit_quat(q: [f64; 4]) -> UnitQuaternion<f64> {
+    UnitQuaternion::new_normalize(Quaternion::new(q[0], q[1], q[2], q[3]))
+}
 
 /// One detected contact, in world coordinates.
 #[derive(Clone, Debug)]
@@ -54,6 +70,10 @@ pub struct MujocoSim {
     /// `(prop name, MuJoCo body id)` for every free prop passed at build,
     /// in [`MjcfOptions::props`] order (empty for raw-MJCF loads).
     props: Vec<(String, usize)>,
+    /// `(prop name, MuJoCo equality-constraint id)` for every prop's grasp
+    /// weld, in the same order. Empty unless the model was built with
+    /// [`MjcfOptions::attach_link`].
+    welds: Vec<(String, usize)>,
 }
 
 impl MujocoSim {
@@ -87,6 +107,7 @@ impl MujocoSim {
             joint_ids,
             doc.skipped_hull_colliders,
             &doc.prop_bodies,
+            &doc.grasp_welds,
         )?;
         // Our MJCF contains exactly the caliper joints — anything else is a
         // generator bug, not a user error.
@@ -110,7 +131,7 @@ impl MujocoSim {
                 (name, id)
             })
             .unzip();
-        Self::from_parts(mj, names, ids, 0, &[])
+        Self::from_parts(mj, names, ids, 0, &[], &[])
     }
 
     /// `joint_names[i]` is the user-facing spelling for MuJoCo joint
@@ -123,6 +144,7 @@ impl MujocoSim {
         joint_ids: Vec<usize>,
         skipped_hull_colliders: usize,
         prop_bodies: &[(String, String)],
+        grasp_welds: &[(String, String)],
     ) -> Result<Self, MujocoError> {
         debug_assert_eq!(joint_names.len(), joint_ids.len());
         let mut qpos_adr = Vec::with_capacity(joint_names.len());
@@ -158,6 +180,17 @@ impl MujocoSim {
                 .ok_or_else(|| MujocoError::MissingBody(bname.clone()))?;
             props.push((pname.clone(), id));
         }
+        // Same story for the grasp welds: the generator emitted them, so a
+        // miss is a generator bug. MuJoCo registers `mujoco_name(..)` of the
+        // weld name the document carries XML-ESCAPED.
+        let mut welds = Vec::with_capacity(grasp_welds.len());
+        for (pname, wname) in grasp_welds {
+            let registered = format!("grasp_{}", mjcf::mujoco_name(pname));
+            let id = mj
+                .name_to_id(MjtObj::mjOBJ_EQUALITY, &registered)
+                .ok_or_else(|| MujocoError::MissingWeld(wname.clone()))?;
+            welds.push((pname.clone(), id));
+        }
         let mut data = MjData::new(Arc::new(mj));
         data.forward(); // consistent derived quantities before first read
         Ok(Self {
@@ -169,6 +202,7 @@ impl MujocoSim {
             nu,
             skipped_hull_colliders,
             props,
+            welds,
         })
     }
 
@@ -231,9 +265,17 @@ impl MujocoSim {
     /// controls, applied forces AND the solver warmstart), then seed `q0` and
     /// recompute. Two runs from the same `reset` + identical commands are
     /// bitwise identical (same binary + libmujoco).
+    ///
+    /// Grasp welds are released: `mj_resetData` restores `d->eq_active` from
+    /// the model's `eq_active0` (all welds are authored inactive), and this
+    /// call deactivates them explicitly too, so the guarantee does not rest on
+    /// a MuJoCo implementation detail. A captured relative pose is left in the
+    /// model — it is dead data while the weld is inactive, and every
+    /// activation overwrites it.
     pub fn reset(&mut self, q0: &[f64]) -> Result<(), MujocoError> {
         self.check(q0, "q0")?;
         self.data.reset();
+        self.deactivate_all_welds();
         {
             let qp = self.data.qpos_mut();
             for (i, &a) in self.qpos_adr.iter().enumerate() {
@@ -366,6 +408,150 @@ impl MujocoSim {
             .iter()
             .map(|(n, id)| (n.clone(), xp[*id], xq[*id]))
             .collect()
+    }
+
+    // ---- grasp welds ----
+    //
+    // An HONEST FAKE, and labeled as one: a real parallel gripper grasps by
+    // friction between two finger geoms, which needs finger dynamics no
+    // teleop-collection rig actually simulates. Instead each prop carries one
+    // `<weld>` equality constraint to the gripper's link, emitted INACTIVE by
+    // the generator ([`MjcfOptions::attach_link`]); "grasping" activates it and
+    // "releasing" deactivates it. While active the prop is rigidly (if
+    // compliantly — a MuJoCo weld is a soft constraint) carried by the arm;
+    // once released it is a free body again, with whatever velocity it had.
+
+    /// Prop names that carry a grasp weld, in build order (empty unless the
+    /// model was built with [`MjcfOptions::attach_link`]).
+    pub fn weld_props(&self) -> Vec<&str> {
+        self.welds.iter().map(|(n, _)| n.as_str()).collect()
+    }
+
+    /// Is this prop's grasp weld currently holding it?
+    pub fn weld_active(&self, prop: &str) -> Result<bool, MujocoError> {
+        let eq = self.weld_id(prop)?;
+        Ok(self.data.eq_active()[eq])
+    }
+
+    /// Attach (`active = true`) or release a prop's grasp weld.
+    ///
+    /// `capture_relpose` is the whole trick: a weld authored in the document
+    /// holds the two bodies at the relative pose the MODEL was compiled with,
+    /// so activating it mid-run would SNAP the prop to wherever that was.
+    /// With `capture_relpose` on, the constraint's target relative pose is
+    /// first overwritten with the pose the prop has RIGHT NOW relative to the
+    /// attach body, so activation is continuous — the prop stays exactly where
+    /// it is and simply stops moving relative to the gripper. Pass `false`
+    /// only to deliberately re-use the authored pose.
+    ///
+    /// Ignored on release (there is nothing to capture).
+    pub fn set_weld_active(
+        &mut self,
+        prop: &str,
+        active: bool,
+        capture_relpose: bool,
+    ) -> Result<(), MujocoError> {
+        let eq = self.weld_id(prop)?;
+        if active && capture_relpose {
+            self.capture_weld_relpose(eq);
+        }
+        self.data.eq_active_mut()[eq] = active;
+        Ok(())
+    }
+
+    /// Release every grasp weld. Cheap and idempotent — the "drop everything"
+    /// move behind a reset or a session teardown.
+    pub fn deactivate_all_welds(&mut self) {
+        let ids: Vec<usize> = self.welds.iter().map(|(_, id)| *id).collect();
+        let active = self.data.eq_active_mut();
+        for id in ids {
+            active[id] = false;
+        }
+    }
+
+    /// Props currently in contact with a ROBOT geom — not with the ground
+    /// plane, not with each other — in build order. This is the "is the
+    /// gripper actually touching it" test a grasp heuristic gates on.
+    ///
+    /// Robot vs. world vs. prop is decided by BODY, not by geom name: a
+    /// contact's geoms resolve to their bodies, prop bodies are the ones the
+    /// generator emitted for [`MjcfOptions::props`], world geoms (the ground
+    /// plane and any `extra_worldbody_xml`) belong to body 0, and everything
+    /// else is the robot.
+    pub fn props_touching_robot(&self) -> Vec<&str> {
+        let gbody = self.data.model().geom_bodyid();
+        let contacts = self.data.contact();
+        let prop_ids: Vec<usize> = self.props.iter().map(|(_, id)| *id).collect();
+        let body_of = |g: i32| -> Option<usize> {
+            (g >= 0 && (g as usize) < gbody.len()).then(|| gbody[g as usize] as usize)
+        };
+        self.props
+            .iter()
+            .filter(|(_, id)| {
+                contacts.iter().any(|c| {
+                    let (Some(b1), Some(b2)) = (body_of(c.geom1), body_of(c.geom2)) else {
+                        return false;
+                    };
+                    let other = if b1 == *id {
+                        b2
+                    } else if b2 == *id {
+                        b1
+                    } else {
+                        return false;
+                    };
+                    other != 0 && !prop_ids.contains(&other)
+                })
+            })
+            .map(|(n, _)| n.as_str())
+            .collect()
+    }
+
+    fn weld_id(&self, prop: &str) -> Result<usize, MujocoError> {
+        self.welds
+            .iter()
+            .find(|(n, _)| n == prop)
+            .map(|(_, id)| *id)
+            .ok_or_else(|| MujocoError::MissingWeld(prop.to_string()))
+    }
+
+    /// Freeze the CURRENT relative pose of the weld's body2 (the prop) with
+    /// respect to body1 (the attach link) into the constraint:
+    ///
+    /// ```text
+    /// relpose.pos  = R1ᵀ · (x2 − x1)
+    /// relpose.quat = q1⁻¹ ⊗ q2
+    /// ```
+    ///
+    /// `mjModel::eq_data` is the only place MuJoCo keeps a weld's target pose
+    /// (there is no per-`mjData` copy), so this writes the model — which is
+    /// exactly what the runtime-attach recipe does, and is why every raw
+    /// pointer in this crate is confined to this file.
+    fn capture_weld_relpose(&mut self, eq: usize) {
+        let model = self.data.model();
+        let b1 = model.eq_obj1id()[eq] as usize;
+        let b2 = model.eq_obj2id()[eq] as usize;
+        let (x1, x2) = (self.data.xpos()[b1], self.data.xpos()[b2]);
+        let (q1, q2) = (self.data.xquat()[b1], self.data.xquat()[b2]);
+        let q1 = unit_quat(q1);
+        let rel_p = q1.inverse_transform_vector(&(Vector3::from(x2) - Vector3::from(x1)));
+        let rel_q = q1.inverse() * unit_quat(q2);
+        let row = [
+            rel_p.x, rel_p.y, rel_p.z, rel_q.w, rel_q.i, rel_q.j, rel_q.k,
+        ];
+        // SAFETY: `eq_data` is a `*mut mjtNum` field of the C-owned mjModel —
+        // its pointee is a separate allocation from the `&mjModel` we read it
+        // out of, so writing through it aliases nothing Rust holds. `eq` came
+        // from `weld_id`, i.e. a name MuJoCo resolved in THIS model, so it is
+        // `< neq` and the row `[eq·NEQDATA, (eq+1)·NEQDATA)` is in bounds.
+        // `mujoco-rs` exposes `eq_data` read-only (no `eq_data_mut`), and the
+        // model is shared through an `Arc` by `MjData`, so this pointer is the
+        // only write path; MuJoCo reads it on the next `mj_forward`/`mj_step`.
+        unsafe {
+            let p = model.ffi().eq_data.add(NEQDATA * eq + WELD_RELPOSE);
+            for (k, v) in row.iter().enumerate() {
+                *p.add(k) = *v;
+            }
+        }
     }
 
     // ---- escape hatches ----

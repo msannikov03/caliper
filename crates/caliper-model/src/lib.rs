@@ -10,6 +10,7 @@ use nalgebra::{Isometry3, Matrix3, Point3, Translation3, UnitQuaternion, Vector3
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+pub mod gripper;
 pub mod hull;
 pub mod stl;
 pub mod xacro;

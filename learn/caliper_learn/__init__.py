@@ -28,6 +28,12 @@ re-run, `caliper-learn coverage`). `video` closes the last lerobot-parity
 hole: dtype-"video" camera storage (per-episode mp4s, lerobot-mirrored encode
 settings, `attach_video_metadata` post-write bridge) — `collect_camera_dataset
 (video=True)`.
+
+SUCCESS PREDICATES (`success`): composable, JSON-describable tests over the
+SCENE rather than the arm — `Lifted`, `PlacedInZone`, `AllOf`/`AnyOf` — shared
+by `VecSimEnv(success=...)` (per-step `info["success"]`), the eval harness
+(`EvalTask.success_predicate`, Wilson-95 over predicate-scored episodes) and
+the autopsy verdict, so a grasp/place run has ONE definition of "it worked".
 """
 
 # Version identity: single-sourced from the installed distribution's metadata
@@ -88,6 +94,18 @@ from .randomize import RandomizationSpec, apply_to_env, apply_to_mjcf
 from .randomize import sample as sample_randomization
 from .runner import run_policy
 from .sim_camera import SimCameraScene
+from .success import (
+    AllOf,
+    AnyOf,
+    Lifted,
+    PlacedInZone,
+    SuccessPredicate,
+    SuccessState,
+    Zone,
+    state_from_mujoco,
+)
+from .success import as_predicate as as_success_predicate
+from .success import from_dict as success_from_dict
 from .vec_env import VecSimEnv, reach_task, rollout_random
 from .video import VideoRecorder, attach_video_metadata, encode_episode_video
 
@@ -105,6 +123,17 @@ __all__ = [
     "apply_to_env",
     "generate_coverage",
     "CoverageReport",
+    # success predicates (VecSimEnv success=, EvalTask.success_predicate)
+    "SuccessPredicate",
+    "SuccessState",
+    "Zone",
+    "Lifted",
+    "PlacedInZone",
+    "AllOf",
+    "AnyOf",
+    "as_success_predicate",
+    "success_from_dict",
+    "state_from_mujoco",
     # dtype-"video" camera storage (mp4 encode + post-write bridge)
     "VideoRecorder",
     "attach_video_metadata",

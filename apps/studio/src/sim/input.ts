@@ -35,9 +35,11 @@ export const TIP_RATE = 0.25;
 export const DRIVE_IDLE_MS = 500;
 
 /** Gamepad button indices (standard mapping): A/cross toggles the freeze,
- *  B/circle restarts the session at its starting pose. */
+ *  B/circle restarts the session at its starting pose, X/square opens and
+ *  closes the gripper. */
 export const PAD_BUTTON_PAUSE = 0;
 export const PAD_BUTTON_RESET = 1;
+export const PAD_BUTTON_GRIPPER = 2;
 
 /** Keys held to jog the selected joint (`=`/`+`/↑ raise, `-`/`_`/↓ lower). */
 export const JOG_UP_KEYS = ["=", "+", "ArrowUp"];
@@ -45,6 +47,8 @@ export const JOG_DOWN_KEYS = ["-", "_", "ArrowDown"];
 /** Keys that move the keyboard-jog selection along the chain. */
 export const JOINT_PREV_KEYS = ["["];
 export const JOINT_NEXT_KEYS = ["]"];
+/** Keys that open/close the gripper (one press = one toggle). */
+export const GRIPPER_KEYS = ["g", "G"];
 
 /** Per-second jog rate for one joint: the kind's base rate, capped by the
  *  model's velocity limit when it carries one (0/absent = unbounded). */
@@ -92,6 +96,17 @@ export function applyJog(
   });
 }
 
+/** A COPY of `v` with slot `i` set to `val`; a null or too-short vector comes
+ *  back untouched. Copy rather than in-place, because a target vector is also
+ *  handed to the store as `liveTarget` — writing through it would move a
+ *  slider with no set() behind it. */
+export function withSlot(v: number[] | null, i: number, val: number): number[] | null {
+  if (!v || i < 0 || i >= v.length || v[i] === val) return v;
+  const out = v.slice();
+  out[i] = val;
+  return out;
+}
+
 /** Deadband + cubic response for one analog axis: everything inside the
  *  deadband reads 0, the remainder is re-normalized to [0,1] and cubed so
  *  small deflections are gentle while full deflection still reaches ±1.
@@ -113,6 +128,7 @@ export interface GamepadIntent {
   moving: boolean;
   togglePause: boolean;
   reset: boolean;
+  toggleGripper: boolean;
 }
 
 /** Map one polled gamepad frame to an intent. Left stick X/Y (axes 0/1) drive
@@ -136,6 +152,7 @@ export function gamepadIntent(
     moving: x !== 0 || y !== 0 || z !== 0,
     togglePause: edge(PAD_BUTTON_PAUSE),
     reset: edge(PAD_BUTTON_RESET),
+    toggleGripper: edge(PAD_BUTTON_GRIPPER),
   };
 }
 
@@ -177,9 +194,10 @@ export function stepJoint(cur: number, delta: number, ndof: number): number {
 /** What a keydown means to a RUNNING live session. App only dispatches this
  *  when a session is up, the mode is simulate and focus is not in a field —
  *  everything else about the key (repeat, modifiers) stays in App. */
-export type LiveKeyAction = "freeze" | "prev-joint" | "next-joint" | "jog" | null;
+export type LiveKeyAction = "freeze" | "gripper" | "prev-joint" | "next-joint" | "jog" | null;
 export function liveKeyAction(key: string): LiveKeyAction {
   if (key === " " || key === "Spacebar") return "freeze";
+  if (GRIPPER_KEYS.includes(key)) return "gripper";
   if (JOINT_PREV_KEYS.includes(key)) return "prev-joint";
   if (JOINT_NEXT_KEYS.includes(key)) return "next-joint";
   return isJogKey(key) ? "jog" : null;

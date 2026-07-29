@@ -556,3 +556,190 @@ fn cross_check_against_caliper_simulator() {
     // comparing two frozen states).
     assert!((qm[0] - q0[0]).abs() + (qm[1] - q0[1]).abs() > 0.05);
 }
+
+// ===== grasp welds (B2) =====
+
+/// The grasp-weld fixture: `gripper_arm` hanging over a 5 cm cube that rests
+/// on the ground plane, with the jaw already 1 mm into the cube's top face —
+/// so a grasp can be tested without racing a falling prop.
+fn grasp_rig(attach: bool) -> MujocoSim {
+    let m = model("gripper_arm.urdf");
+    let opt = MjcfOptions {
+        ground_plane: Some(0.0),
+        attach_link: attach.then(|| "jaw".to_string()),
+        props: vec![PropSpec {
+            name: "cube".into(),
+            shape: PropShape::Box { half: [0.05; 3] },
+            pos: [0.0, 0.0, 0.05],
+            quat: None,
+            mass: 0.05,
+            rgba: None,
+            material: None,
+        }],
+        ..Default::default()
+    };
+    MujocoSim::from_caliper_model_with(&m, &opt).unwrap()
+}
+
+/// Pose of the cube relative to the jaw body — the quantity a weld is supposed
+/// to hold constant.
+fn cube_rel_jaw(sim: &MujocoSim) -> ([f64; 3], [f64; 4]) {
+    let (jp, jq) = sim.body_pose("b_gripper").unwrap();
+    let (_, pp, pq) = sim.prop_poses().into_iter().next().unwrap();
+    // R_jawᵀ·(x_cube − x_jaw), q_jaw⁻¹⊗q_cube, with quats as [w,x,y,z].
+    let q = nalgebra::UnitQuaternion::new_normalize(nalgebra::Quaternion::new(
+        jq[0], jq[1], jq[2], jq[3],
+    ));
+    let p = nalgebra::UnitQuaternion::new_normalize(nalgebra::Quaternion::new(
+        pq[0], pq[1], pq[2], pq[3],
+    ));
+    let d =
+        q.inverse_transform_vector(&(nalgebra::Vector3::from(pp) - nalgebra::Vector3::from(jp)));
+    let r = q.inverse() * p;
+    ([d.x, d.y, d.z], [r.w, r.i, r.j, r.k])
+}
+
+/// A model built WITHOUT `attach_link` has no welds at all, and says so
+/// instead of pretending a grasp happened.
+#[test]
+fn no_attach_link_means_no_welds() {
+    let mut sim = grasp_rig(false);
+    assert!(sim.weld_props().is_empty());
+    let err = sim.set_weld_active("cube", true, true).unwrap_err();
+    assert!(err.to_string().contains("no grasp weld"), "got: {err}");
+    assert!(sim.weld_active("cube").is_err());
+}
+
+/// Welds are emitted inactive, name-addressed by prop, and refuse unknown props.
+#[test]
+fn welds_start_inactive_and_are_addressed_by_prop() {
+    let mut sim = grasp_rig(true);
+    assert_eq!(sim.weld_props(), ["cube"]);
+    assert!(!sim.weld_active("cube").unwrap());
+    let err = sim.set_weld_active("nope", true, true).unwrap_err();
+    assert!(err.to_string().contains("`nope`"), "got: {err}");
+    // an inactive weld does not hold anything: the cube is still a free body
+    sim.forward();
+    assert!(!sim.weld_active("cube").unwrap());
+}
+
+/// The jaw touches the cube, and `props_touching_robot` reports contact with
+/// the ROBOT only — the cube also rests on the ground, which must not count.
+#[test]
+fn prop_contact_with_the_robot_is_distinguished_from_the_ground() {
+    let mut sim = grasp_rig(true);
+    sim.forward();
+    assert!(sim.ncon() >= 2, "expected jaw + ground contacts");
+    assert!(
+        sim.contacts()
+            .iter()
+            .any(|c| c.geom1 == "caliper_ground" || c.geom2 == "caliper_ground"),
+        "the cube should be resting on the ground"
+    );
+    assert_eq!(sim.props_touching_robot(), ["cube"]);
+
+    // Lift the arm clear: the cube still touches the ground, but nothing else.
+    sim.set_state(&[1.2, 0.0, 0.0], &[0.0; 3]).unwrap();
+    sim.forward();
+    assert!(
+        sim.props_touching_robot().is_empty(),
+        "a cube touching only the ground is not touching the robot"
+    );
+}
+
+/// Activation with `capture_relpose` is CONTINUOUS: the prop does not snap to
+/// the pose the weld was authored with. The same activation without capture
+/// yanks it back — that contrast is the whole point of the capture.
+#[test]
+fn relpose_capture_makes_activation_snap_free() {
+    // Move the arm well away from the pose the document was compiled at, so
+    // the authored relative pose is stale by tens of centimeters.
+    let moved = [0.9, 0.0, 0.0];
+
+    let mut with = grasp_rig(true);
+    with.set_state(&moved, &[0.0; 3]).unwrap();
+    with.forward();
+    let before = with.prop_poses()[0].1;
+    with.set_weld_active("cube", true, true).unwrap();
+    with.step_once();
+    let after = with.prop_poses()[0].1;
+    let snap = (nalgebra::Vector3::from(after) - nalgebra::Vector3::from(before)).norm();
+    assert!(
+        snap < 1e-3,
+        "captured activation moved the prop {:.3} mm — it must be continuous",
+        snap * 1000.0
+    );
+
+    let mut without = grasp_rig(true);
+    without.set_state(&moved, &[0.0; 3]).unwrap();
+    without.forward();
+    let before = without.prop_poses()[0].1;
+    without.set_weld_active("cube", true, false).unwrap();
+    for _ in 0..50 {
+        without.step_once();
+    }
+    let after = without.prop_poses()[0].1;
+    let pull = (nalgebra::Vector3::from(after) - nalgebra::Vector3::from(before)).norm();
+    assert!(
+        pull > 0.05,
+        "without capture the weld should drag the prop to its authored pose, moved {pull:.4} m"
+    );
+}
+
+/// The full grasp: attach, carry the prop through a swing, release, and see it
+/// fall. Plus reset, which must drop whatever was held.
+#[test]
+fn welded_prop_is_carried_then_released() {
+    let mut sim = grasp_rig(true);
+    sim.forward();
+    assert_eq!(sim.props_touching_robot(), ["cube"]);
+
+    sim.set_weld_active("cube", true, true).unwrap();
+    let rel0 = cube_rel_jaw(&sim);
+    let z0 = sim.prop_poses()[0].1[2];
+
+    // Swing j1: the jaw sweeps up and sideways, so a carried cube must leave
+    // the ground with it.
+    for _ in 0..600 {
+        sim.set_joint_torques(&[12.0, 0.0, 0.0]).unwrap();
+        sim.step_once();
+    }
+    let held = sim.prop_poses()[0].1;
+    assert!(
+        held[2] > z0 + 0.02,
+        "the carried cube never left the ground (z {z0} → {})",
+        held[2]
+    );
+    // The relative pose is what the weld holds — MuJoCo's weld is a SOFT
+    // constraint, so allow a millimetre-scale sag, not a rigid identity.
+    let rel1 = cube_rel_jaw(&sim);
+    let dp = (nalgebra::Vector3::from(rel1.0) - nalgebra::Vector3::from(rel0.0)).norm();
+    assert!(
+        dp < 5e-3,
+        "carried cube drifted {:.2} mm in the jaw frame",
+        dp * 1000.0
+    );
+
+    // Release: the cube keeps its state and falls under gravity.
+    sim.set_weld_active("cube", false, false).unwrap();
+    assert!(!sim.weld_active("cube").unwrap());
+    let dropped_from = sim.prop_poses()[0].1[2];
+    for _ in 0..800 {
+        sim.set_joint_torques(&[12.0, 0.0, 0.0]).unwrap();
+        sim.step_once();
+    }
+    let landed = sim.prop_poses()[0].1[2];
+    assert!(
+        landed < dropped_from - 0.01,
+        "released cube did not fall (z {dropped_from} → {landed})"
+    );
+
+    // Reset releases everything, whatever was held.
+    sim.set_weld_active("cube", true, true).unwrap();
+    assert!(sim.weld_active("cube").unwrap());
+    sim.reset(&[0.0, 0.0, 0.0]).unwrap();
+    assert!(
+        !sim.weld_active("cube").unwrap(),
+        "reset must drop a held prop"
+    );
+}

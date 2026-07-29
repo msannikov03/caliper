@@ -4,12 +4,13 @@ does nothing" and "checkpoint selection is a seed lottery".
 Training loss predicts almost nothing about closed-loop competence (BC covariate
 shift, chunk-cadence mismatches, normalization drift all hide behind a pretty
 loss curve), so the only honest metric is rollouts: N seeded episodes on
-`VecSimEnv`, success = the task's termination_fn fired, aggregated with a
-Wilson 95% interval so a 3/5 result is reported as the coin-flip it is instead
-of "60%". Everything is deterministic — same `EvalConfig` produces a
-byte-identical serialized `EvalResult` (tested with exact equality), and every
-episode's seed is in the output, so any single failing episode can be
-reproduced in isolation.
+`VecSimEnv`, success = the task's termination_fn fired (or a `success`
+predicate over the SCENE — "the cube is in the bin" — see
+`EvalTask.success_predicate`), aggregated with a Wilson 95% interval so a 3/5
+result is reported as the coin-flip it is instead of "60%". Everything is
+deterministic — same `EvalConfig` produces a byte-identical serialized
+`EvalResult` (tested with exact equality), and every episode's seed is in the
+output, so any single failing episode can be reproduced in isolation.
 
 What runs where:
 
@@ -45,10 +46,11 @@ import math
 import statistics
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Optional, Union
 
 import numpy as np
 
+from .success import SuccessPredicate, as_predicate
 from .vec_env import RewardFn, TerminationFn
 
 # ----- findings (the caliper-doctor pattern: stable code + message + fix) ----
@@ -78,12 +80,27 @@ class EvalTask:
     """What to evaluate on: a robot + the reach_task-shaped hooks.
 
     `reward_fn` / `termination_fn` have the `VecSimEnv.set_task` signature
-    (qpos copy, qvel copy, env index). Success is DEFINED as termination_fn
-    returning True within `max_steps`; with `termination_fn=None` no episode
-    can succeed. Episode initial states are the env's seeded jitter
+    (qpos copy, qvel copy, env index). By default success is DEFINED as
+    termination_fn returning True within `max_steps`; with `termination_fn=None`
+    no episode can succeed. Episode initial states are the env's seeded jitter
     (`init_jitter` fraction of each joint's limit range around its midpoint).
     `distance_fn(qpos) -> float`, when present, is reported per episode as
     `final_distance` (reach tasks: see `reach_eval_task`).
+
+    THE OTHER SUCCESS SOURCE — `success_predicate` (a `success.SuccessPredicate`
+    or its dict form) — scores the SCENE instead of the arm's configuration:
+    "the cube ended up in the bin", not "the joints reached a pose". When it is
+    set it becomes the ONLY thing that marks an episode successful; a
+    termination_fn still ends the episode, but ending is not succeeding (an
+    episode can now terminate and be scored a failure, which is the honest
+    reading). The episode also stops the moment the predicate fires, so `steps`
+    stays "steps to success". Nothing else changes: the same seeds, the same
+    Wilson interval over the same counts.
+
+    `extra_xml` / `ground` are handed to the eval env verbatim. A manipulation
+    task NEEDS `extra_xml`: props enter the scene only through it (see the
+    `VecSimEnv` doc), so a predicate over a prop with an empty `extra_xml` is a
+    predicate over a prop that is not there — it raises rather than scoring 0.
     """
 
     robot: object
@@ -93,6 +110,9 @@ class EvalTask:
     fps: int = 50
     init_jitter: float = 0.2
     distance_fn: Optional[Callable[[np.ndarray], float]] = None
+    success_predicate: Union[SuccessPredicate, dict, None] = None
+    extra_xml: str = ""
+    ground: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -129,6 +149,11 @@ class EvalResult:
     mean_steps_to_success: Optional[float]  # over successful episodes; None if 0
     episodes: tuple[EpisodeResult, ...]
     findings: tuple[EvalFinding, ...]
+    # The success predicate's plain-English sentence when the run was scored by
+    # one (`EvalTask.success_predicate`), else None = "termination_fn fired".
+    # Carried IN the result so a report can never state a rate without stating
+    # what it is a rate OF.
+    success_criterion: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -218,9 +243,10 @@ def evaluate(policy, task: EvalTask, cfg: EvalConfig = EvalConfig()) -> EvalResu
 
     Episode k: `env.reset(seed=cfg.base_seed + k)` (seeded init jitter), then up
     to `task.max_steps` control steps at `task.fps`; success = termination_fn
-    fired. Deterministic for deterministic policies: same cfg → byte-identical
-    `to_json(result)` (a policy with its own unseeded RNG breaks this — seed it
-    in `reset()`, the way the diffusion head does).
+    fired, or — with `task.success_predicate` — the predicate firing (see
+    `EvalTask`). Deterministic for deterministic policies: same cfg →
+    byte-identical `to_json(result)` (a policy with its own unseeded RNG breaks
+    this — seed it in `reset()`, the way the diffusion head does).
     """
     if cfg.n_episodes < 1:
         raise ValueError(f"n_episodes must be >= 1, got {cfg.n_episodes}")
@@ -231,10 +257,22 @@ def evaluate(policy, task: EvalTask, cfg: EvalConfig = EvalConfig()) -> EvalResu
 
     ndof = int(task.robot.ndof)
     step_fn, reset_fn = _adapt_policy(policy, ndof)
+    predicate = (
+        as_predicate(task.success_predicate)
+        if task.success_predicate is not None
+        else None
+    )
 
     episodes: list[EpisodeResult] = []
     with VecSimEnv(
-        task.robot, 1, fps=task.fps, seed=cfg.base_seed, init_jitter=task.init_jitter
+        task.robot,
+        1,
+        fps=task.fps,
+        seed=cfg.base_seed,
+        init_jitter=task.init_jitter,
+        ground=task.ground,
+        extra_xml=task.extra_xml,
+        success=predicate,
     ) as env:
         env.set_task(task.reward_fn, task.termination_fn)
         for k in range(cfg.n_episodes):
@@ -254,8 +292,16 @@ def evaluate(policy, task: EvalTask, cfg: EvalConfig = EvalConfig()) -> EvalResu
                 ep_return += float(r[0])
                 steps += 1
                 if te[0]:
-                    success = True
+                    # Terminated. With a predicate, success is ITS verdict on
+                    # the terminal state — terminating is not succeeding.
+                    success = (
+                        bool(info["final_success"][0]) if predicate is not None else True
+                    )
                     final_state = info["final_observation"][0]  # pre-auto-reset
+                    break
+                if predicate is not None and bool(info["success"][0]):
+                    success = True
+                    final_state = obs["state"][0]
                     break
                 final_state = obs["state"][0]
             final_distance = (
@@ -273,10 +319,14 @@ def evaluate(policy, task: EvalTask, cfg: EvalConfig = EvalConfig()) -> EvalResu
                 )
             )
 
-    return _aggregate(episodes)
+    return _aggregate(
+        episodes, predicate.describe() if predicate is not None else None
+    )
 
 
-def _aggregate(episodes: list[EpisodeResult]) -> EvalResult:
+def _aggregate(
+    episodes: list[EpisodeResult], criterion: Optional[str] = None
+) -> EvalResult:
     n = len(episodes)
     n_success = sum(1 for e in episodes if e.success)
     lo, hi = wilson_interval(n_success, n)
@@ -292,22 +342,28 @@ def _aggregate(episodes: list[EpisodeResult]) -> EvalResult:
         median_return=float(statistics.median(returns)),
         mean_steps_to_success=statistics.fmean(steps_ok) if steps_ok else None,
         episodes=tuple(episodes),
-        findings=tuple(_diagnose(episodes, n_success, lo, hi)),
+        findings=tuple(_diagnose(episodes, n_success, lo, hi, criterion)),
+        success_criterion=criterion,
     )
 
 
 def _diagnose(
-    episodes: list[EpisodeResult], n_success: int, lo: float, hi: float
+    episodes: list[EpisodeResult],
+    n_success: int,
+    lo: float,
+    hi: float,
+    criterion: Optional[str] = None,
 ) -> list[EvalFinding]:
     """The mined failure modes, named in plain English with stable codes."""
     n = len(episodes)
     findings: list[EvalFinding] = []
+    what = "reached termination" if criterion is None else f"met '{criterion}'"
     if n_success == 0:
         findings.append(
             EvalFinding(
                 ALL_EPISODES_FAILED,
                 "warn",
-                f"0/{n} episodes reached termination — the policy never solved the task.",
+                f"0/{n} episodes {what} — the policy never solved the task.",
                 fix_hint=(
                     "Training loss says nothing about this. Check the deploy cadence "
                     "(eval fps vs the collection fps — action chunks consumed at the "
@@ -451,7 +507,10 @@ def _fmt_opt(v: Optional[float], spec: str = ".3f") -> str:
 
 
 def _render_result(r: EvalResult) -> str:
-    lines = [
+    lines = []
+    if r.success_criterion is not None:
+        lines.append(f"success: {r.success_criterion}")
+    lines += [
         f"episodes: {r.n_success}/{r.n_episodes} succeeded  "
         f"success_rate={r.success_rate:.3f}  "
         f"wilson95=[{r.ci95_low:.3f}, {r.ci95_high:.3f}]",

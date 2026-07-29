@@ -65,7 +65,7 @@ import {
   _resetLive,
 } from "./store";
 import type { RobotInfo, TrajectoryDto, StudioState } from "./store";
-import type { LiveStartedDto, LiveStateEvent } from "./sim/live";
+import type { GripperInfo, LiveStartedDto, LiveStateEvent } from "./sim/live";
 import { serializeGraph } from "./graph/serialize";
 import { defaultParams } from "./graph/spec";
 import type { KindName } from "./graph/spec";
@@ -863,6 +863,14 @@ describe("runGraph success", () => {
 // ---- live sim session (store side of src/sim/live.ts) ----
 
 describe("live session — store wiring", () => {
+  /** A gripper channel on joint 1 of MOCK_ROBOT: open 0.04 → closed 0.0. */
+  const CHANNEL: GripperInfo = {
+    joint: "gripper",
+    index: 1,
+    openTarget: 0.04,
+    closedTarget: 0.008,
+  };
+
   function mockStarted(over: Partial<LiveStartedDto> = {}): LiveStartedDto {
     return {
       sessionId: 1,
@@ -871,6 +879,7 @@ describe("live session — store wiring", () => {
       emitHz: 59.5,
       ndof: 2,
       props: [],
+      gripper: null,
       ...over,
     };
   }
@@ -1339,6 +1348,219 @@ describe("live session — store wiring", () => {
     useStore.getState().setLiveTargetJoint(0, 0.9);
     _flushLive();
     expect(targetCalls()).toHaveLength(0);
+  });
+
+  // ---- gripper + grasp (B): one channel, one command, one held prop ----
+
+  describe("gripper", () => {
+    /** Start a session that FOUND a jaw joint, and forget the start calls. */
+    async function startWithGripper(): Promise<void> {
+      backend(mockStarted({ gripper: CHANNEL }));
+      await useStore.getState().startLive();
+      mockInvoke.mockClear(); // the implementation survives; only the log resets
+    }
+
+    /** The jaw slot of the last live_set_target the store sent. */
+    function lastJaw(): number | undefined {
+      const sent = targetCalls();
+      return sent[sent.length - 1]?.[CHANNEL.index];
+    }
+
+    it("adopts the channel the session reports", async () => {
+      await startWithGripper();
+      expect(useStore.getState().live?.gripper).toEqual(CHANNEL);
+    });
+
+    it("carries no channel when the session found no jaw joint", async () => {
+      backend(mockStarted({ gripper: null }));
+      await useStore.getState().startLive();
+      expect(useStore.getState().live?.gripper).toBeNull();
+    });
+
+    it("commands closed, then open, flipping the intent each press", async () => {
+      await startWithGripper();
+
+      await useStore.getState().toggleGripper();
+      expect(mockInvoke).toHaveBeenCalledWith("live_gripper", { closed: true });
+      expect(useStore.getState().live?.gripperState?.closed).toBe(true);
+
+      await useStore.getState().toggleGripper();
+      expect(mockInvoke).toHaveBeenLastCalledWith("live_gripper", { closed: false });
+      expect(useStore.getState().live?.gripperState?.closed).toBe(false);
+    });
+
+    it("does nothing at all on a session with no gripper channel", async () => {
+      backend(mockStarted({ gripper: null }));
+      await useStore.getState().startLive();
+      mockInvoke.mockClear();
+
+      await useStore.getState().toggleGripper();
+
+      expect(mockInvoke).not.toHaveBeenCalledWith("live_gripper", expect.anything());
+      expect(useStore.getState().error).toBeNull();
+    });
+
+    // THE regression this whole channel hangs on: live_set_target overwrites
+    // the WHOLE vector, so a drive mirror that still holds the pre-toggle jaw
+    // value drops the grasp on the very next input the human touches.
+    it("keeps the closed jaw in the target a later jog ships", async () => {
+      await startWithGripper();
+      await useStore.getState().toggleGripper();
+      expect(useStore.getState().liveTarget[CHANNEL.index]).toBe(CHANNEL.closedTarget);
+
+      useStore.getState().selectLiveJoint(0);
+      useStore.getState().liveJogKey("=", true);
+      _flushLive();
+      useStore.getState().liveJogKey("=", false);
+
+      const sent = targetCalls();
+      expect(sent[sent.length - 1][0]).toBeGreaterThan(0); // the jog did move
+      expect(lastJaw()).toBe(CHANNEL.closedTarget); // …and the jaw stayed shut
+    });
+
+    it("keeps it through a slider edit queued across the toggle", async () => {
+      await startWithGripper();
+      // the edit is stashed for the next frame; the toggle lands in between
+      useStore.getState().setLiveTargetJoint(0, 0.3);
+      await useStore.getState().toggleGripper();
+
+      _flushLive();
+
+      expect(targetCalls()).toEqual([[0.3, CHANNEL.closedTarget]]);
+    });
+
+    it("keeps it through an IK solution seeded before the toggle", async () => {
+      await startWithGripper();
+      mockInvoke.mockImplementation(async (cmd: string) =>
+        cmd === "solve_ik_governed"
+          ? { success: true, q: [0.5, CHANNEL.openTarget], residual: 0 }
+          : undefined,
+      );
+      const pose = new Array<number>(16).fill(0);
+      pose[0] = pose[5] = pose[10] = pose[15] = 1;
+
+      // the solve is seeded off the OPEN mirror and lands after the toggle
+      await useStore.getState().driveTipLive(pose);
+      await useStore.getState().toggleGripper();
+      _flushLive();
+
+      expect(lastJaw()).toBe(CHANNEL.closedTarget);
+    });
+
+    it("holds the command over a state event that predates it", async () => {
+      await startWithGripper();
+      await useStore.getState().toggleGripper();
+      mockInvoke.mockClear();
+
+      // emitted before live_gripper landed: it still reports the open jaw
+      emit("live://state", mockState({ gripper: { closed: false, q: 0.04 }, target: [0, 0.04] }));
+      _flushLive();
+
+      // the button must not flip back, and the mirror must not re-open
+      expect(useStore.getState().live?.gripperState?.closed).toBe(true);
+      useStore.getState().setLiveTargetJoint(0, 0.2);
+      _flushLive();
+      expect(lastJaw()).toBe(CHANNEL.closedTarget);
+    });
+
+    it("adopts the stream's own view of the jaw once it agrees", async () => {
+      await startWithGripper();
+      await useStore.getState().toggleGripper();
+      emit(
+        "live://state",
+        mockState({ gripper: { closed: true, q: 0.031 }, target: [0, CHANNEL.closedTarget] }),
+      );
+      _flushLive();
+      mockInvoke.mockClear();
+
+      // the jaw is squeezing a prop: commanded closed, measured short of it
+      expect(useStore.getState().live?.gripperState).toEqual({ closed: true, q: 0.031 });
+      // and a jaw the BACKEND re-opened (not us) lands in the mirror too
+      emit("live://state", mockState({ gripper: { closed: false, q: 0.04 }, target: [0, 0.04] }));
+      _flushLive();
+      expect(useStore.getState().liveTarget[CHANNEL.index]).toBe(CHANNEL.openTarget);
+    });
+
+    it("leaves a jaw the human is jogging by hand alone", async () => {
+      await startWithGripper();
+      useStore.getState().setLiveTargetJoint(CHANNEL.index, 0.02); // hand on the jaw slider
+      _flushLive();
+      mockInvoke.mockClear();
+
+      // a stale event echoing the pre-jog target must not drag it back
+      emit("live://state", mockState({ gripper: { closed: false, q: 0.04 }, target: [0, 0.04] }));
+      _flushLive();
+
+      expect(useStore.getState().liveTarget[CHANNEL.index]).toBe(0.02);
+    });
+
+    it("commands the jaw while the session is frozen, where no event can confirm it", async () => {
+      await startWithGripper();
+      emit("live://state", mockState({ paused: true }));
+      _flushLive();
+
+      await useStore.getState().toggleGripper();
+
+      // nothing streams while frozen, so the panel would read a stale intent
+      // if the command did not paint itself
+      expect(useStore.getState().live?.gripperState?.closed).toBe(true);
+      // and pressing again flips off the COMMAND, not the last state seen
+      await useStore.getState().toggleGripper();
+      expect(mockInvoke).toHaveBeenLastCalledWith("live_gripper", { closed: false });
+    });
+
+    it("banners a rejected command and moves nothing", async () => {
+      await startWithGripper();
+      mockInvoke.mockImplementation(async (cmd: string) => {
+        if (cmd === "live_gripper") throw "this robot has no gripper channel";
+        return undefined;
+      });
+
+      await useStore.getState().toggleGripper();
+
+      const s = useStore.getState();
+      expect(s.error).toBe("this robot has no gripper channel");
+      expect(s.live?.gripperState).toBeNull();
+      expect(s.liveTarget).toEqual([0, 0]); // the mirror never learned a jaw value
+    });
+
+    it("turns pad X into the same toggle, once per press", async () => {
+      await startWithGripper();
+      withPad([0, 0, 0, 0], [false, false, true]);
+
+      _flushLive();
+      await settle();
+      expect(mockInvoke).toHaveBeenCalledWith("live_gripper", { closed: true });
+
+      mockInvoke.mockClear();
+      _flushLive(); // still held: the edge already fired
+      await settle();
+      expect(mockInvoke).not.toHaveBeenCalledWith("live_gripper", expect.anything());
+    });
+
+    it("badges the prop the grasp heuristic welded, and un-badges it on release", async () => {
+      await startWithGripper();
+
+      emit("live://state", mockState({ gripper: { closed: true, q: 0.031 }, held: "box0" }));
+      _flushLive();
+      expect(useStore.getState().live?.held).toBe("box0");
+
+      emit("live://state", mockState({ gripper: { closed: false, q: 0.04 }, held: null }));
+      _flushLive();
+      expect(useStore.getState().live?.held).toBeNull();
+    });
+
+    it("holds nothing on a session with no gripper channel (builtin)", async () => {
+      backend(mockStarted({ engine: "builtin", gripper: null }));
+      await useStore.getState().startLive();
+
+      emit("live://state", mockState());
+      _flushLive();
+
+      const s = useStore.getState();
+      expect(s.live?.held).toBeNull();
+      expect(s.live?.gripperState).toBeNull();
+    });
   });
 
   // ---- teleop recording: takes append episodes to ONE open dataset ----

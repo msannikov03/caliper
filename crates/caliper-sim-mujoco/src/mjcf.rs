@@ -23,6 +23,7 @@
 //! | visuals ([`caliper_model::VisualShape`]) | NOT exported — render meshes stay in Studio; MuJoCo sees collision geometry only |
 //! | joint `<dynamics damping>` | NOT translated (caliper does not parse it); the uniform [`MjcfOptions::joint_damping`] knob instead |
 //! | actuators | none by default (torque via `qfrc_applied`); opt-in `<position>` servos ([`Actuation::PositionServo`]) |
+//! | grasp welds ([`MjcfOptions::attach_link`]) | opt-in `<equality><weld active="false">`, one per prop, tying it to the attach link's body — INERT until the sim layer activates one (`MujocoSim::set_weld_active`) |
 //! | sensors / transmissions / solver tuning | NOT exported — MuJoCo defaults |
 //!
 //! Conventions locked in the header we emit:
@@ -346,6 +347,21 @@ pub struct MjcfOptions {
     /// `solref`/`solimp`/`friction` attributes at all — plain MuJoCo
     /// defaults, byte-identical to the pre-material output.
     pub default_material: Option<ContactMaterial>,
+    /// Caliper LINK (frame) name every prop's GRASP WELD attaches to —
+    /// normally the gripper joint's child link
+    /// ([`caliper_model::gripper::child_link_name`]). When set, each prop in
+    /// [`props`](Self::props) gets one `<equality><weld>` between that link's
+    /// MJCF body and the prop body, emitted INACTIVE
+    /// (`active="false"`) — the sim layer turns exactly one on at a time
+    /// (`MujocoSim::set_weld_active`, feature `mujoco`) to model
+    /// attach-on-grasp. The weld is named `grasp_{sanitize(prop name)}` and
+    /// the pairs are reported in [`MjcfDocument::grasp_welds`].
+    ///
+    /// The named frame must exist and must ride on a movable joint: welding a
+    /// prop to the world body is not a grasp, so a world-anchored (fixed-base)
+    /// link is refused. `None` (the default) emits no `<equality>` block at
+    /// all — byte-identical to the pre-weld output.
+    pub attach_link: Option<String>,
     /// Convex-decomposition seam, consulted ONLY for hulls actually exported
     /// (i.e. when [`export_hull_meshes`](Self::export_hull_meshes) is on):
     /// each hull's points are decomposed and every piece becomes its own
@@ -367,6 +383,7 @@ impl Default for MjcfOptions {
             props: Vec::new(),
             export_hull_meshes: false,
             default_material: None,
+            attach_link: None,
             hull_decomposer: None,
         }
     }
@@ -395,6 +412,10 @@ pub struct MjcfDocument {
     /// `(prop name, MJCF body name)` for every [`MjcfOptions::props`] entry,
     /// in input order — the name map the sim layer resolves body ids from.
     pub prop_bodies: Vec<(String, String)>,
+    /// `(prop name, MJCF weld name)` for every prop's inactive grasp weld, in
+    /// input order — the name map the sim layer resolves equality-constraint
+    /// ids from. Empty unless [`MjcfOptions::attach_link`] is set.
+    pub grasp_welds: Vec<(String, String)>,
 }
 
 /// Generate a minimal MJCF document from a caliper model. Errors when the
@@ -593,6 +614,30 @@ pub fn mjcf_from_model(m: &Model, opt: &MjcfOptions) -> Result<MjcfDocument, Muj
     }
     xml.push_str("  </worldbody>\n");
 
+    // Grasp welds: one INACTIVE weld per prop, tying it to the attach body.
+    // MJCF element order puts <equality> after <worldbody> and before
+    // <actuator>. Each carries `anchor="0 0 0"` (the weld point is the prop's
+    // own origin) and the DEFAULT relpose — the sim layer overwrites the
+    // relpose from the live relative pose at the moment it activates the weld,
+    // so what is authored here never determines where a grasped prop lands.
+    let mut grasp_welds: Vec<(String, String)> = Vec::new();
+    if let Some(link) = &opt.attach_link {
+        let body1 = attach_body(m, link)?;
+        if !opt.props.is_empty() {
+            xml.push_str("  <equality>\n");
+            for (p, (_, body2)) in opt.props.iter().zip(&prop_bodies) {
+                let weld = format!("grasp_{}", sanitize(&p.name));
+                let _ = writeln!(
+                    xml,
+                    "    <weld name=\"{weld}\" body1=\"{body1}\" body2=\"{body2}\" \
+                     anchor=\"0 0 0\" torquescale=\"1\" active=\"false\"/>"
+                );
+                grasp_welds.push((p.name.clone(), weld));
+            }
+            xml.push_str("  </equality>\n");
+        }
+    }
+
     if let Actuation::PositionServo { kp, kv } = opt.actuation {
         if !(kp.is_finite() && kp > 0.0 && kv.is_finite() && kv >= 0.0) {
             return Err(MujocoError::Mjcf(format!(
@@ -624,7 +669,29 @@ pub fn mjcf_from_model(m: &Model, opt: &MjcfOptions) -> Result<MjcfDocument, Muj
         joint_count: m.ndof,
         geom_count,
         prop_bodies,
+        grasp_welds,
     })
+}
+
+/// Resolve [`MjcfOptions::attach_link`] (a caliper link/frame name) to the
+/// MJCF body a grasp weld attaches to: the body of the movable joint that
+/// frame rides on. A frame anchored to the world has no body of its own —
+/// welding a prop to the world is not a grasp, so that is an error, not a
+/// silent weld to body 0.
+fn attach_body(m: &Model, link: &str) -> Result<String, MujocoError> {
+    let f = m.frame_id(link).ok_or_else(|| {
+        MujocoError::Mjcf(format!(
+            "attach_link `{link}` is not a link of this robot (grasp welds need \
+             the link the gripper moves)"
+        ))
+    })?;
+    match m.frames[f].anchor {
+        Some(j) => Ok(format!("b_{}", sanitize(&m.joint_names[j]))),
+        None => Err(MujocoError::Mjcf(format!(
+            "attach_link `{link}` is welded to the world (no movable joint drives it) — \
+             a grasp weld needs a link the robot can move"
+        ))),
+    }
 }
 
 /// One inline-vertex `<mesh>` asset from hull points. MuJoCo's `vertex`
@@ -1111,6 +1178,110 @@ mod tests {
         assert!(last_joint < prop_at && prop_at < wb_end);
         // determinism: same options, same document
         assert_eq!(mjcf_from_model(&m, &opt).unwrap().xml, doc.xml);
+    }
+
+    #[test]
+    fn attach_link_emits_one_inactive_weld_per_prop() {
+        let m = model("gripper_arm.urdf");
+        let props = vec![
+            PropSpec {
+                name: "crate 1".into(),
+                shape: PropShape::Box { half: [0.05; 3] },
+                pos: [0.0, 0.0, 0.05],
+                quat: None,
+                mass: 0.05,
+                rgba: None,
+                material: None,
+            },
+            PropSpec {
+                name: "ball".into(),
+                shape: PropShape::Sphere { r: 0.03 },
+                pos: [0.2, 0.0, 0.03],
+                quat: None,
+                mass: 0.02,
+                rgba: None,
+                material: None,
+            },
+        ];
+        let base = MjcfOptions {
+            ground_plane: Some(0.0),
+            props,
+            ..Default::default()
+        };
+
+        // OFF by default: no <equality> block at all, and the document is
+        // byte-identical to the pre-weld output.
+        let plain = mjcf_from_model(&m, &base).unwrap();
+        assert!(!plain.xml.contains("<equality>"));
+        assert!(plain.grasp_welds.is_empty());
+
+        let opt = MjcfOptions {
+            attach_link: Some("jaw".into()),
+            ..base.clone()
+        };
+        let doc = mjcf_from_model(&m, &opt).unwrap();
+        let x = &doc.xml;
+        // `jaw` is the child link of the `gripper` joint → body b_gripper.
+        assert!(
+            x.contains(
+                "<weld name=\"grasp_crate_1\" body1=\"b_gripper\" body2=\"prop_crate_1\" \
+                 anchor=\"0 0 0\" torquescale=\"1\" active=\"false\"/>"
+            ),
+            "missing crate weld in:\n{x}"
+        );
+        assert!(x.contains("<weld name=\"grasp_ball\" body1=\"b_gripper\" body2=\"prop_ball\""));
+        // Every weld starts INACTIVE — nothing is grasped until the sim layer
+        // says so.
+        assert_eq!(x.matches("<weld ").count(), 2);
+        assert_eq!(x.matches("active=\"false\"").count(), 2);
+        assert_eq!(
+            doc.grasp_welds,
+            vec![
+                ("crate 1".to_string(), "grasp_crate_1".to_string()),
+                ("ball".to_string(), "grasp_ball".to_string()),
+            ]
+        );
+        // <equality> sits after </worldbody> (MJCF element order).
+        assert!(x.find("</worldbody>").unwrap() < x.find("<equality>").unwrap());
+        // determinism: same options, same document
+        assert_eq!(mjcf_from_model(&m, &opt).unwrap().xml, doc.xml);
+
+        // No props → nothing to weld, so no empty block either.
+        let none = mjcf_from_model(
+            &m,
+            &MjcfOptions {
+                attach_link: Some("jaw".into()),
+                props: vec![],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(!none.xml.contains("<equality>"));
+        assert!(none.grasp_welds.is_empty());
+    }
+
+    #[test]
+    fn bad_attach_links_rejected() {
+        let m = model("gripper_arm.urdf");
+        let opt = |link: &str| MjcfOptions {
+            attach_link: Some(link.into()),
+            props: vec![PropSpec {
+                name: "p".into(),
+                shape: PropShape::Sphere { r: 0.03 },
+                pos: [0.0, 0.0, 0.5],
+                quat: None,
+                mass: 0.02,
+                rgba: None,
+                material: None,
+            }],
+            ..Default::default()
+        };
+        let err = mjcf_from_model(&m, &opt("nope")).unwrap_err().to_string();
+        assert!(err.contains("not a link of this robot"), "got: {err}");
+        // The root link rides on no movable joint: welding to it would weld to
+        // the world, which is not a grasp.
+        let err = mjcf_from_model(&m, &opt("base")).unwrap_err().to_string();
+        assert!(err.contains("welded to the world"), "got: {err}");
     }
 
     #[test]

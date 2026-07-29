@@ -31,8 +31,11 @@ import {
   liveRecFromStarted,
   liveRecPatch,
   liveStatePatch,
+  reconcileGripper,
 } from "./sim/live";
 import type {
+  GripperInfo,
+  GripperState,
   LiveEndedEvent,
   LiveInfo,
   LiveRecInfo,
@@ -40,6 +43,7 @@ import type {
   LiveRecordStartedDto,
   LiveRecordStoppedDto,
   LiveStartedDto,
+  LiveStartReq,
   LiveStateEvent,
 } from "./sim/live";
 import {
@@ -50,6 +54,7 @@ import {
   gamepadIntent,
   jogDelta,
   jogDirection,
+  withSlot,
 } from "./sim/input";
 import type { GamepadIntent } from "./sim/input";
 import type { DataDoctorReport, DoctorReport } from "./doctor/doctor";
@@ -386,6 +391,11 @@ export interface StudioState {
   pauseLive: (paused: boolean) => Promise<void>;
   /** Restart the session at its original q0 (tick and t restart at 0). */
   resetLive: () => Promise<void>;
+  /** Open/close the gripper (panel button · G · pad X). A no-op without a
+   *  session or a gripper channel; the backend moves the jaw's slot in the
+   *  SAME PD hold target every other input writes, so the drive mirror learns
+   *  it here too — see `syncGripperSlot`. */
+  toggleGripper: () => Promise<void>;
   /** Slider path: edit one joint of the live hold target. The value lands on
    *  the backend through the SAME per-frame drive step every other input uses
    *  (at most one live_set_target per frame, latest value wins). */
@@ -993,9 +1003,11 @@ export const useStore = create<StudioState>((set, get) => ({
       // subscribe BEFORE the invoke — the first state event can beat the reply
       // through the event loop, and classifyLiveState stashes it either way
       await subscribeLive(get, set);
-      const dto = await invoke<LiveStartedDto>("live_start", {
-        req: { q0: q, engine, props: engine === "mujoco" ? simProps : [] },
-      });
+      // the gripper channel is left to the backend's auto-detect: nothing in
+      // the UI names a joint yet (gripperJoint / gripperClosed ride the req
+      // type for when it does)
+      const req: LiveStartReq = { q0: q, engine, props: engine === "mujoco" ? simProps : [] };
+      const dto = await invoke<LiveStartedDto>("live_start", { req });
       // the session holds q0 until a human drives it — seed the mirror from the
       // pose we started at, so the first jog is a delta off THAT, not off zero
       liveTargetMirror = q.slice();
@@ -1048,9 +1060,39 @@ export const useStore = create<StudioState>((set, get) => ({
       liveTargetMirror = null;
       livePending = null;
       liveTipGoal = null;
+      // a reset also releases the held prop and returns the jaw to OPEN intent,
+      // so our pending command (if any) describes a session state that is gone
+      liveGripIntent = null;
     } catch (e) {
       set({ error: String(e) });
     }
+  },
+
+  async toggleGripper() {
+    const live = get().live;
+    const ch = live?.gripper;
+    if (!live || !ch) return; // no session, or a robot the backend found no jaw on
+    // flip the intent we last COMMANDED, not the one we last SAW: a frozen
+    // session emits no state events at all, so the stream can lag arbitrarily
+    const closed = !(liveGripIntent ?? live.gripperState?.closed ?? false);
+    try {
+      await invoke("live_gripper", { closed });
+    } catch (e) {
+      set({ error: String(e) });
+      return;
+    }
+    const cur = get().live;
+    if (!cur || cur.sessionId !== live.sessionId) return; // the session moved on
+    liveGripIntent = closed;
+    const patch: Partial<StudioState> = { ...syncGripperSlot(ch, closed) };
+    // the command IS what this field reports, so paint it now rather than
+    // waiting on a stream that may be frozen; reconcileGripper keeps an event
+    // predating the command from flipping it back
+    patch.live = {
+      ...cur,
+      gripperState: { closed, q: cur.gripperState?.q ?? get().q[ch.index] ?? ch.openTarget },
+    };
+    set(patch);
   },
 
   setLiveTargetJoint(i, v) {
@@ -2075,20 +2117,30 @@ function flushLive(get: () => StudioState, set: (p: Partial<StudioState>) => voi
   const ev = liveLatest;
   let patch: Partial<StudioState> = {};
   switch (liveFlushFate(cur, ev)) {
-    case "apply":
+    case "apply": {
       liveLatest = null;
       // bump _reqId exactly like _applyTrajAt does: an in-flight get_frames or
       // solve_ik reply must not clobber the pose this event just installed
-      patch = { ...liveStatePatch(cur!, ev!), _reqId: get()._reqId + 1 };
+      const p = liveStatePatch(cur!, ev!);
+      // an event emitted before our last live_gripper still reports the old
+      // intent — hold ours until the stream catches up
+      const grip = reconcileGripper(p.live.gripperState, liveGripIntent);
+      if (grip.settled) liveGripIntent = null;
+      if (grip.state !== p.live.gripperState) p.live = { ...p.live, gripperState: grip.state };
+      patch = { ...p, _reqId: get()._reqId + 1 };
       // the backend's own view of the hold target is authoritative only while
       // we have none of our own (session start, and after a reset)
       if (!liveTargetMirror || liveTargetMirror.length !== ev!.target.length) {
         liveTargetMirror = ev!.target.slice();
         patch.liveTarget = liveTargetMirror;
+      } else {
+        const synced = adoptStreamedGripperSlot(cur!.gripper, grip.state, ev!.target);
+        if (synced) patch.liveTarget = synced;
       }
       liveTipActual = ev!.tip;
       applyLiveRec(ev!, get, patch);
       break;
+    }
     case "keep":
       // the owning session is still being adopted (live_start reply in flight);
       // startLive re-schedules too, but keep trying so no frame is dropped
@@ -2144,12 +2196,55 @@ let livePrevButtons: boolean[] = [];
 let liveIkBusy = false;
 /** the tip pose asked for WHILE that solve was out — run last, latest wins */
 let liveIkPending: Mat4 | null = null;
+/** the last live_gripper intent we sent, until the stream reports it back */
+let liveGripIntent: boolean | null = null;
 /** performance.now() of the previous drive step — the integrators' dt */
 let liveDriveT = 0;
 /** performance.now() of the last target change (the "driving" indicator) */
 let liveDriveAt = 0;
 /** last live_set_target rejection already banner'd (identical ones dedupe) */
 let liveDriveErr: string | null = null;
+
+/** Teach the drive loop's target vectors the jaw slot a just-accepted
+ *  `live_gripper` moved. `live_set_target` overwrites the WHOLE vector, so a
+ *  mirror still holding the pre-toggle jaw value would have the very next
+ *  slider / key / stick motion silently re-open a closed gripper. Returns the
+ *  store patch when the mirror moved, so the jaw's own slider follows too. */
+function syncGripperSlot(ch: GripperInfo, closed: boolean): Partial<StudioState> {
+  const v = closed ? ch.closedTarget : ch.openTarget;
+  // a slider edit queued for this frame carries the old jaw value as well
+  livePending = withSlot(livePending, ch.index, v);
+  const next = withSlot(liveTargetMirror, ch.index, v);
+  if (next === liveTargetMirror) return {};
+  liveTargetMirror = next;
+  return { liveTarget: next! };
+}
+
+/** Belt-and-braces to the above: re-seed the jaw slot from the stream, which
+ *  sees BOTH writers of the hold target. Two gates keep it from fighting the
+ *  human — the intent must be one the stream has caught up on (an unsettled
+ *  command still owns the slot, see reconcileGripper), and the value must be
+ *  one `live_gripper` itself writes; any other value in that slot is a jog of
+ *  the jaw joint echoing back to us a frame late. Returns the new mirror, or
+ *  null when nothing moved. */
+function adoptStreamedGripperSlot(
+  ch: GripperInfo | null,
+  st: GripperState | null,
+  streamed: number[],
+): number[] | null {
+  if (!ch || !st || liveGripIntent !== null || !liveTargetMirror) return null;
+  if (ch.index >= streamed.length || ch.index >= liveTargetMirror.length) return null;
+  const want = st.closed ? ch.closedTarget : ch.openTarget;
+  if (streamed[ch.index] !== want) return null;
+  // …and a jaw the human is driving BY HAND (a slider, a jog) holds a value
+  // neither end of the channel: that one is not the gripper command's to move
+  const mine = liveTargetMirror[ch.index];
+  if (mine !== ch.openTarget && mine !== ch.closedTarget) return null;
+  const next = withSlot(liveTargetMirror, ch.index, want);
+  if (next === liveTargetMirror) return null;
+  liveTargetMirror = next;
+  return next;
+}
 
 /** The first connected gamepad, or null (no pad, or no Gamepad API at all —
  *  jsdom and the odd webview). */
@@ -2184,6 +2279,8 @@ function driveLive(
     livePrevButtons = buttons;
     if (intent.togglePause) void get().pauseLive(!live.paused);
     if (intent.reset) void get().resetLive();
+    // grasping is a "hold here" command like a slider edit — it lands frozen too
+    if (intent.toggleGripper) void get().toggleGripper();
   } else if (livePrevButtons.length > 0) {
     livePrevButtons = []; // pad unplugged: no phantom press-edge on re-plug
   }
@@ -2209,6 +2306,15 @@ function driveLive(
     driveTipFromPad(intent, dt, get);
   } else {
     liveTipGoal = null;
+  }
+
+  // an unconfirmed live_gripper owns the jaw slot outright: a target built
+  // before it landed — a slider edit queued across the toggle, an IK solution
+  // seeded off the pre-toggle mirror — would otherwise ship the old jaw value
+  // and drop what the gripper just took
+  if (target && live.gripper && liveGripIntent !== null) {
+    const ch = live.gripper;
+    target = withSlot(target, ch.index, liveGripIntent ? ch.closedTarget : ch.openTarget)!;
   }
 
   if (target && (!liveTargetMirror || !sameVec(target, liveTargetMirror))) {
@@ -2281,6 +2387,7 @@ function resetLiveDrive(): void {
   liveTipGoal = null;
   liveTipActual = null;
   livePrevButtons = [];
+  liveGripIntent = null;
   liveIkBusy = false;
   liveIkPending = null;
   liveDriveT = 0;

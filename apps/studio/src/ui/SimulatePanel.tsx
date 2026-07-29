@@ -1,5 +1,6 @@
 import { REC_FPS_CHOICES, useStore } from "../store";
 import { frameIndexAt, hasContactEngine, MAX_PROPS } from "../sim/props";
+import { gripperControl, gripperSeated } from "../sim/live";
 import "./panels.css";
 
 /** Kind glyphs for the compact prop list rows. */
@@ -30,6 +31,7 @@ export function SimulatePanel() {
   const stopLive = useStore((s) => s.stopLive);
   const pauseLive = useStore((s) => s.pauseLive);
   const resetLive = useStore((s) => s.resetLive);
+  const toggleGripper = useStore((s) => s.toggleGripper);
   const rec = useStore((s) => s.liveRec);
   const recTask = useStore((s) => s.liveRecTask);
   const recFps = useStore((s) => s.liveRecFps);
@@ -58,6 +60,19 @@ export function SimulatePanel() {
   // a live session streams the pose in; baking a clip over it would fight the
   // stream, so every rollout button goes inert until it is stopped
   const liveEngine = contactView ? "mujoco" : "builtin";
+  // the gripper control reflects the COMMAND intent; the jaw readout appears
+  // only when the measurement disagrees with it — a jaw stopped short is
+  // either still travelling or holding something, and saying which would be
+  // a guess the sim cannot make
+  const grip = gripperControl(live?.gripper ?? null, live?.gripperState ?? null);
+  const gripState = live?.gripperState ?? null;
+  const jaw =
+    live?.gripper && gripState && !gripperSeated(live.gripper, gripState) ? gripState : null;
+  const jawTitle =
+    jaw && live?.gripper
+      ? `commanded ${jaw.closed ? "closed" : "open"} — the jaw is at ${jaw.q.toFixed(3)}, ` +
+        `target ${(jaw.closed ? live.gripper.closedTarget : live.gripper.openTarget).toFixed(3)}`
+      : "";
   const bakeOff = noInertia || live !== null;
   const bakeTitle = (ready: string) =>
     live ? "stop live to bake" : noInertia ? "robot has no inertial data" : ready;
@@ -134,9 +149,34 @@ export function SimulatePanel() {
                 ■ Stop
               </button>
             </div>
+            {/* the gripper channel the session auto-detected; the control is
+                present either way so a robot without one says WHY */}
+            <div className="grip-row">
+              <button
+                className={grip.closed ? "grip closed" : "grip"}
+                disabled={grip.disabled}
+                title={grip.title}
+                onClick={() => void toggleGripper()}
+              >
+                {grip.label}
+              </button>
+              {jaw && (
+                <span className="badge" title={jawTitle}>
+                  jaw {jaw.q.toFixed(3)}
+                </span>
+              )}
+              {live.held && (
+                <span
+                  className="badge held"
+                  title={`${live.held} is welded while the gripper stays closed (heuristic)`}
+                >
+                  HELD {live.held}
+                </span>
+              )}
+            </div>
             <p className="hint">
-              space freeze · sliders/gizmo drive · [ ] pick joint, −/= jog · gamepad: sticks=tip,
-              A=pause, B=reset
+              space freeze · G grip · sliders/gizmo drive · [ ] pick joint, −/= jog · gamepad:
+              sticks=tip, A=pause, B=reset, X=grip
             </p>
             <div className="rec-row">
               <input

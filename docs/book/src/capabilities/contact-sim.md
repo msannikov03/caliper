@@ -90,6 +90,24 @@ Design points, stated plainly:
   response curve; A pauses, B resets). Space freezes and unfreezes. At most
   one target update is sent per rendered frame.
 
+**Grasping — a weld heuristic, stated plainly.** A live session with a
+gripper channel can pick props up, and it does it the way sim teleop rigs
+actually do: not finger-friction physics, but an explicitly-labeled **weld**.
+The gripper joint is auto-detected by name (`gripper`/`finger`/`jaw`/… on the
+joint *or its child link* — SO-101's joints are named `1`–`6`, the semantics
+live in the links; mimic joints are skipped so Panda resolves to the driving
+finger) or overridden explicitly; open/close is just a PD target move to the
+joint's limits (inset 2% so the hold target never slams a stop). When the
+gripper is *commanded* closed and a prop is in contact with the robot, the
+prop welds to the attach link — with its relative pose captured at that
+instant, so activation is snap-free (measured < 1 mm across the activation
+tick) — and opening releases it to fall naturally. One prop at a time; reset
+releases; a MuJoCo weld is a soft constraint, so a carried prop sags ~1–2 mm
+under a hard swing. Two honest limits: contact with *any* robot geom counts
+(a prop leaning on the forearm can be taken), and `closed` in the stream is
+the command, not a measurement — a gripper squeezing a prop reads closed
+while its joint never reaches the closed target.
+
 **Live vs. bake — both exist because they answer different questions.** A bake
 is a fixed command sequence through the deterministic sim: reproducible
 clip-for-clip, and the `C001`–`C003` stability lint runs over the finished

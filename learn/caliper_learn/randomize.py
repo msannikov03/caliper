@@ -293,6 +293,9 @@ def apply_to_env(draw: dict, env, index: int = 0) -> None:
         if off.shape != (env.ndof,):
             raise ValueError(f"spawn_offset shape {off.shape} != ({env.ndof},)")
         d = env._data[index]
-        d.qpos[:] = np.clip(d.qpos + off, env._bounds[:, 0], env._bounds[:, 1])
+        # The ROBOT's qpos entries only — a scene with props does not put them
+        # at the front (see the VecSimEnv doc on `_q_sel`).
+        sel = env._q_sel
+        d.qpos[sel] = np.clip(d.qpos[sel] + off, env._bounds[:, 0], env._bounds[:, 1])
     if ("camera_pos" in draw or "camera_euler" in draw) and env._scenes is not None:
         _apply_camera(env._scenes[index], draw.get("camera_pos"), draw.get("camera_euler"))

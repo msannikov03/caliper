@@ -79,6 +79,16 @@ Design points, stated plainly:
 - **Builtin fallback.** MuJoCo-free builds run the identical session on
   `PhysicsSimBackend` — gravity only: no contacts, no ground reaction, and
   props are rejected with a clear error rather than silently dropped.
+- **Driving it.** Every input edits the *PD hold target*, never the streamed
+  pose — the sim remains the single source of truth for where the arm is, so
+  input and stream cannot fight. Joint sliders become live target editors
+  (the measured pose is drawn as a ghost tick, making servo lag visible), the
+  IK gizmo retargets the tip (solutions seeded from the target, not the
+  lagging measurement, so consecutive drags compose), `[`/`]` select a joint
+  and `-`/`=`/arrows jog it at a rate scaled to the joint type, and a gamepad
+  drives the tip in cartesian world axes (0.15 stick deadband with a cubic
+  response curve; A pauses, B resets). Space freezes and unfreezes. At most
+  one target update is sent per rendered frame.
 
 **Live vs. bake — both exist because they answer different questions.** A bake
 is a fixed command sequence through the deterministic sim: reproducible

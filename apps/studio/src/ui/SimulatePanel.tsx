@@ -25,6 +25,7 @@ export function SimulatePanel() {
   const removeSimProp = useStore((s) => s.removeSimProp);
   const runContactSim = useStore((s) => s.runContactSim);
   const live = useStore((s) => s.live);
+  const liveDriving = useStore((s) => s.liveDriving);
   const startLive = useStore((s) => s.startLive);
   const stopLive = useStore((s) => s.stopLive);
   const pauseLive = useStore((s) => s.pauseLive);
@@ -33,8 +34,10 @@ export function SimulatePanel() {
   const noInertia = !robot.hasInertia;
   const driftPct = simTraj ? (simTraj.energyDrift * 100).toFixed(3) : null;
   const energyOk = simTraj ? simTraj.energyDrift < 1e-3 : false;
-  // without mujoco in the build, the panel renders EXACTLY as before: no
-  // toggle, no contact UI (pinned by the palette gating tests on the same flag)
+  // the engine segmented control is the ONE engine choice on this panel: it
+  // picks the contact-bake view AND the engine a live session starts on. Without
+  // mujoco in the build the Contact half is inert, so the contact UI below still
+  // never appears (the same flag the palette gating tests pin).
   const mujoco = hasContactEngine(simEngines);
   const contactView = mujoco && simEngine === "mujoco";
   // live contact readout: the count at the CURRENT playback instant, read from
@@ -45,26 +48,37 @@ export function SimulatePanel() {
     : null;
   // a live session streams the pose in; baking a clip over it would fight the
   // stream, so every rollout button goes inert until it is stopped
-  const liveEngine = mujoco ? "mujoco" : "builtin";
+  const liveEngine = contactView ? "mujoco" : "builtin";
   const bakeOff = noInertia || live !== null;
   const bakeTitle = (ready: string) =>
     live ? "stop live to bake" : noInertia ? "robot has no inertial data" : ready;
   return (
     <aside className="sim-panel">
       <h3>Simulate</h3>
-      {mujoco && (
-        <div className="segmented sim-engine">
-          <button
-            className={contactView ? "" : "active"}
-            onClick={() => setSimEngine("builtin")}
-          >
-            Builtin
-          </button>
-          <button className={contactView ? "active" : ""} onClick={() => setSimEngine("mujoco")}>
-            Contact
-          </button>
-        </div>
-      )}
+      <div className="segmented sim-engine">
+        <button
+          className={contactView ? "" : "active"}
+          disabled={live !== null}
+          title={live ? "stop the live session to switch engine" : "rigid-body engine"}
+          onClick={() => setSimEngine("builtin")}
+        >
+          Builtin
+        </button>
+        <button
+          className={contactView ? "active" : ""}
+          disabled={!mujoco || live !== null}
+          title={
+            !mujoco
+              ? "this build has no mujoco contact engine"
+              : live
+                ? "stop the live session to switch engine"
+                : "MuJoCo contacts + free props"
+          }
+          onClick={() => setSimEngine("mujoco")}
+        >
+          Contact
+        </button>
+      </div>
       <div className="live-block">
         <div className="sim-badges">
           {live && <span className="badge live">● LIVE</span>}
@@ -77,26 +91,41 @@ export function SimulatePanel() {
               {live.ncon > 0 ? `CONTACT ×${live.ncon}` : "no contact"}
             </span>
           )}
+          {live && liveDriving && (
+            <span className="badge live" title="an input is moving the hold target">
+              ⇢ driving
+            </span>
+          )}
         </div>
         {live ? (
-          <div className="live-controls">
-            <button
-              title={live.paused ? "resume integration" : "freeze integration"}
-              onClick={() => void pauseLive(!live.paused)}
-            >
-              {live.paused ? "▶ Resume" : "⏸ Pause"}
-            </button>
-            <button title="restart at the starting pose" onClick={() => void resetLive()}>
-              ↺ Reset
-            </button>
-            <button title="end the session" onClick={() => void stopLive()}>
-              ■ Stop
-            </button>
-          </div>
+          <>
+            <div className="live-controls">
+              <button
+                title={live.paused ? "resume integration (space)" : "freeze integration (space)"}
+                onClick={() => void pauseLive(!live.paused)}
+              >
+                {live.paused ? "▶ Resume" : "⏸ Pause"}
+              </button>
+              <button title="restart at the starting pose" onClick={() => void resetLive()}>
+                ↺ Reset
+              </button>
+              <button title="end the session" onClick={() => void stopLive()}>
+                ■ Stop
+              </button>
+            </div>
+            <p className="hint">
+              space freeze · sliders/gizmo drive · [ ] pick joint, −/= jog · gamepad: sticks=tip,
+              A=pause, B=reset
+            </p>
+          </>
         ) : (
           <button
             disabled={noInertia}
-            title={noInertia ? "robot has no inertial data" : "stream physics live from this pose"}
+            title={
+              noInertia
+                ? "robot has no inertial data"
+                : `stream physics live from this pose (${liveEngine})`
+            }
             onClick={() => void startLive()}
           >
             ◉ Start live

@@ -166,8 +166,14 @@ const STORE_RESET = {
   graphName: "",
   _graphRunId: 0,
   recentUrdfs: [] as string[],
+  simEngine: "builtin" as const,
+  simEngines: ["builtin"],
+  simProps: [],
   live: null,
   livePropPoses: [] as number[][],
+  liveTarget: [] as number[],
+  liveJoint: 0,
+  liveDriving: false,
 };
 
 beforeEach(() => {
@@ -896,7 +902,8 @@ describe("live session — store wiring", () => {
     });
   });
 
-  it("starts on the contact engine and adopts the session the backend returns", async () => {
+  it("starts on the engine the panel selected and adopts what the backend returns", async () => {
+    useStore.setState({ simEngine: "mujoco" });
     backend(mockStarted({ sessionId: 3 }));
 
     await useStore.getState().startLive();
@@ -913,7 +920,20 @@ describe("live session — store wiring", () => {
   });
 
   it("falls back to the builtin engine (and sends no props) without mujoco", async () => {
-    useStore.setState({ simEngines: ["builtin"] });
+    useStore.setState({ simEngine: "mujoco", simEngines: ["builtin"] });
+    backend(mockStarted({ engine: "builtin" }));
+
+    await useStore.getState().startLive();
+
+    expect(mockInvoke).toHaveBeenCalledWith("live_start", {
+      req: { q0: [0, 0], engine: "builtin", props: [] },
+    });
+  });
+
+  it("keeps builtin selectable on a build that HAS the contact engine", async () => {
+    // the panel's toggle is the only engine choice — a mujoco build that picks
+    // Builtin gets builtin (and its props stay behind, builtin rejects them)
+    useStore.setState({ simEngine: "builtin", simProps: [{ name: "box1" } as never] });
     backend(mockStarted({ engine: "builtin" }));
 
     await useStore.getState().startLive();
@@ -1055,5 +1075,255 @@ describe("live session — store wiring", () => {
     expect(s.live).toBeNull();
     expect(s.livePropPoses).toEqual([]);
     expect(s.error).toBe("backend gone");
+  });
+
+  // ---- the input layer: every source folds into ONE target per frame ----
+
+  /** Every live_set_target the store has sent, oldest first. */
+  function targetCalls(): number[][] {
+    return mockInvoke.mock.calls
+      .filter((c) => c[0] === "live_set_target")
+      .map((c) => (c[1] as { q: number[] }).q);
+  }
+
+  /** Install a gamepad for the drive step's navigator.getGamepads() poll. */
+  function withPad(axes: number[], buttons: boolean[] = []): void {
+    Object.defineProperty(navigator, "getGamepads", {
+      configurable: true,
+      value: () => [{ axes, buttons: buttons.map((pressed) => ({ pressed })) }],
+    });
+  }
+
+  /** Drain the microtask queue (the drive step's invokes are fire-and-forget). */
+  const settle = () => new Promise((r) => setTimeout(r, 0));
+
+  beforeEach(() => {
+    // no pad by default; jsdom has no Gamepad API of its own
+    Object.defineProperty(navigator, "getGamepads", { configurable: true, value: () => [] });
+  });
+
+  it("sends a slider edit once per frame, carrying the latest value", async () => {
+    backend(mockStarted());
+    await useStore.getState().startLive();
+    mockInvoke.mockClear();
+
+    useStore.getState().setLiveTargetJoint(1, 0.4);
+    useStore.getState().setLiveTargetJoint(1, 0.5);
+    expect(targetCalls()).toHaveLength(0); // the frame owns the send, not the event
+
+    _flushLive();
+
+    expect(targetCalls()).toEqual([[0, 0.5]]);
+    const s = useStore.getState();
+    expect(s.liveTarget).toEqual([0, 0.5]);
+    expect(s.liveJoint).toBe(1); // the slider you touched becomes the jog selection
+    expect(s.liveDriving).toBe(true);
+  });
+
+  it("clamps a slider edit into the joint's limit", async () => {
+    backend(mockStarted());
+    await useStore.getState().startLive();
+    mockInvoke.mockClear();
+
+    useStore.getState().setLiveTargetJoint(0, 99);
+    _flushLive();
+
+    expect(targetCalls()).toEqual([[Math.PI, 0]]);
+  });
+
+  it("never re-sends a target nothing moved", async () => {
+    backend(mockStarted());
+    await useStore.getState().startLive();
+    emit("live://state", mockState());
+    mockInvoke.mockClear();
+
+    _flushLive();
+    _flushLive();
+
+    expect(targetCalls()).toHaveLength(0);
+    expect(useStore.getState().liveDriving).toBe(false);
+  });
+
+  it("jogs the selected joint while its key is held, and stops on release", async () => {
+    backend(mockStarted());
+    await useStore.getState().startLive();
+    mockInvoke.mockClear();
+    useStore.getState().selectLiveJoint(1);
+    useStore.getState().liveJogKey("=", true);
+
+    _flushLive();
+
+    const [q] = targetCalls();
+    expect(q[0]).toBe(0); // only the selected joint moves
+    expect(q[1]).toBeGreaterThan(0);
+    expect(q[1]).toBeLessThanOrEqual(1.5 / 60); // ≤ one frame at the jog rate
+
+    useStore.getState().liveJogKey("=", false);
+    mockInvoke.mockClear();
+    _flushLive();
+    expect(targetCalls()).toHaveLength(0);
+  });
+
+  it("holds a jogged joint at its limit instead of running past it", async () => {
+    backend(mockStarted());
+    await useStore.getState().startLive();
+    mockInvoke.mockClear();
+    useStore.getState().setLiveTargetJoint(0, Math.PI); // pinned at the top stop
+    useStore.getState().liveJogKey("=", true);
+
+    _flushLive();
+
+    expect(targetCalls()).toEqual([[Math.PI, 0]]);
+    useStore.getState().liveJogKey("=", false);
+  });
+
+  it("ignores held keys while the session is frozen", async () => {
+    backend(mockStarted());
+    await useStore.getState().startLive();
+    emit("live://state", mockState({ paused: true }));
+    _flushLive();
+    mockInvoke.mockClear();
+    useStore.getState().liveJogKey("=", true);
+
+    _flushLive();
+
+    expect(targetCalls()).toHaveLength(0);
+    useStore.getState().liveJogKey("=", false);
+  });
+
+  it("turns a gamepad button press into the pause it stands for", async () => {
+    backend(mockStarted());
+    await useStore.getState().startLive();
+    mockInvoke.mockClear();
+    withPad([0, 0, 0, 0], [true]);
+
+    _flushLive();
+    expect(mockInvoke).toHaveBeenCalledWith("live_pause", { paused: true });
+
+    // held, not re-pressed: the edge already fired
+    mockInvoke.mockClear();
+    _flushLive();
+    expect(mockInvoke).not.toHaveBeenCalledWith("live_pause", expect.anything());
+  });
+
+  it("drives the tip through IK on a stick push and adopts the solution", async () => {
+    backend(mockStarted());
+    await useStore.getState().startLive();
+    emit("live://state", mockState()); // frames + the streamed tip land first
+    _flushLive();
+    mockInvoke.mockClear();
+    mockInvoke.mockImplementation(async (cmd: string) =>
+      cmd === "solve_ik_governed" ? { success: true, q: [0.5, -0.5], residual: 1e-7 } : undefined,
+    );
+    withPad([1, 0, 0, 0]); // left stick hard over: +X in URDF world
+
+    _flushLive();
+    await settle();
+
+    const ik = mockInvoke.mock.calls.find((c) => c[0] === "solve_ik_governed");
+    expect(ik).toBeDefined();
+    const req = (ik as [string, { req: { target: number[]; frame: string; seed: number[] } }])[1]
+      .req;
+    expect(req.frame).toBe("root"); // MOCK_ROBOT's tip frame
+    expect(req.target[12]).toBeGreaterThan(0.3); // pushed out from the streamed tip
+    expect(req.target[13]).toBe(0); // untouched axes keep the tip's own pose
+    expect(req.target[14]).toBe(0.2);
+
+    _flushLive();
+    const sent = targetCalls();
+    expect(sent[sent.length - 1]).toEqual([0.5, -0.5]);
+    // the IK reply is a TARGET only — the streamed pose is never overwritten
+    expect(useStore.getState().q).toEqual([0.1, 0.2]);
+  });
+
+  it("never loses the last tip target when a solve is still in flight", async () => {
+    backend(mockStarted());
+    await useStore.getState().startLive();
+    emit("live://state", mockState());
+    _flushLive();
+    mockInvoke.mockClear();
+    // the first solve hangs; the gizmo's drag-end asks for a second pose while
+    // it is still out (the case a plain busy-flag would have dropped)
+    let release: () => void = () => {};
+    mockInvoke.mockImplementation(async (cmd: string, args?: unknown) => {
+      if (cmd !== "solve_ik_governed") return undefined;
+      const t = (args as { req: { target: number[] } }).req.target[12];
+      if (t === 1) {
+        return new Promise((r) => {
+          release = () => r({ success: true, q: [1, 1], residual: 0 });
+        });
+      }
+      return { success: true, q: [2, 2], residual: 0 };
+    });
+    const pose = (x: number) => {
+      const m = new Array<number>(16).fill(0);
+      m[0] = m[5] = m[10] = m[15] = 1;
+      m[12] = x;
+      return m;
+    };
+
+    void useStore.getState().driveTipLive(pose(1));
+    void useStore.getState().driveTipLive(pose(2)); // stashed behind the first
+    release();
+    await settle();
+
+    _flushLive();
+    const sent = targetCalls();
+    expect(sent[sent.length - 1]).toEqual([2, 2]);
+  });
+
+  it("banners a live_set_target rejection once, not once per frame", async () => {
+    backend(mockStarted());
+    await useStore.getState().startLive();
+    mockInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "live_set_target") throw "no live session";
+      return undefined;
+    });
+
+    useStore.getState().setLiveTargetJoint(0, 0.2);
+    _flushLive();
+    await settle();
+    expect(useStore.getState().error).toBe("no live session");
+
+    useStore.setState({ error: null });
+    useStore.getState().setLiveTargetJoint(0, 0.3);
+    _flushLive();
+    await settle();
+    expect(useStore.getState().error).toBeNull(); // same message: already said
+  });
+
+  it("re-seeds the hold target from the stream after a reset", async () => {
+    backend(mockStarted());
+    await useStore.getState().startLive();
+    useStore.getState().setLiveTargetJoint(0, 0.4);
+    _flushLive();
+    expect(useStore.getState().liveTarget).toEqual([0.4, 0]);
+
+    await useStore.getState().resetLive();
+    mockInvoke.mockClear();
+    emit("live://state", mockState({ target: [0, 0] }));
+    _flushLive();
+
+    // the pre-reset target is forgotten, not re-asserted over the fresh session
+    expect(useStore.getState().liveTarget).toEqual([0, 0]);
+    expect(targetCalls()).toHaveLength(0);
+  });
+
+  it("drops every input scrap when the session ends", async () => {
+    backend(mockStarted());
+    await useStore.getState().startLive();
+    useStore.getState().setLiveTargetJoint(0, 0.4);
+    _flushLive();
+
+    emit("live://ended", { sessionId: 1, reason: "stopped" });
+
+    const s = useStore.getState();
+    expect(s.liveTarget).toEqual([]);
+    expect(s.liveDriving).toBe(false);
+    // and a slider that is still on screen for a frame cannot resurrect it
+    mockInvoke.mockClear();
+    useStore.getState().setLiveTargetJoint(0, 0.9);
+    _flushLive();
+    expect(targetCalls()).toHaveLength(0);
   });
 });

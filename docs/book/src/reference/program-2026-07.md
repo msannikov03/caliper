@@ -67,7 +67,8 @@ Studio. Only what is built is listed as built:
 | Phase | Status |
 |---|---|
 | **A1 — live sim session** | ✅ built — Studio's Simulate mode steps the sim (MuJoCo, or the builtin integrator in default builds) live in a background thread: fixed 1 ms timestep, PD hold target, ~60 Hz state stream, pause-as-freeze, deterministic reset, live contact count ([details](../capabilities/contact-sim.md#live-session-studio)) |
-| Input devices (drive the arm by hand) · teleop episode recording into LeRobotDataset v3.0 | ⏳ next phases — not built yet |
+| **A2 — input layer** | ✅ built — the live session is drivable: joint sliders edit the hold target (measured pose ghosted so PD lag is visible), IK gizmo retargets the tip live, keyboard jog (`[`/`]` select, `-`/`=`/arrows move), gamepad cartesian tip drive (deadband + cubic response, A = pause, B = reset), Space = freeze. Inputs write only the hold target — never the streamed pose — so input and stream cannot fight |
+| Teleop episode recording into LeRobotDataset v3.0 | ⏳ next phase — not built yet |
 
 ## Deliberately not built (traps the research flagged)
 

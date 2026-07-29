@@ -70,6 +70,13 @@ not releases); from `0.1.0` on, every release gets a proper entry.
   warmstart included) / Stop. Bake-then-replay stays for reproducible clips
   and the stability lint. First phase of the human-demonstration-loop
   program.
+- **Studio live-session input layer**: the live sim is drivable by hand —
+  joint sliders edit the PD hold target (measured pose drawn as a ghost tick,
+  so servo lag is visible), the IK gizmo retargets the tip live, `[`/`]`
+  select a joint and `-`/`=`/arrows jog it, a gamepad drives the tip in
+  cartesian (0.15 deadband, cubic response; A pauses, B resets), and Space
+  freezes/unfreezes. One target update per rendered frame; inputs write only
+  the hold target, never the streamed pose, so input and stream cannot fight.
 
 ### Changed
 - `caliper record` default dataset format is **v3.0** (was v2.1); the legacy

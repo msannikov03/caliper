@@ -26,6 +26,16 @@ import {
   liveStatePatch,
 } from "./sim/live";
 import type { LiveEndedEvent, LiveInfo, LiveStartedDto, LiveStateEvent } from "./sim/live";
+import {
+  applyJog,
+  applyTipVelocity,
+  clampJoint,
+  DRIVE_IDLE_MS,
+  gamepadIntent,
+  jogDelta,
+  jogDirection,
+} from "./sim/input";
+import type { GamepadIntent } from "./sim/input";
 import type { DataDoctorReport, DoctorReport } from "./doctor/doctor";
 
 // ---- wire types: mirror the serde structs in src-tauri/src/lib.rs exactly ----
@@ -337,8 +347,17 @@ export interface StudioState {
   /** latest streamed `[x,y,z,qw,qx,qy,qz]` per prop, indexed like `live.props`
    *  (build order, NOT time) — empty with no session */
   livePropPoses: number[][];
-  /** Start a session at the current pose (mujoco when the build has it, else
-   *  builtin). Drops any baked clip: the session owns the pose from here. */
+  /** the PD hold target the human drives (keyboard / sliders / gizmo / pad).
+   *  `q` is what the physics ACTUALLY reached; this is where it is being
+   *  pulled. Empty with no session. */
+  liveTarget: number[];
+  /** joint the keyboard jog moves (`[`/`]` select, `-`/`=` jog) */
+  liveJoint: number;
+  /** true while an input moved the target within the last DRIVE_IDLE_MS */
+  liveDriving: boolean;
+  /** Start a session at the current pose on the selected engine (`simEngine`,
+   *  falling back to builtin without a contact build). Drops any baked clip:
+   *  the session owns the pose from here. */
   startLive: () => Promise<void>;
   /** Ask the backend to stop; the "live://ended" event does the teardown. */
   stopLive: () => Promise<void>;
@@ -346,6 +365,20 @@ export interface StudioState {
   pauseLive: (paused: boolean) => Promise<void>;
   /** Restart the session at its original q0 (tick and t restart at 0). */
   resetLive: () => Promise<void>;
+  /** Slider path: edit one joint of the live hold target. The value lands on
+   *  the backend through the SAME per-frame drive step every other input uses
+   *  (at most one live_set_target per frame, latest value wins). */
+  setLiveTargetJoint: (i: number, v: number) => void;
+  /** Point the keyboard jog at joint `i` (clamped into the model). */
+  selectLiveJoint: (i: number) => void;
+  /** Track a held jog key (App's keydown/keyup); `down` false releases it. */
+  liveJogKey: (key: string, down: boolean) => void;
+  /** Release every held jog key (window blur — keyup never arrives). */
+  clearLiveJog: () => void;
+  /** Gizmo / gamepad path: solve IK for a tip pose (URDF world, column-major)
+   *  and adopt the solution as the live hold target. Unlike solveIkGoverned
+   *  this NEVER writes `q`/`frames` — the stream owns the pose. */
+  driveTipLive: (targetColMajor: Mat4) => Promise<void>;
 
   // control + collision (Phase 5)
   collision: CollisionDto | null;
@@ -450,6 +483,9 @@ export const useStore = create<StudioState>((set, get) => ({
   simProps: [],
   live: null,
   livePropPoses: [],
+  liveTarget: [],
+  liveJoint: 0,
+  liveDriving: false,
   collision: null,
   graphNodes: [],
   graphEdges: [],
@@ -536,6 +572,9 @@ export const useStore = create<StudioState>((set, get) => ({
   },
 
   async loadRobot(path) {
+    // a live session belongs to the model it was started on (its ndof, its
+    // props): a new robot ends it, exactly like leaving simulate mode does
+    if (get().live) void get().stopLive();
     // urdfPath is set up-front so Reload can re-attempt a failed load; any
     // doctor verdict describes a previous file, so it clears with the error
     set({
@@ -565,6 +604,10 @@ export const useStore = create<StudioState>((set, get) => ({
         // contact-sim state is per-robot (prop poses live in its workspace)
         simEngine: "builtin",
         simProps: [],
+        // live-drive state is ndof-bound
+        liveTarget: [],
+        liveJoint: 0,
+        liveDriving: false,
         // a new robot invalidates the (ndof-bound) graph
         graphNodes: [],
         graphEdges: [],
@@ -883,14 +926,15 @@ export const useStore = create<StudioState>((set, get) => ({
 
   // ---- live sim session (streamed, not baked) ----
   async startLive() {
-    const { q, robot, simProps, simEngines, live } = get();
+    const { q, robot, simProps, simEngine, simEngines, live } = get();
     if (!robot || live) return; // one session at a time (the backend agrees)
     if (!robot.hasInertia) {
       set({ error: "this robot has no inertial data" });
       return;
     }
-    // props are a contact-engine feature; builtin rejects them outright
-    const engine = hasContactEngine(simEngines) ? "mujoco" : "builtin";
+    // the panel's engine choice, minus what this build can actually run; props
+    // are a contact-engine feature and builtin rejects them outright
+    const engine = simEngine === "mujoco" && hasContactEngine(simEngines) ? "mujoco" : "builtin";
     // the session owns the pose: drop any baked clip and its playback clock
     stopClock();
     set({ traj: null, simTraj: null, playing: false, playhead: 0 });
@@ -902,7 +946,16 @@ export const useStore = create<StudioState>((set, get) => ({
       const dto = await invoke<LiveStartedDto>("live_start", {
         req: { q0: q, engine, props: engine === "mujoco" ? simProps : [] },
       });
-      set({ live: liveInfoFromStarted(dto), livePropPoses: [], error: null });
+      // the session holds q0 until a human drives it — seed the mirror from the
+      // pose we started at, so the first jog is a delta off THAT, not off zero
+      liveTargetMirror = q.slice();
+      set({
+        live: liveInfoFromStarted(dto),
+        livePropPoses: [],
+        liveTarget: q.slice(),
+        liveDriving: false,
+        error: null,
+      });
       // an event for this session may already be stashed ("keep" until now)
       scheduleLiveFlush(get, set);
     } catch (e) {
@@ -921,7 +974,7 @@ export const useStore = create<StudioState>((set, get) => ({
       // the session is unreachable — tear down here so the UI can't wedge
       set({ error: String(e) });
       stopLiveStream();
-      set({ live: null, livePropPoses: [] });
+      set({ live: null, livePropPoses: [], liveTarget: [], liveDriving: false });
     }
   },
   async pauseLive(paused) {
@@ -937,8 +990,73 @@ export const useStore = create<StudioState>((set, get) => ({
     if (!get().live) return;
     try {
       await invoke("live_reset", { q0: null });
+      // the backend re-pins its target to q0; forget ours so the next streamed
+      // event re-seeds it instead of re-asserting the pre-reset target
+      liveTargetMirror = null;
+      livePending = null;
+      liveTipGoal = null;
     } catch (e) {
       set({ error: String(e) });
+    }
+  },
+
+  setLiveTargetJoint(i, v) {
+    const { robot, live } = get();
+    if (!robot || !live || i < 0 || i >= robot.ndof) return;
+    const base = livePending ?? liveTargetMirror ?? get().liveTarget;
+    const next = (base.length === robot.ndof ? base : get().q).slice();
+    if (next.length !== robot.ndof) return;
+    next[i] = clampJoint(v, robot.limits[i], robot.jointKinds[i]);
+    livePending = next;
+    // paint the knob immediately (the invoke still rides the next frame), and
+    // let the slider you are touching become the keyboard-jog selection
+    set({ liveTarget: next, liveJoint: i });
+    scheduleLiveFlush(get, set);
+  },
+  selectLiveJoint(i) {
+    const ndof = get().robot?.ndof ?? 0;
+    if (ndof <= 0) return;
+    set({ liveJoint: Math.min(Math.max(i, 0), ndof - 1) });
+  },
+  liveJogKey(key, down) {
+    if (down) livePressed.add(key);
+    else livePressed.delete(key);
+    if (down && get().live) scheduleLiveFlush(get, set);
+  },
+  clearLiveJog() {
+    livePressed.clear();
+  },
+  async driveTipLive(targetColMajor) {
+    const { q, robot, live } = get();
+    if (!robot || !live) return;
+    if (liveIkBusy) {
+      // one solve at a time, but the LAST request always gets solved: a drag
+      // that ends while a solve is out must not lose its final pose
+      liveIkPending = targetColMajor;
+      return;
+    }
+    const frameName = robot.frames[robot.tip].name;
+    // seed off the TARGET, not the measured pose: consecutive drags then
+    // compose instead of fighting the PD lag
+    const seed = liveTargetMirror ?? (get().liveTarget.length === robot.ndof ? get().liveTarget : q);
+    liveIkBusy = true;
+    try {
+      const res = await invoke<IkSolution>("solve_ik_governed", {
+        req: { target: targetColMajor, seed, frame: frameName },
+      });
+      if (!get().live) return; // the session ended under us — nothing to drive
+      // NOTE: no q/frames write. The stream owns the pose, so an IK reply can
+      // never fight it; the solution is a new hold target and nothing else.
+      livePending = clampQ(res.q, robot.limits);
+      set({ ikOk: res.success, ikResidual: res.residual });
+      scheduleLiveFlush(get, set);
+    } catch (e) {
+      set({ error: String(e) });
+    } finally {
+      liveIkBusy = false;
+      const queued = liveIkPending;
+      liveIkPending = null;
+      if (queued && get().live) void get().driveTipLive(queued);
     }
   },
 
@@ -1787,34 +1905,218 @@ function onLiveEnded(
   // exactly this way
   if (cur ? ev.sessionId < cur.sessionId : liveStartsInFlight === 0) return;
   stopLiveStream();
-  set(liveEndedPatch(ev.reason));
+  set({ ...liveEndedPatch(ev.reason), liveTarget: [], liveDriving: false });
 }
 
 function scheduleLiveFlush(get: () => StudioState, set: (p: Partial<StudioState>) => void) {
   if (!liveRafId) liveRafId = requestAnimationFrame(() => flushLive(get, set));
 }
 
-/** One frame's worth of streamed state → one set(). */
+/** One frame's worth of streamed state AND of human input → one set().
+ *
+ *  This is the single per-frame rendezvous of the live session: the newest
+ *  streamed event lands, then `driveLive` folds every input source (held jog
+ *  keys, gamepad, slider/gizmo edits) into ONE hold target and sends at most
+ *  one live_set_target. While a session is up the loop free-runs at frame rate
+ *  rather than waiting on the stream — a frozen session emits no state events
+ *  at all, and the gamepad still has to be polled to unfreeze it. */
 function flushLive(get: () => StudioState, set: (p: Partial<StudioState>) => void) {
   liveRafId = 0;
   const cur = get().live;
   const ev = liveLatest;
+  let patch: Partial<StudioState> = {};
   switch (liveFlushFate(cur, ev)) {
     case "apply":
       liveLatest = null;
       // bump _reqId exactly like _applyTrajAt does: an in-flight get_frames or
       // solve_ik reply must not clobber the pose this event just installed
-      set({ ...liveStatePatch(cur!, ev!), _reqId: get()._reqId + 1 });
+      patch = { ...liveStatePatch(cur!, ev!), _reqId: get()._reqId + 1 };
+      // the backend's own view of the hold target is authoritative only while
+      // we have none of our own (session start, and after a reset)
+      if (!liveTargetMirror || liveTargetMirror.length !== ev!.target.length) {
+        liveTargetMirror = ev!.target.slice();
+        patch.liveTarget = liveTargetMirror;
+      }
+      liveTipActual = ev!.tip;
       break;
     case "keep":
       // the owning session is still being adopted (live_start reply in flight);
       // startLive re-schedules too, but keep trying so no frame is dropped
       scheduleLiveFlush(get, set);
-      break;
+      return; // nothing to drive until the session it describes is ours
     case "drop":
       liveLatest = null;
       break;
   }
+  const drive = driveLive(get, set);
+  const merged = { ...patch, ...drive };
+  if (Object.keys(merged).length > 0) set(merged);
+  if (get().live) scheduleLiveFlush(get, set); // free-run for as long as it lives
+}
+
+// ---- live input drive (keyboard · gamepad · sliders · gizmo) ----
+// Every source writes into module state here and the per-frame step above
+// reconciles them, so there is exactly ONE rAF and one invoke per frame no
+// matter how many inputs move at once.
+
+/** jog keys currently held (App's keydown/keyup feed this through the store) */
+const livePressed = new Set<string>();
+/** the hold target we believe the backend has; null = re-seed from the stream */
+let liveTargetMirror: number[] | null = null;
+/** a target edit from a slider or an IK reply, waiting for the next frame */
+let livePending: number[] | null = null;
+/** cartesian tip goal while the pad's sticks are pushed (URDF world, m) */
+let liveTipGoal: [number, number, number] | null = null;
+/** the tip the stream last reported — where a fresh tip goal starts from */
+let liveTipActual: [number, number, number] | null = null;
+/** previous frame's pad button state, for press-edge detection */
+let livePrevButtons: boolean[] = [];
+/** one tip-drive IK solve in flight (a second would only fight it) */
+let liveIkBusy = false;
+/** the tip pose asked for WHILE that solve was out — run last, latest wins */
+let liveIkPending: Mat4 | null = null;
+/** performance.now() of the previous drive step — the integrators' dt */
+let liveDriveT = 0;
+/** performance.now() of the last target change (the "driving" indicator) */
+let liveDriveAt = 0;
+/** last live_set_target rejection already banner'd (identical ones dedupe) */
+let liveDriveErr: string | null = null;
+
+/** The first connected gamepad, or null (no pad, or no Gamepad API at all —
+ *  jsdom and the odd webview). */
+function readGamepad(): Gamepad | null {
+  const pads = typeof navigator !== "undefined" ? navigator.getGamepads?.() : null;
+  if (!pads) return null;
+  for (const p of pads) if (p) return p;
+  return null;
+}
+
+/** Fold one frame of human input into the live hold target. Returns the store
+ *  patch for the caller's single set(); the invoke (if any) is fire-and-forget. */
+function driveLive(
+  get: () => StudioState,
+  set: (p: Partial<StudioState>) => void,
+): Partial<StudioState> {
+  const st = get();
+  const { live, robot } = st;
+  if (!live || !robot) return {};
+  const now = performance.now();
+  const dt = liveDriveT > 0 ? Math.min((now - liveDriveT) / 1000, 0.1) : 1 / 60;
+  liveDriveT = now;
+
+  // the pad first: its buttons freeze/reset the session, and those must work
+  // WHILE frozen (the physics thread is silent then — this loop is the only
+  // thing still running)
+  const pad = readGamepad();
+  let intent: GamepadIntent | null = null;
+  if (pad) {
+    const buttons = pad.buttons.map((b) => b.pressed);
+    intent = gamepadIntent(pad.axes, buttons, livePrevButtons);
+    livePrevButtons = buttons;
+    if (intent.togglePause) void get().pauseLive(!live.paused);
+    if (intent.reset) void get().resetLive();
+  } else if (livePrevButtons.length > 0) {
+    livePrevButtons = []; // pad unplugged: no phantom press-edge on re-plug
+  }
+
+  const patch: Partial<StudioState> = {};
+  // a slider/gizmo edit still lands while the session is frozen (an explicit
+  // "hold here" the physics will honour on resume); the CONTINUOUS inputs —
+  // held keys and sticks — go quiet instead of piling up motion behind the pause
+  let target = livePending;
+  livePending = null;
+  if (!live.paused) {
+    const base = target ?? liveTargetMirror;
+    // keyboard jog moves ONE selected joint per frame
+    const dir = jogDirection(livePressed);
+    if (base && dir !== 0 && robot.ndof > 0) {
+      const i = Math.min(Math.max(st.liveJoint, 0), robot.ndof - 1);
+      const deltas = new Array<number>(robot.ndof).fill(0);
+      deltas[i] = jogDelta(robot.jointKinds[i], dt, dir);
+      target = applyJog(base, deltas, robot.limits, robot.jointKinds);
+    }
+    // the pad's sticks drive the TIP, so they go through IK; the solution
+    // arrives asynchronously and lands in `livePending` for a later frame
+    driveTipFromPad(intent, dt, get);
+  } else {
+    liveTipGoal = null;
+  }
+
+  if (target && (!liveTargetMirror || !sameVec(target, liveTargetMirror))) {
+    liveTargetMirror = target;
+    liveDriveAt = now;
+    patch.liveTarget = target;
+    sendLiveTarget(target, set);
+  }
+  const driving = liveDriveAt > 0 && now - liveDriveAt < DRIVE_IDLE_MS;
+  if (driving !== st.liveDriving) patch.liveDriving = driving;
+  return patch;
+}
+
+/** Integrate the pad's cartesian velocity into a tip goal and ask IK for a
+ *  configuration that reaches it. The goal is seeded from the STREAMED tip and
+ *  dropped the moment the sticks centre, so it can never drift away from the
+ *  arm; orientation comes from the current tip frame (a position-only drive). */
+function driveTipFromPad(
+  intent: GamepadIntent | null,
+  dt: number,
+  get: () => StudioState,
+): void {
+  if (!intent || !intent.moving) {
+    liveTipGoal = null;
+    return;
+  }
+  const st = get();
+  const tipFrame = st.robot ? st.frames[st.robot.tip] : undefined;
+  if (!liveTipActual || !tipFrame || tipFrame.length !== 16) return;
+  liveTipGoal = applyTipVelocity(liveTipGoal ?? liveTipActual, intent.tip, dt);
+  if (liveIkBusy) return; // last frame's solve is still out — let it land first
+  // column-major 4x4: elements 12..14 are the translation, so the tip frame's
+  // CURRENT orientation rides along untouched
+  const m = tipFrame.slice();
+  m[12] = liveTipGoal[0];
+  m[13] = liveTipGoal[1];
+  m[14] = liveTipGoal[2];
+  void get().driveTipLive(m);
+}
+
+/** Ship the target. Fire-and-forget by design (it must never gate the frame);
+ *  a rejection banners ONCE per distinct message — at 60 Hz an unreachable
+ *  session would otherwise repaint the same error every frame. */
+function sendLiveTarget(q: number[], set: (p: Partial<StudioState>) => void): void {
+  void invoke("live_set_target", { q }).then(
+    () => {
+      liveDriveErr = null;
+    },
+    (e: unknown) => {
+      const msg = String(e);
+      if (msg === liveDriveErr) return;
+      liveDriveErr = msg;
+      set({ error: msg });
+    },
+  );
+}
+
+/** Element-wise equality of two same-length joint vectors. */
+function sameVec(a: number[], b: number[]): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+
+/** Drop every input-drive scrap (a session's target mirror outlives nothing). */
+function resetLiveDrive(): void {
+  livePressed.clear();
+  liveTargetMirror = null;
+  livePending = null;
+  liveTipGoal = null;
+  liveTipActual = null;
+  livePrevButtons = [];
+  liveIkBusy = false;
+  liveIkPending = null;
+  liveDriveT = 0;
+  liveDriveAt = 0;
+  liveDriveErr = null;
 }
 
 /** Tear the stream down: no pending flush, no stashed event, no listeners.
@@ -1828,6 +2130,7 @@ function stopLiveStream(): void {
   for (const un of liveUnlisten) un();
   liveUnlisten = [];
   liveSubscribed = false;
+  resetLiveDrive();
 }
 
 /** Apply the stashed state event NOW instead of on the next frame (test helper

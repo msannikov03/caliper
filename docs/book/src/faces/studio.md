@@ -55,6 +55,11 @@ Alongside the baked rollouts, Simulate mode runs a **live stepped session**:
   builds this is the full contact sim — free props supported, contact count
   shown live; default builds fall back to the builtin gravity integrator
   (no contacts, props rejected with a clear error).
+- **Drive it by hand** — while live, the joint sliders edit the PD hold
+  target (the measured pose rides along as a ghost tick so the servo lag is
+  visible), the IK gizmo drags the tip, `[`/`]` pick a joint and `-`/`=` or
+  the arrow keys jog it, and a gamepad drives the tip in cartesian (A pauses,
+  B resets). Space freezes/unfreezes.
 - **Pause** freezes the sim — stepping and the wall clock both stop, and the
   arm holds its pose. It is a freeze, not an e-stop: nothing is de-energized,
   so nothing falls.

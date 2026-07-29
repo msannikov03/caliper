@@ -25,6 +25,23 @@
   color: var(--accent);
 }
 
+/* --- live drive: the sliders edit the hold target, not the pose ---
+   The header line says so, and each track carries a second tick at the
+   MEASURED joint value so the PD lag is visible rather than invisible. */
+.joint-panel .jp-live {
+  color: var(--accent);
+  margin: -8px 0 12px;
+}
+.joint .j-actual-tick {
+  position: absolute;
+  top: -2px;
+  bottom: -2px;
+  width: 2px;
+  border-radius: 1px;
+  background: var(--accent-dim);
+  opacity: 0.85;
+}
+
 /* --- interactive slider laid transparently over the visual track ---
    The .j-fill / .j-knob render the value; this native range sits on
    top (invisible) purely to capture click + drag and dispatch setJoint. */

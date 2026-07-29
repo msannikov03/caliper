@@ -13,13 +13,23 @@ import { DISPLAY_UP, DISPLAY_UP_INV } from "../coords";
  * URDF world (T_tip). PivotControls reports its drag world matrix `w` =
  * DISPLAY_UP · T_target; we recover the URDF-world target with DISPLAY_UP_INV
  * and hand it to the engine. OrbitControls is disabled while dragging.
+ *
+ * Two destinations for that target:
+ *   - normally solveIkGoverned, which poses the robot directly;
+ *   - during a LIVE session driveTipLive, which turns it into the session's
+ *     hold target and never touches `q` — the stream owns the pose, so the two
+ *     can't fight. The handle also stops tracking the streamed tip for the
+ *     duration of a live drag (the arm is still converging on it; a handle that
+ *     chased the lagging tip would slide out from under the cursor).
  */
 export function IkGizmo() {
   const robot = useStore((s) => s.robot);
   const frames = useStore((s) => s.frames);
   const playing = useStore((s) => s.playing);
   const mode = useStore((s) => s.mode);
+  const live = useStore((s) => s.live);
   const solveIkGoverned = useStore((s) => s.solveIkGoverned);
+  const driveTipLive = useStore((s) => s.driveTipLive);
   const controls = useThree((s) => s.controls) as unknown as
     | { enabled: boolean }
     | undefined;
@@ -28,6 +38,9 @@ export function IkGizmo() {
   const raf = useRef(0);
   const lastWorld = useRef(new THREE.Matrix4());
   const tmp = useMemo(() => new THREE.Matrix4(), []);
+  // live drag only: the handle pose held still while the arm catches up
+  const dragging = useRef(false);
+  const held = useRef<THREE.Matrix4 | null>(null);
 
   // cancel any queued drag-follow rAF if we unmount mid-drag.
   useEffect(() => () => {
@@ -44,8 +57,15 @@ export function IkGizmo() {
     return m;
   }, [tipMat]);
 
-  // gizmo hidden during playback + in simulate mode (the sim owns the pose)
-  if (!robot || !tipMat || playing || mode === "simulate") return null;
+  // hidden during playback, and in simulate mode UNLESS a live session is up
+  // (then it retargets the running session instead of posing a static robot)
+  const liveDrive = mode === "simulate" && !!live;
+  if (!robot || !tipMat || playing || (mode === "simulate" && !liveDrive)) return null;
+
+  const send = (m: number[], snap: boolean) => {
+    if (liveDrive) void driveTipLive(m);
+    else void solveIkGoverned(m, snap);
+  };
 
   const queue = (w: THREE.Matrix4) => {
     if (raf.current) return;
@@ -54,14 +74,14 @@ export function IkGizmo() {
       raf.current = 0;
       // URDF-world target = DISPLAY_UP⁻¹ · (three-world gizmo matrix)
       tmp.copy(DISPLAY_UP_INV).multiply(world);
-      void solveIkGoverned(tmp.toArray(), false); // damped live-follow, no snap
+      send(tmp.toArray(), false); // damped live-follow, no snap
     });
   };
 
   return (
     <group matrixAutoUpdate={false} matrix={groupMatrix}>
       <PivotControls
-        matrix={pivotMatrix}
+        matrix={liveDrive && dragging.current ? (held.current ?? pivotMatrix) : pivotMatrix}
         autoTransform={false}
         disableScaling
         depthTest={false}
@@ -70,6 +90,8 @@ export function IkGizmo() {
         axisColors={["#ff5a5a", "#5aff7a", "#5a9bff"]}
         onDragStart={() => {
           if (controls) controls.enabled = false;
+          dragging.current = true;
+          held.current = pivotMatrix;
         }}
         onDrag={(_l, _dl, w) => {
           lastWorld.current.copy(w);
@@ -81,9 +103,12 @@ export function IkGizmo() {
             raf.current = 0;
           }
           if (controls) controls.enabled = true;
-          // exact final snap from the last drag world matrix (same path as queue)
+          dragging.current = false;
+          held.current = null;
+          // exact final target from the last drag world matrix (same path as
+          // queue); off-line that also snaps IK, live it is just the last word
           tmp.copy(DISPLAY_UP_INV).multiply(lastWorld.current);
-          void solveIkGoverned(tmp.toArray(), true);
+          send(tmp.toArray(), true);
         }}
       />
     </group>

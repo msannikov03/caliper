@@ -9,6 +9,7 @@ import { Toolbar, openUrdf } from "./ui/Toolbar";
 import { Palette } from "./ui/Palette";
 import { TourOverlay } from "./ui/Tour";
 import { MODE_TABS, modeNeedsRobot } from "./commands";
+import { isJogKey, liveKeyAction, stepJoint } from "./sim/input";
 import { JointPanel } from "./ui/JointPanel";
 import { Hud } from "./ui/Hud";
 import { SingularityHud } from "./ui/SingularityHud";
@@ -95,12 +96,35 @@ export default function App() {
   // ctrlKey accepted. Shortcuts are ignored while typing in a field — except
   // inside the palette, which stopPropagation()s the keys it consumes itself
   // and deliberately lets these chords fall through.
+  //
+  // A RUNNING live session claims the unmodified drive keys on top: Space
+  // freezes, `[`/`]` pick the jogged joint, `-`/`=`/↑/↓ jog it (held, so the
+  // store's per-frame drive step integrates them). preventDefault on Space
+  // matters twice — it stops the page scrolling AND stops a focused transport
+  // button from re-firing its own click.
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
       const t = e.target instanceof HTMLElement ? e.target : null;
       const typing = !!t?.closest("input, textarea, [contenteditable]");
       if (typing && !t?.closest(".cmdk")) return;
       const mod = e.metaKey || e.ctrlKey;
+      const st = useStore.getState();
+      if (!mod && st.live && st.mode === "simulate") {
+        const act = liveKeyAction(e.key);
+        if (act) {
+          e.preventDefault();
+          if (act === "freeze") {
+            if (!e.repeat) void st.pauseLive(!st.live.paused);
+          } else if (act === "jog") {
+            st.liveJogKey(e.key, true);
+          } else {
+            const step = act === "next-joint" ? 1 : -1;
+            st.selectLiveJoint(stepJoint(st.liveJoint, step, st.robot?.ndof ?? 0));
+          }
+          return;
+        }
+      }
+
       if (mod && (e.key === "k" || e.key === "K")) {
         e.preventDefault();
         setPaletteOpen((o) => !o);
@@ -111,7 +135,6 @@ export default function App() {
       } else if (mod && e.key >= "1" && e.key <= String(MODE_TABS.length)) {
         // single-digit string compare holds while MODE_TABS.length <= 9 (now 5)
         const tab = MODE_TABS[Number(e.key) - 1];
-        const st = useStore.getState();
         // mirror the ModeTabs gating: robot-bound tabs need a robot (Data does
         // not); simulate additionally needs inertia
         const okRobot = !modeNeedsRobot(tab.id) || !!st.robot;
@@ -123,8 +146,22 @@ export default function App() {
         setPaletteOpen(false);
       }
     }
+    // held-key release, unconditional: a session that ends (or a mode switch)
+    // mid-hold must not leave a joint jogging on the next one
+    function onKeyUp(e: KeyboardEvent) {
+      if (isJogKey(e.key)) useStore.getState().liveJogKey(e.key, false);
+    }
+    function onBlur() {
+      useStore.getState().clearLiveJog(); // no keyup arrives once focus is gone
+    }
     window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
+    window.addEventListener("keyup", onKeyUp);
+    window.addEventListener("blur", onBlur);
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      window.removeEventListener("keyup", onKeyUp);
+      window.removeEventListener("blur", onBlur);
+    };
   }, []);
 
   const isGraph = mode === "graph";

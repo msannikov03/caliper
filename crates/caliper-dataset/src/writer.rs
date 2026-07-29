@@ -564,6 +564,22 @@ impl DatasetWriter {
         self.buf_times.len()
     }
 
+    /// Throw away the frames buffered for the in-progress episode; nothing is
+    /// written and the dataset stays open for the next one. This is what an
+    /// interactive recorder needs when a take is invalidated part-way through
+    /// (the operator aborts, the sim is reset): without it those frames would
+    /// either be saved as a bogus episode or make
+    /// [`finalize`](Self::finalize) refuse to close the dataset.
+    pub fn discard_buffered(&mut self) {
+        for b in &mut self.buf {
+            match b {
+                FeatureBuf::Vector(v) => v.clear(),
+                FeatureBuf::Image(v) => v.clear(),
+            }
+        }
+        self.buf_times.clear();
+    }
+
     /// Flush everything and write the `meta/` sidecars. Errors if frames were
     /// buffered but never saved via [`save_episode`](Self::save_episode) — the
     /// `Drop` guard, by contrast, silently discards such frames because drop

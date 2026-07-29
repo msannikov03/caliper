@@ -1,7 +1,9 @@
 // Headless unit tests for the pure live-session helpers (src/sim/live.ts):
 // the adoption of a started session, the two-stage event filter (stash/drop at
 // arrival, apply/keep/drop at flush time) that keeps a ~60 Hz stream down to
-// one set() per frame, and the two store patches.
+// one set() per frame, the two store patches, and the recording slice (A3):
+// a dataset that outlives its takes, and the stream transition that is the
+// ONLY notice a take died without a command behind it.
 //
 // The interesting cases are all ORDERING ones: a state event can arrive before
 // the live_start reply that names its session, and an "ended" of a superseded
@@ -13,9 +15,12 @@ import {
   liveEndedPatch,
   liveFlushFate,
   liveInfoFromStarted,
+  liveRecAfterStop,
+  liveRecFromStarted,
+  liveRecPatch,
   liveStatePatch,
 } from "./live";
-import type { LiveInfo, LiveStartedDto, LiveStateEvent } from "./live";
+import type { LiveInfo, LiveRecInfo, LiveStartedDto, LiveStateEvent } from "./live";
 import type { PropTrack } from "./props";
 
 /** Static prop shape row as `live_start` returns it: no baked frames. */
@@ -69,6 +74,8 @@ function mockEvent(over: Partial<LiveStateEvent> = {}): LiveStateEvent {
     props: [[0, 0, 0.05, 1, 0, 0, 0]],
     paused: false,
     target: [0, 0],
+    recording: false,
+    recFrames: 0,
     ...over,
   };
 }
@@ -178,5 +185,120 @@ describe("liveEndedPatch", () => {
 
   it("treats an unrecognized reason as loud, not benign", () => {
     expect(liveEndedPatch("stopped ").error).toBe("live sim ended — stopped ");
+  });
+});
+
+// ---- recording (A3): the dataset outlives each take ----
+
+function mockRec(over: Partial<LiveRecInfo> = {}): LiveRecInfo {
+  return {
+    root: "/tmp/teleop_panda",
+    fps: 50,
+    recording: false,
+    task: null,
+    frames: 0,
+    episodesSaved: 0,
+    ...over,
+  };
+}
+
+describe("liveRecFromStarted", () => {
+  it("adopts the root the BACKEND named, not the one we asked with", () => {
+    const rec = liveRecFromStarted(
+      null,
+      { root: "/data/teleop", fps: 25, recordEvery: 20, episodeIndex: 0 },
+      "pick the cube",
+    );
+    expect(rec).toEqual({
+      root: "/data/teleop",
+      fps: 25,
+      recording: true,
+      task: "pick the cube",
+      frames: 0,
+      episodesSaved: 0,
+    });
+  });
+
+  it("keeps the episode count when the take continues the open dataset", () => {
+    const prev = mockRec({ root: "/data/teleop", episodesSaved: 3 });
+    const rec = liveRecFromStarted(
+      prev,
+      { root: "/data/teleop", fps: 50, recordEvery: 10, episodeIndex: 3 },
+      "again",
+    );
+    expect(rec.episodesSaved).toBe(3);
+    expect(rec.recording).toBe(true);
+  });
+
+  it("restarts the count when the reply names a different dataset", () => {
+    const prev = mockRec({ root: "/data/old", episodesSaved: 3 });
+    const rec = liveRecFromStarted(
+      prev,
+      { root: "/data/new", fps: 50, recordEvery: 10, episodeIndex: 0 },
+      "t",
+    );
+    expect(rec.episodesSaved).toBe(0);
+  });
+});
+
+describe("liveRecAfterStop", () => {
+  it("counts a saved take and ends it", () => {
+    const rec = liveRecAfterStop(mockRec({ recording: true, task: "t", frames: 120 }), {
+      saved: true,
+      episodeIndex: 0,
+      frames: 120,
+    });
+    expect(rec).toMatchObject({ recording: false, task: null, frames: 0, episodesSaved: 1 });
+  });
+
+  it("ends a discarded take without counting it", () => {
+    const rec = liveRecAfterStop(
+      mockRec({ recording: true, task: "t", frames: 40, episodesSaved: 2 }),
+      { saved: false, episodeIndex: null, frames: 40 },
+    );
+    expect(rec).toMatchObject({ recording: false, episodesSaved: 2 });
+  });
+});
+
+describe("liveRecPatch — the stream's view of the take", () => {
+  it("says nothing when no dataset is open", () => {
+    expect(liveRecPatch(null, mockEvent({ recording: true, recFrames: 9 }), true)).toEqual({
+      rec: null,
+      discarded: false,
+    });
+  });
+
+  it("counts the take's frames as they stream in", () => {
+    const prev = mockRec({ recording: true, task: "t", frames: 10 });
+    const ev = mockEvent({ recording: true, recFrames: 11 });
+    const { rec, discarded } = liveRecPatch(prev, ev, true);
+    expect(rec).toMatchObject({ recording: true, task: "t", frames: 11 });
+    expect(discarded).toBe(false);
+  });
+
+  it("returns the SAME slice when nothing moved (no repaint per streamed frame)", () => {
+    const prev = mockRec({ recording: true, task: "t", frames: 11 });
+    expect(liveRecPatch(prev, mockEvent({ recording: true, recFrames: 11 }), true).rec).toBe(prev);
+  });
+
+  it("reads an armed true→false transition as a take that died on its own", () => {
+    const prev = mockRec({ recording: true, task: "t", frames: 11 });
+    const { rec, discarded } = liveRecPatch(prev, mockEvent({ recording: false }), true);
+    expect(rec).toMatchObject({ recording: false, task: null, frames: 0 });
+    expect(discarded).toBe(true);
+  });
+
+  it("ignores a not-yet-armed false: it is an older event crossing the start reply", () => {
+    const prev = mockRec({ recording: true, task: "t", frames: 0 });
+    const { rec, discarded } = liveRecPatch(prev, mockEvent({ recording: false }), false);
+    expect(rec).toBe(prev);
+    expect(discarded).toBe(false);
+  });
+
+  it("stays quiet between takes (a stopped take does not discard twice)", () => {
+    const prev = mockRec({ episodesSaved: 1 });
+    const { rec, discarded } = liveRecPatch(prev, mockEvent({ recording: false }), true);
+    expect(rec).toBe(prev);
+    expect(discarded).toBe(false);
   });
 });

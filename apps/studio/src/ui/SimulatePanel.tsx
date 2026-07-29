@@ -1,4 +1,4 @@
-import { useStore } from "../store";
+import { REC_FPS_CHOICES, useStore } from "../store";
 import { frameIndexAt, hasContactEngine, MAX_PROPS } from "../sim/props";
 import "./panels.css";
 
@@ -30,6 +30,15 @@ export function SimulatePanel() {
   const stopLive = useStore((s) => s.stopLive);
   const pauseLive = useStore((s) => s.pauseLive);
   const resetLive = useStore((s) => s.resetLive);
+  const rec = useStore((s) => s.liveRec);
+  const recTask = useStore((s) => s.liveRecTask);
+  const recFps = useStore((s) => s.liveRecFps);
+  const recHint = useStore((s) => s.liveRecHint);
+  const recDone = useStore((s) => s.liveRecDone);
+  const recordStart = useStore((s) => s.recordStart);
+  const recordStop = useStore((s) => s.recordStop);
+  const recordFinish = useStore((s) => s.recordFinish);
+  const openRecordedDataset = useStore((s) => s.openRecordedDataset);
   if (mode !== "simulate" || !robot) return null;
   const noInertia = !robot.hasInertia;
   const driftPct = simTraj ? (simTraj.energyDrift * 100).toFixed(3) : null;
@@ -96,6 +105,11 @@ export function SimulatePanel() {
               ⇢ driving
             </span>
           )}
+          {rec?.recording && (
+            <span className="badge rec" title={`recording "${rec.task}" at ${rec.fps} fps`}>
+              ● REC
+            </span>
+          )}
         </div>
         {live ? (
           <>
@@ -106,7 +120,14 @@ export function SimulatePanel() {
               >
                 {live.paused ? "▶ Resume" : "⏸ Pause"}
               </button>
-              <button title="restart at the starting pose" onClick={() => void resetLive()}>
+              <button
+                title={
+                  rec?.recording
+                    ? "restart at the starting pose — DISCARDS the current take"
+                    : "restart at the starting pose"
+                }
+                onClick={() => void resetLive()}
+              >
                 ↺ Reset
               </button>
               <button title="end the session" onClick={() => void stopLive()}>
@@ -117,6 +138,80 @@ export function SimulatePanel() {
               space freeze · sliders/gizmo drive · [ ] pick joint, −/= jog · gamepad: sticks=tip,
               A=pause, B=reset
             </p>
+            <div className="rec-row">
+              <input
+                value={recTask}
+                disabled={rec?.recording}
+                placeholder="task label"
+                title="what this demonstration does — each episode carries its own"
+                onChange={(e) => useStore.setState({ liveRecTask: e.target.value })}
+              />
+              <select
+                value={recFps}
+                disabled={rec !== null}
+                title={
+                  rec
+                    ? "the open dataset's rate — finish it to record at another"
+                    : "recorded frames per second"
+                }
+                onChange={(e) => useStore.setState({ liveRecFps: Number(e.target.value) })}
+              >
+                {REC_FPS_CHOICES.map((f) => (
+                  <option key={f} value={f}>
+                    {f} fps
+                  </option>
+                ))}
+              </select>
+            </div>
+            {rec?.recording ? (
+              <div className="rec-take">
+                <button
+                  className="rec-stop"
+                  title="keep this take as an episode"
+                  onClick={() => void recordStop(true)}
+                >
+                  ■ stop take ({rec.frames} frames)
+                </button>
+                <button
+                  className="rec-drop"
+                  title="throw this take away"
+                  onClick={() => void recordStop(false)}
+                >
+                  discard
+                </button>
+              </div>
+            ) : (
+              <button
+                className="rec-arm"
+                disabled={!recTask.trim()}
+                title={
+                  recTask.trim()
+                    ? rec
+                      ? `record another episode into ${rec.root}`
+                      : "pick a dataset directory and record an episode"
+                    : "give the episode a task label first"
+                }
+                onClick={() => void recordStart(recTask, recFps)}
+              >
+                ● record
+              </button>
+            )}
+            {rec && rec.episodesSaved > 0 && (
+              <div className="rec-take">
+                <span className="badge" title={rec.root}>
+                  episodes: {rec.episodesSaved}
+                </span>
+                <button
+                  disabled={rec.recording}
+                  title={
+                    rec.recording ? "stop the take first" : "close the dataset (writes its meta/)"
+                  }
+                  onClick={() => void recordFinish()}
+                >
+                  finish dataset
+                </button>
+              </div>
+            )}
           </>
         ) : (
           <button
@@ -130,6 +225,22 @@ export function SimulatePanel() {
           >
             ◉ Start live
           </button>
+        )}
+        {/* both outlive the session: a take can die with it, and a finished
+            dataset is still worth opening after the session is gone */}
+        {recHint && <p className="hint rec-hint">{recHint}</p>}
+        {recDone && (
+          <div className="rec-done">
+            <p className="hint" title={recDone.root}>
+              {recDone.episodes} episode{recDone.episodes === 1 ? "" : "s"} → {recDone.root}
+            </p>
+            <button
+              title="browse the dataset in Data mode"
+              onClick={() => void openRecordedDataset()}
+            >
+              open in Data
+            </button>
+          </div>
         )}
       </div>
       {contactView ? (

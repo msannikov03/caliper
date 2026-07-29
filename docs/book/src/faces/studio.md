@@ -69,10 +69,16 @@ Alongside the baked rollouts, Simulate mode runs a **live stepped session**:
 - **Stop** ends the session. A stepping error also ends it, with the reason
   surfaced rather than a silent freeze.
 
+- **Record teleop episodes** — while live, pick a dataset folder, set a task
+  label and fps (default 50), and record takes straight into a native
+  LeRobotDataset v3.0: stop-and-save or discard per take, episode counter,
+  finish-dataset, then open the result in Data mode. Capture is exact tick
+  decimation in the sim thread (timestamps are `k/fps`, not wall-clock).
+  Reset discards the current take — a reset invalidates the demonstration.
+
 Bake-then-replay stays for what it is good at — reproducible clips and the
-`C001`–`C003` stability lint. Live is for watching and interacting; driving
-the robot by hand and recording teleop episodes into LeRobotDataset v3.0 are
-the next phases of the build program. Details and honest constraints:
+`C001`–`C003` stability lint. Live is for watching, driving, and recording
+demonstrations. Details and honest constraints:
 [Live session](../capabilities/contact-sim.md#live-session-studio).
 
 ## Launch

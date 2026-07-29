@@ -95,9 +95,21 @@ is a fixed command sequence through the deterministic sim: reproducible
 clip-for-clip, and the `C001`–`C003` stability lint runs over the finished
 rollout. A live session is paced by the wall clock and driven by whatever the
 UI sends, so it is for *watching and interacting*, not for reproducible
-artifacts. Driving the robot by hand during a live session and recording
-teleop episodes into native LeRobotDataset v3.0 datasets are the next phases
-of the [build program](../reference/program-2026-07.md).
+artifacts.
+
+**Recording teleop episodes.** While driving a live session you can record
+straight into a native [LeRobotDataset v3.0](./learning.md) — the same format
+the training side reads, no conversion step. Capture happens *in the session
+thread at exact tick decimation* (default 50 fps from the 1 kHz loop; any fps
+that divides the tick rate), writing `observation.state` (measured joints)
+and `action` (the PD hold target) per frame, so timestamps are exact
+`k/fps` — never wall-clock-sampled. A take is start/stop with a per-episode
+task label; stopping either saves the episode or discards it. Pausing
+mid-take freezes capture and resumes the same take with no timestamp gap.
+Resetting mid-take **discards the take** (a reset invalidates the
+demonstration) and says so. Ending the session finalizes the open dataset. A
+Studio-recorded dataset loads directly in real lerobot — verified against
+lerobot 0.6.0.
 
 The `live_*` Tauri commands and `live://` events behind this are
 **Studio-internal IPC, not a public API** — they fall in the same not-promised

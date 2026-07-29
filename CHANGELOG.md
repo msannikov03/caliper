@@ -77,6 +77,15 @@ not releases); from `0.1.0` on, every release gets a proper entry.
   cartesian (0.15 deadband, cubic response; A pauses, B resets), and Space
   freezes/unfreezes. One target update per rendered frame; inputs write only
   the hold target, never the streamed pose, so input and stream cannot fight.
+- **Studio teleop episode recording**: record takes from a live session
+  straight into a native LeRobotDataset v3.0 — capture happens in the sim
+  thread at exact tick decimation (default 50 fps from the 1 kHz loop), with
+  per-episode task labels, stop-and-save / discard, an episode counter,
+  finish-dataset, and open-in-Data. Pause freezes capture into the same take;
+  reset discards the take (a reset invalidates the demonstration); ending the
+  session finalizes the open dataset. Verified end-to-end: a Studio-recorded
+  dataset loads in real lerobot 0.6.0. Adds an additive
+  `DatasetWriter::discard_buffered` to `caliper-dataset`.
 
 ### Changed
 - `caliper record` default dataset format is **v3.0** (was v2.1); the legacy

@@ -1,6 +1,10 @@
 import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+// the ONE dialog the store opens itself: a take cannot start without a dataset
+// directory, and the recording state machine (root memory, take vs dataset
+// lifetime) is all here — splitting the picker out would split that in two.
+import { save as saveDialog } from "@tauri-apps/plugin-dialog";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import { applyNodeChanges, applyEdgeChanges, addEdge } from "@xyflow/react";
 import type { Connection, NodeChange, EdgeChange } from "@xyflow/react";
@@ -23,9 +27,21 @@ import {
   liveEndedPatch,
   liveFlushFate,
   liveInfoFromStarted,
+  liveRecAfterStop,
+  liveRecFromStarted,
+  liveRecPatch,
   liveStatePatch,
 } from "./sim/live";
-import type { LiveEndedEvent, LiveInfo, LiveStartedDto, LiveStateEvent } from "./sim/live";
+import type {
+  LiveEndedEvent,
+  LiveInfo,
+  LiveRecInfo,
+  LiveRecordFinishedDto,
+  LiveRecordStartedDto,
+  LiveRecordStoppedDto,
+  LiveStartedDto,
+  LiveStateEvent,
+} from "./sim/live";
 import {
   applyJog,
   applyTipVelocity,
@@ -237,6 +253,11 @@ export interface DatasetEpisodeSeries {
 /** Plot budget handed to `dataset_episode` (the backend decimates to <= this). */
 export const SERIES_MAX_POINTS = 1200;
 
+/** Teleop recording rate the panel offers; every one divides the tick rate. */
+export const REC_FPS_CHOICES = [25, 50, 100] as const;
+/** Default of those (and of `live_record_start` itself). */
+export const DEFAULT_REC_FPS = 50;
+
 export interface StudioState {
   // robot + configuration
   robot: RobotInfo | null;
@@ -380,6 +401,30 @@ export interface StudioState {
    *  this NEVER writes `q`/`frames` — the stream owns the pose. */
   driveTipLive: (targetColMajor: Mat4) => Promise<void>;
 
+  // teleop recording (A3) — a live session's frames stream into a LeRobot
+  // v3.0 dataset. The dataset outlives each take: takes append episodes to it
+  // until `recordFinish` closes it (or the session ends and the backend does).
+  /** the OPEN dataset + the take running into it, null when none is open */
+  liveRec: LiveRecInfo | null;
+  /** task label the NEXT take records under (panel-bound, survives a take) */
+  liveRecTask: string;
+  /** recording rate the next dataset is created at (25/50/100) */
+  liveRecFps: number;
+  /** recording-domain notice (take discarded, nothing captured) — not the
+   *  error banner: none of these mean a command failed */
+  liveRecHint: string | null;
+  /** a closed dataset waiting to be opened in Data mode */
+  liveRecDone: { root: string; episodes: number } | null;
+  /** Start a take. The first one picks the dataset directory (native save
+   *  dialog); every later take continues the dataset the backend named. */
+  recordStart: (task: string, fps?: number) => Promise<void>;
+  /** End the take, keeping its frames as an episode or throwing them away. */
+  recordStop: (save: boolean) => Promise<void>;
+  /** Close the dataset (writes `meta/`); refused while a take runs. */
+  recordFinish: () => Promise<void>;
+  /** Open the just-finished dataset in Data mode (ends the live session). */
+  openRecordedDataset: () => Promise<void>;
+
   // control + collision (Phase 5)
   collision: CollisionDto | null;
   runControl: (goal: number[]) => Promise<void>;
@@ -486,6 +531,11 @@ export const useStore = create<StudioState>((set, get) => ({
   liveTarget: [],
   liveJoint: 0,
   liveDriving: false,
+  liveRec: null,
+  liveRecTask: "teleop",
+  liveRecFps: DEFAULT_REC_FPS,
+  liveRecHint: null,
+  liveRecDone: null,
   collision: null,
   graphNodes: [],
   graphEdges: [],
@@ -955,6 +1005,9 @@ export const useStore = create<StudioState>((set, get) => ({
         liveTarget: q.slice(),
         liveDriving: false,
         error: null,
+        // whatever the LAST session's takes did is history now (a finished
+        // dataset keeps its notice — it is still worth opening)
+        liveRecHint: null,
       });
       // an event for this session may already be stashed ("keep" until now)
       scheduleLiveFlush(get, set);
@@ -1058,6 +1111,87 @@ export const useStore = create<StudioState>((set, get) => ({
       liveIkPending = null;
       if (queued && get().live) void get().driveTipLive(queued);
     }
+  },
+
+  // ---- teleop recording (A3) ----
+  async recordStart(task, fps) {
+    const { live, liveRec, robot } = get();
+    if (!live || liveRec?.recording) return;
+    const label = task.trim();
+    if (!label) return; // the panel keeps the button off; the backend agrees
+    // the first take picks the directory, later ones continue the dataset the
+    // backend named (its root, not the string we asked with)
+    let root = liveRec?.root ?? null;
+    if (!root) {
+      const picked = await saveDialog({
+        title: "Record teleop episodes into",
+        defaultPath: `teleop_${robot?.name ?? "robot"}`,
+      });
+      if (typeof picked !== "string") return; // dialog cancelled
+      root = picked;
+    }
+    liveRecArmed = false; // the stream has not confirmed THIS take yet
+    try {
+      const dto = await invoke<LiveRecordStartedDto>("live_record_start", {
+        req: { root, task: label, fps: fps ?? get().liveRecFps },
+      });
+      set({
+        liveRec: liveRecFromStarted(get().liveRec, dto, label),
+        liveRecHint: null,
+        liveRecDone: null,
+        error: null,
+      });
+    } catch (e) {
+      set({ error: String(e) });
+    }
+  },
+  async recordStop(save) {
+    if (!get().liveRec?.recording) return;
+    liveRecStopping = true; // a stream event flipping off is US, not a discard
+    try {
+      const dto = await invoke<LiveRecordStoppedDto>("live_record_stop", { save });
+      const rec = get().liveRec;
+      if (rec) {
+        set({
+          liveRec: liveRecAfterStop(rec, dto),
+          liveRecHint: dto.saved ? null : `take discarded — ${dto.frames} frames thrown away`,
+        });
+      }
+    } catch (e) {
+      // the backend refuses to SAVE a take that captured nothing, but the take
+      // is over either way ("an Err reports what became of the frames, it does
+      // not leave the take running") — never leave the panel recording
+      const rec = get().liveRec;
+      set({
+        liveRec: rec ? { ...rec, recording: false, task: null, frames: 0 } : rec,
+        liveRecHint: String(e),
+      });
+    } finally {
+      liveRecStopping = false;
+      liveRecArmed = false;
+    }
+  },
+  async recordFinish() {
+    const rec = get().liveRec;
+    if (!rec || rec.recording) return;
+    try {
+      const dto = await invoke<LiveRecordFinishedDto>("live_record_finish");
+      set({
+        liveRec: null,
+        liveRecHint: null,
+        liveRecDone: { root: dto.root, episodes: dto.episodes },
+      });
+    } catch (e) {
+      set({ error: String(e) });
+    }
+  },
+  async openRecordedDataset() {
+    const done = get().liveRecDone;
+    if (!done) return;
+    // Data mode is not simulate mode: this ends the live session on the way in
+    get().setMode("data");
+    set({ liveRecDone: null });
+    await get().openDataset(done.root);
   },
 
   // ---- control + collision (Phase 5) ----
@@ -1866,6 +2000,10 @@ let liveUnlisten: UnlistenFn[] = [];
 let liveSubscribed = false;
 /** live_start invokes awaiting a reply — lets events that beat it be stashed */
 let liveStartsInFlight = 0;
+/** the stream has confirmed the running take (see liveRecPatch's `armed`) */
+let liveRecArmed = false;
+/** a live_record_stop is out: the take is ending because WE asked it to */
+let liveRecStopping = false;
 
 async function subscribeLive(
   get: () => StudioState,
@@ -1904,8 +2042,19 @@ function onLiveEnded(
   // the one running now — the "superseded" end of a restarted session arrives
   // exactly this way
   if (cur ? ev.sessionId < cur.sessionId : liveStartsInFlight === 0) return;
+  const rec = get().liveRec;
   stopLiveStream();
-  set({ ...liveEndedPatch(ev.reason), liveTarget: [], liveDriving: false });
+  set({
+    ...liveEndedPatch(ev.reason),
+    liveTarget: [],
+    liveDriving: false,
+    // the backend finalizes an open dataset when the session ends, so what it
+    // wrote is a real dataset — keep the path reachable instead of dropping it
+    liveRec: null,
+    liveRecHint: rec?.recording ? "the session ended — the running take was discarded" : null,
+    liveRecDone:
+      rec && rec.episodesSaved > 0 ? { root: rec.root, episodes: rec.episodesSaved } : null,
+  });
 }
 
 function scheduleLiveFlush(get: () => StudioState, set: (p: Partial<StudioState>) => void) {
@@ -1938,6 +2087,7 @@ function flushLive(get: () => StudioState, set: (p: Partial<StudioState>) => voi
         patch.liveTarget = liveTargetMirror;
       }
       liveTipActual = ev!.tip;
+      applyLiveRec(ev!, get, patch);
       break;
     case "keep":
       // the owning session is still being adopted (live_start reply in flight);
@@ -1952,6 +2102,25 @@ function flushLive(get: () => StudioState, set: (p: Partial<StudioState>) => voi
   const merged = { ...patch, ...drive };
   if (Object.keys(merged).length > 0) set(merged);
   if (get().live) scheduleLiveFlush(get, set); // free-run for as long as it lives
+}
+
+/** Fold the event's recording fields into the frame's patch. A take can end
+ *  with no command behind it — `live_reset` auto-discards it and a rejected
+ *  frame kills it — so this transition IS the notification. */
+function applyLiveRec(
+  ev: LiveStateEvent,
+  get: () => StudioState,
+  patch: Partial<StudioState>,
+): void {
+  const prev = get().liveRec;
+  const { rec, discarded } = liveRecPatch(prev, ev, liveRecArmed && !liveRecStopping);
+  if (ev.recording) liveRecArmed = true;
+  if (rec !== prev) patch.liveRec = rec;
+  if (discarded) {
+    // one-shot by construction: the slice is not `recording` any more
+    liveRecArmed = false;
+    patch.liveRecHint = "take discarded — a reset or a write error ended it";
+  }
 }
 
 // ---- live input drive (keyboard · gamepad · sliders · gizmo) ----
@@ -2130,6 +2299,8 @@ function stopLiveStream(): void {
   for (const un of liveUnlisten) un();
   liveUnlisten = [];
   liveSubscribed = false;
+  liveRecArmed = false;
+  liveRecStopping = false;
   resetLiveDrive();
 }
 

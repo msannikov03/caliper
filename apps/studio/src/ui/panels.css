@@ -156,6 +156,113 @@
   background: var(--raised-2);
 }
 
+/* --- simulate panel: teleop recording (A3) ---
+   Sits under the live transport and borrows its secondary-chrome treatment;
+   the ONE exception is the record control, which is red and pulses while a
+   take is running so the panel can never look idle mid-episode. */
+.sim-panel .rec-row {
+  display: flex;
+  gap: 6px;
+}
+.sim-panel .rec-row input,
+.sim-panel .rec-row select {
+  min-width: 0;
+  background: var(--base);
+  border: 1px solid var(--border-2);
+  border-radius: var(--r-sm);
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 10.5px;
+  padding: 4px 7px;
+  outline: none;
+}
+.sim-panel .rec-row input {
+  flex: 1;
+}
+.sim-panel .rec-row input:focus,
+.sim-panel .rec-row select:focus {
+  border-color: var(--accent);
+}
+.sim-panel .rec-row input:disabled,
+.sim-panel .rec-row select:disabled {
+  opacity: 0.5;
+}
+.sim-panel .rec-take {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.sim-panel .rec-take .badge {
+  flex: 1;
+}
+.sim-panel .rec-take button {
+  background: var(--raised);
+  border: 1px solid var(--border-2);
+  color: var(--text);
+  font-weight: 500;
+  padding: 4px 9px;
+}
+.sim-panel .rec-take button:hover:not(:disabled) {
+  background: var(--raised-2);
+}
+.sim-panel .rec-take button.rec-drop:hover:not(:disabled) {
+  color: var(--singular);
+}
+.sim-panel .rec-arm,
+.sim-panel .rec-take button.rec-stop {
+  flex: 1;
+  background: var(--singular);
+  border-color: transparent;
+  color: #fff;
+  font-weight: 600;
+}
+.sim-panel .rec-arm:hover:not(:disabled),
+.sim-panel .rec-take button.rec-stop:hover:not(:disabled) {
+  background: #ff7683;
+}
+/* only the RUNNING take pulses — an armed-but-idle panel stays still */
+.sim-panel .rec-take button.rec-stop,
+.sim-panel .badge.rec {
+  animation: recpulse 1s infinite alternate;
+}
+.sim-panel .badge.rec {
+  color: var(--singular);
+  border-color: rgba(255, 92, 108, 0.3);
+}
+@keyframes recpulse {
+  from {
+    opacity: 0.62;
+  }
+  to {
+    opacity: 1;
+  }
+}
+.sim-panel .rec-hint {
+  color: var(--singular);
+}
+.sim-panel .rec-done {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.sim-panel .rec-done .hint {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap; /* a long root elides; the title carries it in full */
+}
+.sim-panel .rec-done button {
+  background: var(--raised);
+  border: 1px solid var(--border-2);
+  color: var(--text);
+  font-weight: 500;
+  padding: 4px 9px;
+}
+.sim-panel .rec-done button:hover:not(:disabled) {
+  background: var(--raised-2);
+}
+
 /* --- simulate panel: compact free-prop list (contact view) --- */
 .sim-panel .prop-add {
   display: flex;

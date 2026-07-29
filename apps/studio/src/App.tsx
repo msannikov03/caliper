@@ -105,7 +105,7 @@ export default function App() {
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
       const t = e.target instanceof HTMLElement ? e.target : null;
-      const typing = !!t?.closest("input, textarea, [contenteditable]");
+      const typing = !!t?.closest("input, textarea, select, [contenteditable]");
       if (typing && !t?.closest(".cmdk")) return;
       const mod = e.metaKey || e.ctrlKey;
       const st = useStore.getState();

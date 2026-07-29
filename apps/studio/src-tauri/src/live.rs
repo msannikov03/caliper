@@ -11,10 +11,18 @@
 //! [`CATCHUP_CAP_S`] — a stall drops sim time instead of spiraling. Pause stops
 //! BOTH stepping and time accumulation (the arm is frozen mid-physics, never
 //! de-energized — `disable`/`estop` would let it fall).
+//!
+//! Teleop recording (A3) rides the same thread: while the human drives the live
+//! sim, `live_record_*` streams the control loop's own [`Frame`]s into a native
+//! LeRobotDataset v3.0 at an exact tick decimation — every `(1/h)/fps` ticks,
+//! one frame, so per-episode timestamps are exactly `frame_index / fps` with no
+//! resampling. The [`DatasetWriter`] lives in the session thread; commands hand
+//! it work through [`LiveShared`] and wait for a reply slot.
 
 use crate::{bake_frame_row, logged, AppState, PropDto, PropTrackDto};
-use caliper::hal::{ControlLoop, Gains, PhysicsSimBackend, TeleopSetpoint};
+use caliper::hal::{ControlLoop, Frame, Gains, PhysicsSimBackend, TeleopSetpoint};
 use caliper::model::Model;
+use caliper_dataset::{DatasetSpec, DatasetWriter, FeatureSpec};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -23,6 +31,14 @@ use std::time::{Duration, Instant};
 
 /// Maximum wall-clock debt (s) the pacer will convert into catch-up steps.
 const CATCHUP_CAP_S: f64 = 0.25;
+
+/// Recording rate used when a `live_record_start` omits `fps`.
+const DEFAULT_RECORD_FPS: u32 = 50;
+
+/// How long a recording command waits for the session thread to service its
+/// request. Generous next to a step batch (bounded by [`CATCHUP_CAP_S`]) and
+/// still short enough that a wedged thread surfaces as an error, not a hang.
+const REC_REPLY_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Monotonic session ids across the process lifetime.
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
@@ -79,6 +95,10 @@ pub struct LiveStateEvent {
     props: Vec<[f64; 7]>,
     paused: bool,
     target: Vec<f64>,
+    /// A take is in progress (A3) — the UI badges the viewport.
+    recording: bool,
+    /// Frames captured in the current take; 0 when not recording.
+    rec_frames: u64,
 }
 
 #[derive(Serialize, Clone)]
@@ -98,6 +118,61 @@ pub struct LiveStatusDto {
     t: f64,
     tick: u64,
     ndof: usize,
+    /// A take is in progress; `live_record_status` has the detail.
+    recording: bool,
+}
+
+// ===== recording wire types (A3) =====
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LiveRecordStartReq {
+    /// Dataset directory to create (first call) / continue recording into.
+    root: String,
+    /// Task label for THIS episode (each take carries its own).
+    task: String,
+    /// Recording rate; must divide the tick rate exactly. Default 50.
+    fps: Option<u32>,
+}
+
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct LiveRecordStartedDto {
+    root: String,
+    fps: u32,
+    /// Physics ticks per recorded frame: `(1/h)/fps`.
+    record_every: u64,
+    /// 0-based index this episode gets when saved.
+    episode_index: usize,
+}
+
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct LiveRecordStoppedDto {
+    saved: bool,
+    /// Index of the saved episode; null for a discarded take.
+    episode_index: Option<usize>,
+    /// Frames that were in the take (saved or thrown away).
+    frames: usize,
+}
+
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct LiveRecordFinishedDto {
+    root: String,
+    episodes: usize,
+}
+
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct LiveRecordStatusDto {
+    root: String,
+    fps: u32,
+    recording: bool,
+    /// Task label of the take in progress; null between takes.
+    task: Option<String>,
+    buffered_frames: usize,
+    episodes_saved: usize,
 }
 
 // ===== emission seam (testable without a Tauri app) =====
@@ -128,6 +203,54 @@ struct LiveStatusInner {
     tick: u64,
 }
 
+/// One recording command handed to the session thread. The thread services at
+/// most one per loop iteration (including while paused) and answers in
+/// `rec_reply`.
+enum RecRequest {
+    /// Begin a take. `writer` is `Some` only on the call that OPENS the
+    /// dataset — it is created in the command so root/spec errors surface
+    /// synchronously — and `None` for every later take on the same dataset.
+    Start {
+        writer: Option<Box<DatasetWriter>>,
+        root: String,
+        fps: u32,
+        record_every: u64,
+        task: String,
+    },
+    /// End the take: `save` writes it as an episode, else it is thrown away.
+    Stop { save: bool },
+    /// Close the dataset (refused mid-take).
+    Finish,
+}
+
+/// The thread's answer to one [`RecRequest`].
+enum RecReply {
+    Started {
+        episode_index: usize,
+    },
+    Stopped {
+        saved: bool,
+        episode_index: Option<usize>,
+        frames: usize,
+    },
+    Finished {
+        root: String,
+        episodes: usize,
+    },
+}
+
+/// The thread-owned recorder, mirrored out for commands and state events. The
+/// live counters (`recording`, `rec_frames`) are atomics because every state
+/// event reads them.
+#[derive(Clone)]
+struct RecMirror {
+    root: String,
+    fps: u32,
+    /// `Some` while a take is recording (that episode's task label).
+    task: Option<String>,
+    episodes_saved: usize,
+}
+
 pub(crate) struct LiveShared {
     stop: AtomicBool,
     /// Selects the ended reason when `stop` is raised by a superseding start.
@@ -138,6 +261,17 @@ pub(crate) struct LiveShared {
     target: Mutex<Vec<f64>>,
     reset_req: Mutex<Option<Vec<f64>>>,
     status: Mutex<LiveStatusInner>,
+    /// Pending recording request / its reply. One in flight at a time — the
+    /// commands serialize themselves on `rec_gate` before touching either.
+    rec_req: Mutex<Option<RecRequest>>,
+    rec_reply: Mutex<Option<Result<RecReply, String>>>,
+    /// Held by a recording command for its whole request→reply cycle. NEVER
+    /// taken by the session thread, so it cannot deadlock against it.
+    rec_gate: Mutex<()>,
+    /// What the thread's writer looks like right now; `None` = no dataset open.
+    rec_mirror: Mutex<Option<RecMirror>>,
+    recording: AtomicBool,
+    rec_frames: AtomicU64,
 }
 
 impl LiveShared {
@@ -150,6 +284,12 @@ impl LiveShared {
             target: Mutex::new(q0),
             reset_req: Mutex::new(None),
             status: Mutex::new(LiveStatusInner::default()),
+            rec_req: Mutex::new(None),
+            rec_reply: Mutex::new(None),
+            rec_gate: Mutex::new(()),
+            rec_mirror: Mutex::new(None),
+            recording: AtomicBool::new(false),
+            rec_frames: AtomicU64::new(0),
         }
     }
 }
@@ -160,6 +300,8 @@ pub(crate) struct LiveSession {
     id: u64,
     engine: &'static str,
     ndof: usize,
+    /// Physics timestep (s) — recording decimates against its tick rate.
+    h: f64,
     /// Initial pose — the `live_reset(None)` restore point.
     q0: Vec<f64>,
     shared: Arc<LiveShared>,
@@ -211,11 +353,14 @@ enum LiveEngine {
 }
 
 impl LiveEngine {
-    fn step(&mut self, sp: &mut TeleopSetpoint) -> Result<(), String> {
+    /// One control step. Returns the loop's own [`Frame`] — `measured` is the
+    /// state read before the command (`observation.state`), `command` the
+    /// commanded target (`action`) — which is exactly what recording writes.
+    fn step(&mut self, sp: &mut TeleopSetpoint) -> Result<Frame, String> {
         match self {
-            LiveEngine::Builtin(l) => l.step(sp, None).map(|_| ()).map_err(|e| e.to_string()),
+            LiveEngine::Builtin(l) => l.step(sp, None).map_err(|e| e.to_string()),
             #[cfg(feature = "mujoco")]
-            LiveEngine::Mujoco(l) => l.step(sp, None).map(|_| ()).map_err(|e| e.to_string()),
+            LiveEngine::Mujoco(l) => l.step(sp, None).map_err(|e| e.to_string()),
         }
     }
 
@@ -288,6 +433,250 @@ impl LiveEngine {
     }
 }
 
+// ===== recording (thread-side) =====
+
+/// The open dataset plus the take in progress. Lives in the session thread for
+/// its whole life: the writer is never touched from a command, so appends stay
+/// on the tick path with no lock contention and no torn episodes.
+struct Recorder {
+    writer: DatasetWriter,
+    /// Root exactly as the command supplied it (what status/`Started` echo).
+    root: String,
+    fps: u32,
+    /// Physics ticks per recorded frame — the exact decimation.
+    record_every: u64,
+    /// `Some(task)` while a take is recording.
+    task: Option<String>,
+    /// Joint count the writer's features were sized to.
+    ndof: usize,
+}
+
+impl Recorder {
+    /// Append one control frame as `observation.state` / `action`.
+    fn append(&mut self, f: &Frame) -> Result<(), String> {
+        if f.measured.len() != self.ndof || f.command.len() != self.ndof {
+            return Err(format!(
+                "control frame carries {} measured / {} commanded values but the dataset \
+                 was opened for {} joints",
+                f.measured.len(),
+                f.command.len(),
+                self.ndof
+            ));
+        }
+        self.writer
+            .add_frame(&[
+                ("observation.state", f.measured.as_slice()),
+                ("action", f.command.as_slice()),
+            ])
+            .map_err(|e| e.to_string())
+    }
+
+    /// Abandon the take in progress; the dataset stays open. Returns the frame
+    /// count that was thrown away.
+    fn discard_take(&mut self) -> usize {
+        let n = self.writer.buffered_frames();
+        self.writer.discard_buffered();
+        self.task = None;
+        n
+    }
+}
+
+/// Publish the recorder's state for commands (`rec_mirror`) and state events
+/// (the atomics). Called on every transition — never per appended frame.
+fn publish_rec(shared: &LiveShared, rec: Option<&Recorder>) {
+    let (recording, frames) = match rec {
+        Some(r) => (r.task.is_some(), r.writer.buffered_frames() as u64),
+        None => (false, 0),
+    };
+    shared.recording.store(recording, Ordering::Relaxed);
+    shared.rec_frames.store(frames, Ordering::Relaxed);
+    if let Ok(mut m) = shared.rec_mirror.lock() {
+        *m = rec.map(|r| RecMirror {
+            root: r.root.clone(),
+            fps: r.fps,
+            task: r.task.clone(),
+            episodes_saved: r.writer.total_episodes(),
+        });
+    }
+}
+
+/// Offer one stepped frame to the recorder, appending it when the tick lands on
+/// the decimation boundary. A rejected frame would leave a hole in the take, so
+/// the take is dropped (the dataset stays open) and the UI sees recording go
+/// false — loud in the log, never a panic on the sim thread.
+fn record_tick(shared: &LiveShared, rec: &mut Option<Recorder>, frame: &Frame) {
+    let Some(r) = rec.as_mut() else { return };
+    if r.task.is_none() || !frame.tick.is_multiple_of(r.record_every) {
+        return;
+    }
+    match r.append(frame) {
+        Ok(()) => {
+            shared
+                .rec_frames
+                .store(r.writer.buffered_frames() as u64, Ordering::Relaxed);
+            return;
+        }
+        Err(e) => {
+            let n = r.discard_take();
+            log::error!(
+                target: "studio::live",
+                "recording aborted after {n} frames — the frame was rejected: {e}"
+            );
+        }
+    }
+    publish_rec(shared, rec.as_ref());
+}
+
+/// Service at most one pending recording request. Runs in the session thread,
+/// including while paused, so a take can be stopped without resuming first.
+fn service_rec(shared: &LiveShared, rec: &mut Option<Recorder>, ndof: usize) {
+    let Some(req) = shared.rec_req.lock().ok().and_then(|mut r| r.take()) else {
+        return;
+    };
+    let reply = match req {
+        RecRequest::Start {
+            writer,
+            root,
+            fps,
+            record_every,
+            task,
+        } => match writer {
+            // Opening call: the command already validated the root and built
+            // the writer. (A second one while a dataset is open is refused in
+            // the command; guarded here too so a writer is never stranded.)
+            Some(w) if rec.is_none() => {
+                *rec = Some(Recorder {
+                    writer: *w,
+                    root,
+                    fps,
+                    record_every,
+                    task: Some(task),
+                    ndof,
+                });
+                Ok(RecReply::Started { episode_index: 0 })
+            }
+            Some(_) => Err("a dataset is already open — finish it first".into()),
+            None => match rec.as_mut() {
+                None => Err("no dataset open".into()),
+                Some(r) if r.task.is_some() => {
+                    Err("a take is already recording — stop it first".into())
+                }
+                Some(r) => {
+                    r.task = Some(task);
+                    Ok(RecReply::Started {
+                        episode_index: r.writer.total_episodes(),
+                    })
+                }
+            },
+        },
+        RecRequest::Stop { save } => match rec.as_mut() {
+            None => Err("no dataset open".into()),
+            // The take ends either way — an error below reports what happened
+            // to its frames, it does not resume recording.
+            Some(r) => match r.task.take() {
+                None => Err("not recording".into()),
+                Some(task) => {
+                    let frames = r.writer.buffered_frames();
+                    if !save {
+                        r.writer.discard_buffered();
+                        Ok(RecReply::Stopped {
+                            saved: false,
+                            episode_index: None,
+                            frames,
+                        })
+                    } else if frames == 0 {
+                        Err(
+                            "the take captured no frames — nothing to save (was the sim \
+                             paused the whole time?)"
+                                .into(),
+                        )
+                    } else {
+                        match r.writer.save_episode(&task) {
+                            Ok(()) => Ok(RecReply::Stopped {
+                                saved: true,
+                                episode_index: Some(r.writer.total_episodes() - 1),
+                                frames,
+                            }),
+                            Err(e) => {
+                                r.writer.discard_buffered();
+                                Err(format!("saving the episode failed: {e}"))
+                            }
+                        }
+                    }
+                }
+            },
+        },
+        RecRequest::Finish => match rec.take() {
+            None => Err("no dataset open".into()),
+            Some(r) if r.task.is_some() => {
+                *rec = Some(r);
+                Err("stop the take first, then finish the dataset".into())
+            }
+            Some(r) => {
+                let episodes = r.writer.total_episodes();
+                match r.writer.finalize() {
+                    Ok(root) => Ok(RecReply::Finished {
+                        root: root.display().to_string(),
+                        episodes,
+                    }),
+                    Err(e) => Err(format!("finalizing the dataset failed: {e}")),
+                }
+            }
+        },
+    };
+    publish_rec(shared, rec.as_ref());
+    if let Ok(mut slot) = shared.rec_reply.lock() {
+        *slot = Some(reply);
+    }
+}
+
+/// Close an open dataset at session end: an interrupted take is never
+/// half-saved, but whatever WAS saved must land on disk readable. Best effort —
+/// a failure here is logged and must not stop the thread from exiting.
+fn close_recorder(shared: &LiveShared, rec: &mut Option<Recorder>) {
+    let Some(mut r) = rec.take() else { return };
+    if r.task.is_some() {
+        let n = r.discard_take();
+        log::warn!(
+            target: "studio::live",
+            "live session ended mid-take — {n} unsaved frames discarded"
+        );
+    }
+    if let Err(e) = r.writer.finalize() {
+        log::warn!(target: "studio::live", "finalizing the recording dataset failed: {e}");
+    }
+    publish_rec(shared, None);
+}
+
+/// Physics ticks per recorded frame. The tick rate must be an exact integer
+/// multiple of `fps`: anything else would drift the real sample times away from
+/// the `frame_index / fps` timestamps the dataset stores.
+fn record_every(h: f64, fps: u32) -> Result<u64, String> {
+    if fps == 0 {
+        return Err("fps must be positive".into());
+    }
+    let rate = 1.0 / h;
+    if !rate.is_finite() || (rate - rate.round()).abs() > 1e-6 || rate.round() < 1.0 {
+        return Err(format!(
+            "this engine's tick rate ({rate:.4} Hz) is not a whole number — recording needs \
+             an integer tick rate"
+        ));
+    }
+    let rate = rate.round() as u64;
+    if !rate.is_multiple_of(u64::from(fps)) {
+        let ok: Vec<String> = [10u64, 20, 25, 50, 100, 125, 200, 250, 500, 1000]
+            .iter()
+            .filter(|d| **d <= rate && rate.is_multiple_of(**d))
+            .map(|d| d.to_string())
+            .collect();
+        return Err(format!(
+            "fps {fps} must divide the {rate} Hz tick rate exactly (try {})",
+            ok.join(", ")
+        ));
+    }
+    Ok(rate / u64::from(fps))
+}
+
 // ===== the session loop =====
 
 fn set_status(shared: &LiveShared, paused: bool, t: f64, tick: u64) {
@@ -325,14 +714,17 @@ fn state_event(
         props,
         paused,
         target,
+        recording: shared.recording.load(Ordering::Relaxed),
+        rec_frames: shared.rec_frames.load(Ordering::Relaxed),
     })
 }
 
 /// The session body, generic over the emitter so tests run it headlessly.
-/// Owns the engine until the thread exits; every exit path emits `live://ended`.
+/// Owns the engine until the thread exits; every exit path emits `live://ended`
+/// and closes an open recording exactly once.
 #[allow(clippy::too_many_arguments)]
 fn run_session<E: LiveEmitter>(
-    mut engine: LiveEngine,
+    engine: LiveEngine,
     model: Arc<Model>,
     gains: Gains,
     h: f64,
@@ -341,6 +733,30 @@ fn run_session<E: LiveEmitter>(
     shared: Arc<LiveShared>,
     emitter: E,
 ) {
+    let mut rec: Option<Recorder> = None;
+    let reason = session_loop(
+        engine, &model, gains, h, emit_every, session_id, &shared, &emitter, &mut rec,
+    );
+    close_recorder(&shared, &mut rec);
+    emitter.ended(&LiveEndedEvent { session_id, reason });
+}
+
+/// The loop proper: steps until the session must end and returns the
+/// `live://ended` reason (setting `dead` itself on an error exit). Split out of
+/// [`run_session`] so stop, supersede and every error path share ONE place that
+/// closes the recording.
+#[allow(clippy::too_many_arguments)]
+fn session_loop<E: LiveEmitter>(
+    mut engine: LiveEngine,
+    model: &Arc<Model>,
+    gains: Gains,
+    h: f64,
+    emit_every: u64,
+    session_id: u64,
+    shared: &Arc<LiveShared>,
+    emitter: &E,
+    rec: &mut Option<Recorder>,
+) -> String {
     // Never-stale teleop budget: the live target is a UI hold value, not a
     // deadman link — pause/stop are the explicit controls here, and letting the
     // watchdog kick in mid-catch-up-batch would silently swap targets.
@@ -352,29 +768,26 @@ fn run_session<E: LiveEmitter>(
             .unwrap_or_else(|_| vec![0.0; model.ndof]);
         TeleopSetpoint::new(q0).with_tick_budget(u64::MAX)
     };
+    let ndof = model.ndof;
     let mut pacer = Pacer::new(h, CATCHUP_CAP_S);
     let mut last_wall = Instant::now();
     let mut last_paused = shared.paused.load(Ordering::Relaxed);
     let mut since_emit: u64 = 0;
 
-    let fail = |shared: &LiveShared, emitter: &E, detail: String| {
-        shared.dead.store(true, Ordering::Relaxed);
-        emitter.ended(&LiveEndedEvent {
-            session_id,
-            reason: format!("error: {detail}"),
-        });
-    };
+    macro_rules! die {
+        ($detail:expr) => {{
+            shared.dead.store(true, Ordering::Relaxed);
+            return format!("error: {}", $detail);
+        }};
+    }
     macro_rules! emit_state_or_die {
         ($paused:expr) => {
-            match state_event(&engine, &model, &shared, session_id, $paused) {
+            match state_event(&engine, model, shared, session_id, $paused) {
                 Some(ev) => {
-                    set_status(&shared, $paused, ev.t, ev.tick);
+                    set_status(shared, $paused, ev.t, ev.tick);
                     emitter.state(&ev);
                 }
-                None => {
-                    fail(&shared, &emitter, "simulation state went non-finite".into());
-                    return;
-                }
+                None => die!("simulation state went non-finite"),
             }
         };
     }
@@ -383,27 +796,32 @@ fn run_session<E: LiveEmitter>(
 
     loop {
         if shared.stop.load(Ordering::Relaxed) {
-            let reason = if shared.superseded.load(Ordering::Relaxed) {
-                "superseded"
+            return if shared.superseded.load(Ordering::Relaxed) {
+                "superseded".to_string()
             } else {
-                "stopped"
+                "stopped".to_string()
             };
-            emitter.ended(&LiveEndedEvent {
-                session_id,
-                reason: reason.into(),
-            });
-            return;
         }
 
         // Reset request (honored even while paused; paused flag survives).
         let req = shared.reset_req.lock().ok().and_then(|mut r| r.take());
         if let Some(qr) = req {
-            engine = match engine.reset(&qr, &model, gains, h) {
-                Ok(e) => e,
-                Err(e) => {
-                    fail(&shared, &emitter, format!("reset failed: {e}"));
-                    return;
+            // A take spanning a reset is not one demonstration: drop it, keep
+            // the dataset open for the next one.
+            if let Some(r) = rec.as_mut() {
+                if r.task.is_some() {
+                    let n = r.discard_take();
+                    log::warn!(
+                        target: "studio::live",
+                        "live reset discarded the take in progress ({n} frames); \
+                         the dataset stays open"
+                    );
                 }
+            }
+            publish_rec(shared, rec.as_ref());
+            engine = match engine.reset(&qr, model, gains, h) {
+                Ok(e) => e,
+                Err(e) => die!(format!("reset failed: {e}")),
             };
             if let Ok(mut t) = shared.target.lock() {
                 *t = qr.clone();
@@ -415,6 +833,10 @@ fn run_session<E: LiveEmitter>(
             emit_state_or_die!(last_paused);
             continue;
         }
+
+        // Recording requests are serviced while paused too, so a take can be
+        // stopped or saved without resuming the sim.
+        service_rec(shared, rec, ndof);
 
         let paused = shared.paused.load(Ordering::Relaxed);
         if paused != last_paused {
@@ -442,17 +864,18 @@ fn run_session<E: LiveEmitter>(
             sp.set(t.clone());
         }
         for _ in 0..n {
-            if let Err(e) = engine.step(&mut sp) {
-                fail(&shared, &emitter, e);
-                return;
-            }
+            let frame = match engine.step(&mut sp) {
+                Ok(f) => f,
+                Err(e) => die!(e),
+            };
+            record_tick(shared, rec, &frame);
             since_emit += 1;
             if since_emit >= emit_every {
                 since_emit = 0;
                 emit_state_or_die!(false);
             }
         }
-        set_status(&shared, false, engine.time(), engine.tick());
+        set_status(shared, false, engine.time(), engine.tick());
     }
 }
 
@@ -601,6 +1024,7 @@ pub(crate) fn live_start_on<E: LiveEmitter>(
         id: session_id,
         engine: engine_name,
         ndof: n,
+        h,
         q0: req.q0,
         shared,
         join: Some(join),
@@ -715,10 +1139,200 @@ pub(crate) fn live_status_impl(state: &AppState) -> Result<Option<LiveStatusDto>
                 t: st.t,
                 tick: st.tick,
                 ndof: s.ndof,
+                recording: s.shared.recording.load(Ordering::Relaxed),
             }))
         }
         None => Ok(None),
     }
+}
+
+// ===== recording command impls =====
+
+/// Post one recording request to the session thread and wait for its reply.
+///
+/// The caller holds `rec_gate` (so the slots are ours alone) and NO `AppState`
+/// lock: the session thread never takes `AppState` locks, but it can be busy
+/// for a whole catch-up batch, and blocking on `state.live` while waiting would
+/// stall every other command. A dead/stopping session or a wedged thread ends
+/// the wait with an error instead of hanging the webview.
+fn rec_request(shared: &LiveShared, req: RecRequest) -> Result<RecReply, String> {
+    {
+        let mut slot = shared.rec_reply.lock().map_err(|_| "state lock poisoned")?;
+        *slot = None;
+    }
+    {
+        let mut slot = shared.rec_req.lock().map_err(|_| "state lock poisoned")?;
+        *slot = Some(req);
+    }
+    let deadline = Instant::now() + REC_REPLY_TIMEOUT;
+    let abandon = |shared: &LiveShared| {
+        if let Ok(mut slot) = shared.rec_req.lock() {
+            *slot = None;
+        }
+    };
+    loop {
+        if let Ok(mut slot) = shared.rec_reply.lock() {
+            if let Some(reply) = slot.take() {
+                return reply;
+            }
+        }
+        // Checked AFTER the reply slot: a thread that answered and then exited
+        // still hands us its answer.
+        if shared.dead.load(Ordering::Relaxed) || shared.stop.load(Ordering::Relaxed) {
+            abandon(shared);
+            return Err("the live session ended".into());
+        }
+        if Instant::now() >= deadline {
+            abandon(shared);
+            return Err("the live sim thread did not answer the recording request in 2 s".into());
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+/// Start recording a take, creating the dataset on the first call.
+///
+/// Everything that can fail cheaply fails HERE, synchronously, before the
+/// session thread is involved: the task label, the fps/tick-rate divisibility,
+/// the robot match, and the dataset root itself (the writer is created in this
+/// command, so a bad root never leaves a half-open session behind).
+pub(crate) fn live_record_start_impl(
+    state: &AppState,
+    req: LiveRecordStartReq,
+) -> Result<LiveRecordStartedDto, String> {
+    let task = req.task.trim().to_string();
+    if task.is_empty() {
+        return Err("give the episode a task label (what the demonstration does)".into());
+    }
+    let fps = req.fps.unwrap_or(DEFAULT_RECORD_FPS);
+
+    // Session facts first, then the AppState locks are dropped: nothing below
+    // may hold them while waiting on the session thread.
+    let (shared, ndof, h) = with_live(state, |s| Ok((s.shared.clone(), s.ndof, s.h)))?;
+    let every = record_every(h, fps)?;
+    let (robot_type, joint_names) = {
+        let guard = state.model.lock().map_err(|_| "state lock poisoned")?;
+        let m = guard.as_ref().ok_or("no robot loaded")?;
+        if m.ndof != ndof {
+            return Err(
+                "the loaded robot changed — restart the live session before recording".into(),
+            );
+        }
+        (m.name.clone(), m.joint_names.clone())
+    };
+
+    let _gate = shared.rec_gate.lock().map_err(|_| "state lock poisoned")?;
+    let open = shared
+        .rec_mirror
+        .lock()
+        .map_err(|_| "state lock poisoned")?
+        .clone();
+    let writer = match open {
+        // Roots are compared as the caller wrote them — a second dataset must
+        // never be created under a running one.
+        Some(m) if m.root != req.root || m.fps != fps => {
+            return Err(format!(
+                "a dataset is already open at {} ({} fps) — finish the open dataset first",
+                m.root, m.fps
+            ));
+        }
+        Some(m) if m.task.is_some() => {
+            return Err("a take is already recording — stop it first".into());
+        }
+        Some(_) => None,
+        None => {
+            let names = (joint_names.len() == ndof).then_some(joint_names);
+            let spec = DatasetSpec::new(
+                fps,
+                robot_type,
+                vec![
+                    FeatureSpec::vector("observation.state", ndof, names.clone()),
+                    FeatureSpec::vector("action", ndof, names),
+                ],
+            );
+            Some(Box::new(
+                DatasetWriter::create(&req.root, spec).map_err(|e| e.to_string())?,
+            ))
+        }
+    };
+
+    let reply = rec_request(
+        &shared,
+        RecRequest::Start {
+            writer,
+            root: req.root.clone(),
+            fps,
+            record_every: every,
+            task,
+        },
+    )?;
+    match reply {
+        RecReply::Started { episode_index } => Ok(LiveRecordStartedDto {
+            root: req.root,
+            fps,
+            record_every: every,
+            episode_index,
+        }),
+        _ => Err("unexpected reply to a record start".into()),
+    }
+}
+
+/// End the take: `save` writes it as an episode, otherwise its frames are
+/// thrown away. Either way recording stops — an `Err` reports what became of
+/// the frames, it does not leave the take running.
+pub(crate) fn live_record_stop_impl(
+    state: &AppState,
+    save: bool,
+) -> Result<LiveRecordStoppedDto, String> {
+    let shared = with_live(state, |s| Ok(s.shared.clone()))?;
+    let _gate = shared.rec_gate.lock().map_err(|_| "state lock poisoned")?;
+    match rec_request(&shared, RecRequest::Stop { save })? {
+        RecReply::Stopped {
+            saved,
+            episode_index,
+            frames,
+        } => Ok(LiveRecordStoppedDto {
+            saved,
+            episode_index,
+            frames,
+        }),
+        _ => Err("unexpected reply to a record stop".into()),
+    }
+}
+
+/// Close the dataset (writing `meta/`). Refused mid-take.
+pub(crate) fn live_record_finish_impl(state: &AppState) -> Result<LiveRecordFinishedDto, String> {
+    let shared = with_live(state, |s| Ok(s.shared.clone()))?;
+    let _gate = shared.rec_gate.lock().map_err(|_| "state lock poisoned")?;
+    match rec_request(&shared, RecRequest::Finish)? {
+        RecReply::Finished { root, episodes } => Ok(LiveRecordFinishedDto { root, episodes }),
+        _ => Err("unexpected reply to a record finish".into()),
+    }
+}
+
+/// Recording state, or null when no dataset is open (including with no live
+/// session). Reads the mirror — it never disturbs the session thread.
+pub(crate) fn live_record_status_impl(
+    state: &AppState,
+) -> Result<Option<LiveRecordStatusDto>, String> {
+    let shared = match with_live(state, |s| Ok(s.shared.clone())) {
+        Ok(s) => s,
+        Err(e) if e == "no live session" => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let mirror = shared
+        .rec_mirror
+        .lock()
+        .map_err(|_| "state lock poisoned")?
+        .clone();
+    Ok(mirror.map(|m| LiveRecordStatusDto {
+        root: m.root,
+        fps: m.fps,
+        recording: m.task.is_some(),
+        task: m.task,
+        buffered_frames: shared.rec_frames.load(Ordering::Relaxed) as usize,
+        episodes_saved: m.episodes_saved,
+    }))
 }
 
 // ===== tauri commands =====
@@ -764,12 +1378,47 @@ pub fn live_status(state: tauri::State<'_, AppState>) -> Result<Option<LiveStatu
     live_status_impl(&state)
 }
 
+/// Start recording a take into a LeRobotDataset v3.0 at `root` (created on the
+/// first call), tagged with this episode's task label.
+#[tauri::command]
+pub fn live_record_start(
+    req: LiveRecordStartReq,
+    state: tauri::State<'_, AppState>,
+) -> Result<LiveRecordStartedDto, String> {
+    logged("live_record_start", live_record_start_impl(&state, req))
+}
+
+/// Stop the take, saving it as an episode or discarding its frames.
+#[tauri::command]
+pub fn live_record_stop(
+    save: bool,
+    state: tauri::State<'_, AppState>,
+) -> Result<LiveRecordStoppedDto, String> {
+    logged("live_record_stop", live_record_stop_impl(&state, save))
+}
+
+/// Close the dataset — refused while a take is running.
+#[tauri::command]
+pub fn live_record_finish(
+    state: tauri::State<'_, AppState>,
+) -> Result<LiveRecordFinishedDto, String> {
+    logged("live_record_finish", live_record_finish_impl(&state))
+}
+
+/// Recording state, or null when no dataset is open.
+#[tauri::command]
+pub fn live_record_status(
+    state: tauri::State<'_, AppState>,
+) -> Result<Option<LiveRecordStatusDto>, String> {
+    logged("live_record_status", live_record_status_impl(&state))
+}
+
 // ===== tests =====
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     fn fixture(name: &str) -> PathBuf {
         PathBuf::from(concat!(
@@ -1069,6 +1718,356 @@ mod tests {
         assert!(live_pause_impl(&state, true).is_err());
         assert!(live_reset_impl(&state, None).is_err());
         live_stop_impl(&state).unwrap(); // idempotent no-op
+    }
+
+    // -- teleop recording (A3) --
+
+    fn rec_dir(tag: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!("studio_live_rec_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        p
+    }
+
+    fn start_req(root: &Path, task: &str, fps: Option<u32>) -> LiveRecordStartReq {
+        LiveRecordStartReq {
+            root: root.display().to_string(),
+            task: task.into(),
+            fps,
+        }
+    }
+
+    /// The timestamp the writer stores for frame `k` at `fps`: the exact
+    /// `k / fps` seconds, rounded once to the f32 the parquet column holds.
+    fn stamp(k: usize, fps: u32) -> f64 {
+        ((k as f64 / f64::from(fps)) as f32) as f64
+    }
+
+    #[test]
+    fn record_every_divides_the_tick_rate_exactly() {
+        assert_eq!(record_every(1e-3, 50).unwrap(), 20);
+        assert_eq!(record_every(1e-3, 100).unwrap(), 10);
+        assert_eq!(record_every(1e-3, 250).unwrap(), 4);
+        assert_eq!(record_every(1e-3, 1000).unwrap(), 1);
+        // 1000 / 30 is not whole — recording would drift off frame_index/fps
+        let err = record_every(1e-3, 30).unwrap_err();
+        assert!(err.contains("divide") && err.contains("50"), "got: {err}");
+        assert!(record_every(1e-3, 0).is_err());
+        // a non-integer tick rate cannot host any exact decimation
+        assert!(record_every(1.0 / 999.5, 50).is_err());
+    }
+
+    #[test]
+    fn record_writes_a_v3_dataset_the_reader_opens() {
+        let state = pendulum_state();
+        let (_em, _dto) = start_builtin(&state, vec![0.2, -0.1]);
+        let dir = rec_dir("smoke");
+
+        let started = live_record_start_impl(&state, start_req(&dir, "pick", Some(50))).unwrap();
+        assert_eq!(started.fps, 50);
+        assert_eq!(started.record_every, 20); // 1 kHz ticks / 50 fps
+        assert_eq!(started.episode_index, 0);
+        assert_eq!(started.root, dir.display().to_string());
+
+        // drive the arm while the take runs, so the episode is not a constant
+        live_set_target_impl(&state, &[0.1, 0.05]).unwrap();
+        sleep_ms(250);
+        live_set_target_impl(&state, &[-0.15, 0.2]).unwrap();
+        sleep_ms(250);
+
+        let st = live_record_status_impl(&state)
+            .unwrap()
+            .expect("dataset open");
+        assert!(st.recording);
+        assert_eq!(st.task.as_deref(), Some("pick"));
+        assert_eq!(st.fps, 50);
+        assert!(st.buffered_frames > 0);
+        assert_eq!(st.episodes_saved, 0);
+        assert!(live_status_impl(&state).unwrap().unwrap().recording);
+
+        let stopped = live_record_stop_impl(&state, true).unwrap();
+        assert!(stopped.saved);
+        assert_eq!(stopped.episode_index, Some(0));
+        // ~0.5 s at 50 fps ≈ 25 frames; loose bounds keep this robust on a
+        // loaded machine while still proving the decimation is not per-tick.
+        assert!(
+            (5..=45).contains(&stopped.frames),
+            "{} frames for ~0.5 s at 50 fps",
+            stopped.frames
+        );
+        let saved = stopped.frames;
+
+        // a second take on the same dataset, thrown away
+        let started2 = live_record_start_impl(&state, start_req(&dir, "place", None)).unwrap();
+        assert_eq!(started2.episode_index, 1);
+        assert_eq!(started2.fps, 50); // the default
+        sleep_ms(200);
+        let dropped = live_record_stop_impl(&state, false).unwrap();
+        assert!(!dropped.saved);
+        assert_eq!(dropped.episode_index, None);
+        assert!(dropped.frames > 0);
+
+        let st = live_record_status_impl(&state).unwrap().unwrap();
+        assert!(!st.recording);
+        assert!(st.task.is_none());
+        assert_eq!(st.buffered_frames, 0);
+        assert_eq!(st.episodes_saved, 1);
+
+        let fin = live_record_finish_impl(&state).unwrap();
+        assert_eq!(fin.episodes, 1);
+        assert!(live_record_status_impl(&state).unwrap().is_none());
+
+        let r = caliper_dataset::DatasetReader::open(&dir).unwrap();
+        assert_eq!(r.total_episodes(), 1);
+        assert_eq!(r.fps(), 50);
+        let ep = r.read_episode(0).unwrap();
+        assert_eq!(ep.len(), saved);
+        assert_eq!(ep.tasks, vec!["pick".to_string()]);
+        let states = ep.features.get("observation.state").expect("state feature");
+        let actions = ep.features.get("action").expect("action feature");
+        assert_eq!(states.len(), saved);
+        assert_eq!(actions.len(), saved);
+        assert!(states.iter().all(|s| s.len() == 2));
+        assert!(actions.iter().all(|a| a.len() == 2));
+        assert!(
+            states.iter().any(|s| (s[0] - states[0][0]).abs() > 1e-4),
+            "the recorded arm never moved"
+        );
+        // exact decimation → exact frame_index/fps timestamps, no resampling
+        for (k, ts) in ep.timestamps.iter().enumerate() {
+            assert_eq!(*ts, stamp(k, 50), "timestamp {k}");
+        }
+
+        live_stop_impl(&state).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn record_commands_refuse_bad_requests() {
+        let state = pendulum_state();
+        let dir = rec_dir("errs");
+
+        // no session at all
+        let err = live_record_start_impl(&state, start_req(&dir, "t", None)).unwrap_err();
+        assert!(err.contains("no live session"), "got: {err}");
+        assert!(live_record_status_impl(&state).unwrap().is_none());
+
+        let (_em, _dto) = start_builtin(&state, vec![0.0, 0.0]);
+        let err = live_record_start_impl(&state, start_req(&dir, "   ", None)).unwrap_err();
+        assert!(err.contains("task label"), "got: {err}");
+        // an fps that does not divide the tick rate — and nothing is created
+        let err = live_record_start_impl(&state, start_req(&dir, "t", Some(30))).unwrap_err();
+        assert!(err.contains("1000 Hz tick rate"), "got: {err}");
+        assert!(!dir.exists(), "a refused start must not create the dataset");
+
+        assert!(live_record_stop_impl(&state, true)
+            .unwrap_err()
+            .contains("no dataset open"));
+        assert!(live_record_finish_impl(&state)
+            .unwrap_err()
+            .contains("no dataset open"));
+
+        live_record_start_impl(&state, start_req(&dir, "take", Some(50))).unwrap();
+        let err = live_record_start_impl(&state, start_req(&dir, "again", Some(50))).unwrap_err();
+        assert!(err.contains("already recording"), "got: {err}");
+        // a different root, or a different fps, while a dataset is open
+        let other = rec_dir("errs_other");
+        let err = live_record_start_impl(&state, start_req(&other, "t", Some(50))).unwrap_err();
+        assert!(err.contains("finish the open dataset first"), "got: {err}");
+        assert!(!other.exists(), "the refused root must not be created");
+        let err = live_record_start_impl(&state, start_req(&dir, "t", Some(100))).unwrap_err();
+        assert!(err.contains("finish the open dataset first"), "got: {err}");
+        // finishing mid-take
+        let err = live_record_finish_impl(&state).unwrap_err();
+        assert!(err.contains("stop the take first"), "got: {err}");
+
+        sleep_ms(150);
+        live_record_stop_impl(&state, true).unwrap();
+        let err = live_record_stop_impl(&state, true).unwrap_err();
+        assert!(err.contains("not recording"), "got: {err}");
+        live_record_finish_impl(&state).unwrap();
+
+        live_stop_impl(&state).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn live_reset_discards_the_take_but_keeps_the_dataset() {
+        let state = pendulum_state();
+        let (_em, _dto) = start_builtin(&state, vec![0.2, -0.1]);
+        let dir = rec_dir("reset");
+
+        live_record_start_impl(&state, start_req(&dir, "spoiled", Some(50))).unwrap();
+        sleep_ms(200);
+        assert!(
+            live_record_status_impl(&state)
+                .unwrap()
+                .unwrap()
+                .buffered_frames
+                > 0
+        );
+
+        live_reset_impl(&state, None).unwrap();
+        sleep_ms(100);
+        let st = live_record_status_impl(&state)
+            .unwrap()
+            .expect("the dataset stays open across a reset");
+        assert!(!st.recording, "a reset invalidates the take");
+        assert_eq!(st.buffered_frames, 0);
+        assert_eq!(st.episodes_saved, 0);
+        assert_eq!(st.root, dir.display().to_string());
+
+        // and the dataset still records: the next take saves normally
+        live_record_start_impl(&state, start_req(&dir, "clean", Some(50))).unwrap();
+        sleep_ms(200);
+        assert!(live_record_stop_impl(&state, true).unwrap().saved);
+        assert_eq!(live_record_finish_impl(&state).unwrap().episodes, 1);
+
+        let r = caliper_dataset::DatasetReader::open(&dir).unwrap();
+        assert_eq!(r.total_episodes(), 1);
+        assert_eq!(r.read_episode(0).unwrap().tasks, vec!["clean".to_string()]);
+        live_stop_impl(&state).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pausing_mid_take_freezes_capture_and_resumes_the_same_take() {
+        let state = pendulum_state();
+        let (_em, _dto) = start_builtin(&state, vec![0.2, -0.1]);
+        let dir = rec_dir("pause");
+
+        live_record_start_impl(&state, start_req(&dir, "paused", Some(50))).unwrap();
+        sleep_ms(200);
+        live_pause_impl(&state, true).unwrap();
+        sleep_ms(60);
+        let a = live_record_status_impl(&state)
+            .unwrap()
+            .unwrap()
+            .buffered_frames;
+        sleep_ms(150);
+        let b = live_record_status_impl(&state)
+            .unwrap()
+            .unwrap()
+            .buffered_frames;
+        assert!(a > 0);
+        assert_eq!(a, b, "a paused sim captures no frames");
+
+        live_pause_impl(&state, false).unwrap();
+        sleep_ms(200);
+        let stopped = live_record_stop_impl(&state, true).unwrap();
+        assert!(stopped.saved);
+        assert!(stopped.frames > b, "the same take continues after resume");
+        live_record_finish_impl(&state).unwrap();
+
+        // Timestamps are frame-count based, so the paused span leaves NO gap.
+        let r = caliper_dataset::DatasetReader::open(&dir).unwrap();
+        let ep = r.read_episode(0).unwrap();
+        assert_eq!(ep.len(), stopped.frames);
+        for (k, ts) in ep.timestamps.iter().enumerate() {
+            assert_eq!(*ts, stamp(k, 50), "timestamp {k}");
+        }
+        live_stop_impl(&state).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stopping_the_session_finalizes_an_open_dataset() {
+        let state = pendulum_state();
+        let (_em, _dto) = start_builtin(&state, vec![0.1, 0.0]);
+        let dir = rec_dir("sessionend");
+
+        live_record_start_impl(&state, start_req(&dir, "held", Some(50))).unwrap();
+        sleep_ms(200);
+        assert!(live_record_stop_impl(&state, true).unwrap().saved);
+        // leave a take running: ending the session must drop it, not save it
+        live_record_start_impl(&state, start_req(&dir, "aborted", Some(50))).unwrap();
+        sleep_ms(150);
+
+        live_stop_impl(&state).unwrap(); // joins the thread → finalize is done
+        assert!(live_record_status_impl(&state).unwrap().is_none());
+
+        let r = caliper_dataset::DatasetReader::open(&dir).unwrap();
+        assert_eq!(r.total_episodes(), 1, "an interrupted take is never saved");
+        assert_eq!(r.read_episode(0).unwrap().tasks, vec!["held".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn state_events_carry_the_recording_flag() {
+        let state = pendulum_state();
+        let (em, _dto) = start_builtin(&state, vec![0.2, -0.1]);
+        sleep_ms(60);
+        let idle = em.last_state();
+        assert!(!idle.recording);
+        assert_eq!(idle.rec_frames, 0);
+
+        let dir = rec_dir("events");
+        live_record_start_impl(&state, start_req(&dir, "wave", Some(50))).unwrap();
+        sleep_ms(150);
+        let a = em.last_state();
+        assert!(a.recording);
+        assert!(a.rec_frames > 0);
+        sleep_ms(200);
+        let b = em.last_state();
+        assert!(
+            b.rec_frames > a.rec_frames,
+            "recFrames must advance during a take ({} → {})",
+            a.rec_frames,
+            b.rec_frames
+        );
+
+        live_record_stop_impl(&state, false).unwrap();
+        sleep_ms(80);
+        let c = em.last_state();
+        assert!(!c.recording);
+        assert_eq!(c.rec_frames, 0);
+
+        live_stop_impl(&state).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Manual acceptance run for the lerobot pairing check: records two ~2 s
+    /// episodes at 50 fps into `$CALIPER_LIVE_RECORD_DIR` (a real directory,
+    /// not a tempdir) and finalizes it, so the result can be loaded with
+    /// lerobot 0.6.0.
+    ///
+    /// ```text
+    /// CALIPER_LIVE_RECORD_DIR=/tmp/live_teleop \
+    ///   cargo test -p studio --lib record_dataset_to_env_path -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore]
+    fn record_dataset_to_env_path() {
+        let dir = std::env::var("CALIPER_LIVE_RECORD_DIR")
+            .expect("set CALIPER_LIVE_RECORD_DIR to the dataset directory to create");
+        let state = pendulum_state();
+        let (_em, _dto) = start_builtin(&state, vec![0.3, -0.2]);
+
+        for task in ["reach", "return"] {
+            live_record_start_impl(
+                &state,
+                LiveRecordStartReq {
+                    root: dir.clone(),
+                    task: task.into(),
+                    fps: Some(50),
+                },
+            )
+            .unwrap();
+            // ~2 s of driving, so the episodes carry real motion
+            for tgt in [[0.4, -0.3], [0.0, 0.1], [-0.3, 0.4], [0.1, 0.0]] {
+                live_set_target_impl(&state, &tgt).unwrap();
+                sleep_ms(500);
+            }
+            let stopped = live_record_stop_impl(&state, true).unwrap();
+            assert!(stopped.saved);
+            println!(
+                "episode {:?} ({task}): {} frames",
+                stopped.episode_index, stopped.frames
+            );
+        }
+        let fin = live_record_finish_impl(&state).unwrap();
+        assert_eq!(fin.episodes, 2);
+        println!("finalized {} with {} episodes", fin.root, fin.episodes);
+        live_stop_impl(&state).unwrap();
     }
 
     // -- mujoco-gated --

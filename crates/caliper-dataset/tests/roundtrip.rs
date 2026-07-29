@@ -186,6 +186,40 @@ fn drop_discards_unsaved_frames_but_keeps_saved_episodes() {
 }
 
 #[test]
+fn discard_buffered_drops_the_take_and_leaves_the_dataset_writable() {
+    let dir = tmpdir("discard");
+    let mut seed = 7;
+    let mut w = DatasetWriter::create(&dir, spec2()).unwrap();
+    record_episode(&mut w, 4, "kept", &mut seed);
+
+    // An aborted take: buffered frames go away, the saved episode does not.
+    for _ in 0..3 {
+        w.add_frame(&[
+            ("observation.state", &[0.1, 0.2][..]),
+            ("action", &[0.3, 0.4][..]),
+        ])
+        .unwrap();
+    }
+    assert_eq!(w.buffered_frames(), 3);
+    w.discard_buffered();
+    assert_eq!(w.buffered_frames(), 0);
+    assert_eq!(w.total_episodes(), 1);
+    // Discarding on an empty buffer is a no-op, and the writer still records.
+    w.discard_buffered();
+    record_episode(&mut w, 2, "next", &mut seed);
+    // finalize would refuse leftover frames — discarding must have cleared them.
+    let root = w.finalize().unwrap();
+
+    let r = DatasetReader::open(&root).unwrap();
+    assert_eq!(r.total_episodes(), 2);
+    assert_eq!(r.read_episode(0).unwrap().len(), 4);
+    let ep1 = r.read_episode(1).unwrap();
+    assert_eq!(ep1.len(), 2);
+    assert_eq!(ep1.tasks, vec!["next".to_string()]);
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
 fn files_roll_at_tiny_size_target_and_wrap_chunks() {
     let dir = tmpdir("roll");
     let mut spec = spec2();

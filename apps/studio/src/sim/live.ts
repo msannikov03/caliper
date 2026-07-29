@@ -43,6 +43,37 @@ export interface LiveStateEvent {
   props: number[][];
   paused: boolean;
   target: number[];
+  /** a take is in progress (A3 recording) */
+  recording: boolean;
+  /** frames captured in the current take; 0 when not recording */
+  recFrames: number;
+}
+
+/** Camel-case mirror of `LiveRecordStartedDto` (reply to `live_record_start`).
+ *  `root` is the path the dataset ACTUALLY lives at — subsequent takes echo it
+ *  back, so the UI remembers this and never re-sends its own string. */
+export interface LiveRecordStartedDto {
+  root: string;
+  fps: number;
+  /** physics ticks per recorded frame */
+  recordEvery: number;
+  /** 0-based index this episode gets when saved */
+  episodeIndex: number;
+}
+
+/** Camel-case mirror of `LiveRecordStoppedDto` (reply to `live_record_stop`). */
+export interface LiveRecordStoppedDto {
+  saved: boolean;
+  /** index of the saved episode; null for a discarded take */
+  episodeIndex: number | null;
+  /** frames the take held (saved or thrown away) */
+  frames: number;
+}
+
+/** Camel-case mirror of `LiveRecordFinishedDto` (reply to `live_record_finish`). */
+export interface LiveRecordFinishedDto {
+  root: string;
+  episodes: number;
 }
 
 /** Camel-case mirror of `LiveEndedEvent` ("live://ended"). */
@@ -77,6 +108,78 @@ export function liveInfoFromStarted(dto: LiveStartedDto): LiveInfo {
     ncon: 0,
     props: dto.props,
   };
+}
+
+/** The store's recording slice: the OPEN dataset plus the take running into it,
+ *  or null when no dataset is open. It outlives a take (a stopped take leaves
+ *  `root`/`fps`/`episodesSaved` behind so the next one continues the same
+ *  dataset) but never the session — the backend finalizes on session end. */
+export interface LiveRecInfo {
+  /** dataset root as the BACKEND reports it, not as we asked for it */
+  root: string;
+  fps: number;
+  /** a take is running right now */
+  recording: boolean;
+  /** task label of the running take; null between takes */
+  task: string | null;
+  /** frames captured in the running take */
+  frames: number;
+  episodesSaved: number;
+}
+
+/** Recording slice after a `live_record_start` reply. The dataset the backend
+ *  names is authoritative; a reply naming a DIFFERENT root than the one we were
+ *  recording into is a new dataset, so its episode count restarts. */
+export function liveRecFromStarted(
+  prev: LiveRecInfo | null,
+  dto: LiveRecordStartedDto,
+  task: string,
+): LiveRecInfo {
+  return {
+    root: dto.root,
+    fps: dto.fps,
+    recording: true,
+    task,
+    frames: 0,
+    episodesSaved: prev && prev.root === dto.root ? prev.episodesSaved : 0,
+  };
+}
+
+/** Recording slice after a `live_record_stop` reply: the take is over either
+ *  way, and only a SAVED one adds an episode to the open dataset. */
+export function liveRecAfterStop(prev: LiveRecInfo, dto: LiveRecordStoppedDto): LiveRecInfo {
+  return {
+    ...prev,
+    recording: false,
+    task: null,
+    frames: 0,
+    episodesSaved: prev.episodesSaved + (dto.saved ? 1 : 0),
+  };
+}
+
+/** Fold one state event's recording fields into the slice.
+ *
+ *  `armed` is the caller's "the stream has confirmed this take" latch. Until it
+ *  is set, a `recording: false` event is an OLDER event crossing the start
+ *  reply, not the take ending. Once set, a true→false transition is the only
+ *  signal a take died without a command (`live_reset` auto-discards it, and a
+ *  rejected frame kills it) — the caller turns `discarded` into the hint.
+ *
+ *  Returns `prev` itself when nothing moved: the flush set()s what it gets, so
+ *  a new object per streamed frame would repaint the panel for nothing. */
+export function liveRecPatch(
+  prev: LiveRecInfo | null,
+  ev: LiveStateEvent,
+  armed: boolean,
+): { rec: LiveRecInfo | null; discarded: boolean } {
+  if (!prev) return { rec: prev, discarded: false }; // no dataset open — not ours
+  if (ev.recording) {
+    return prev.recording && prev.frames === ev.recFrames
+      ? { rec: prev, discarded: false }
+      : { rec: { ...prev, recording: true, frames: ev.recFrames }, discarded: false };
+  }
+  if (!prev.recording || !armed) return { rec: prev, discarded: false };
+  return { rec: { ...prev, recording: false, task: null, frames: 0 }, discarded: true };
 }
 
 /** What the "live://state" handler does with an incoming event:

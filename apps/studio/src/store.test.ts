@@ -17,6 +17,8 @@
 //  - exportGraph / importGraph: save_graph_file/load_graph_file seam + banner
 //  - live session: start/adopt/flush, ended-with-error, stale-event guard,
 //    mode switch tears the session down
+//  - teleop recording: dataset picked once and continued, save/discard/empty
+//    takes, a take dying on the stream alone, finish → open in Data
 
 // vi.mock calls are hoisted before imports by Vitest.
 import { vi, describe, it, expect, beforeEach } from "vitest";
@@ -36,6 +38,9 @@ vi.mock("@tauri-apps/api/event", () => ({
   }),
 }));
 
+// The native save dialog the recording path opens to pick a dataset directory.
+vi.mock("@tauri-apps/plugin-dialog", () => ({ save: vi.fn() }));
+
 // Replace xyflow utilities with minimal pure implementations.
 // applyNodeChanges / applyEdgeChanges are only used in the pass-through change
 // handlers (onGraphNodesChange / onGraphEdgesChange) which we don't test here.
@@ -46,6 +51,7 @@ vi.mock("@xyflow/react", () => ({
 }));
 
 import { invoke } from "@tauri-apps/api/core";
+import { save } from "@tauri-apps/plugin-dialog";
 import {
   useStore,
   handleGraphError,
@@ -66,6 +72,7 @@ import type { KindName } from "./graph/spec";
 import type { CNode, CEdge, Diagnostics, GraphRunResult } from "./graph/types";
 
 const mockInvoke = vi.mocked(invoke);
+const mockSaveDialog = vi.mocked(save);
 
 // ---- shared fixtures ----
 
@@ -174,6 +181,11 @@ const STORE_RESET = {
   liveTarget: [] as number[],
   liveJoint: 0,
   liveDriving: false,
+  liveRec: null,
+  liveRecTask: "teleop",
+  liveRecFps: 50,
+  liveRecHint: null,
+  liveRecDone: null,
 };
 
 beforeEach(() => {
@@ -876,6 +888,8 @@ describe("live session — store wiring", () => {
       props: [[0, 0, 0.05, 1, 0, 0, 0]],
       paused: false,
       target: [0, 0],
+      recording: false,
+      recFrames: 0,
       ...over,
     };
   }
@@ -1325,5 +1339,270 @@ describe("live session — store wiring", () => {
     useStore.getState().setLiveTargetJoint(0, 0.9);
     _flushLive();
     expect(targetCalls()).toHaveLength(0);
+  });
+
+  // ---- teleop recording: takes append episodes to ONE open dataset ----
+
+  describe("recording", () => {
+    const ROOT = "/data/teleop_panda";
+
+    /** live_start + the four recording commands; everything else resolves
+     *  empty. Per-test overrides ride on mock*Once, which wins over this. */
+    function recBackend() {
+      mockInvoke.mockImplementation(async (cmd: string) => {
+        switch (cmd) {
+          case "live_start":
+            return mockStarted();
+          case "live_record_start":
+            return { root: ROOT, fps: 50, recordEvery: 40, episodeIndex: 0 };
+          case "live_record_stop":
+            return { saved: true, episodeIndex: 0, frames: 120 };
+          case "live_record_finish":
+            return { root: ROOT, episodes: 1 };
+          default:
+            return undefined;
+        }
+      });
+    }
+
+    /** The `req` of the last live_record_start, as the backend saw it. */
+    function lastStartReq(): { root: string; task: string; fps: number } {
+      const calls = mockInvoke.mock.calls.filter((c) => c[0] === "live_record_start");
+      return (calls[calls.length - 1] as [string, { req: never }])[1].req;
+    }
+
+    beforeEach(() => {
+      recBackend();
+      mockSaveDialog.mockResolvedValue(ROOT);
+    });
+
+    it("picks the dataset directory for the first take and adopts the reply's root", async () => {
+      // the dialog's string is only a REQUEST — the reply names where the
+      // dataset actually lives, and that is what later takes continue
+      mockSaveDialog.mockResolvedValue("/data/as_typed");
+      await useStore.getState().startLive();
+
+      await useStore.getState().recordStart("pick the cube", 25);
+
+      expect(mockSaveDialog).toHaveBeenCalledTimes(1);
+      expect(lastStartReq()).toEqual({ root: "/data/as_typed", task: "pick the cube", fps: 25 });
+      expect(useStore.getState().liveRec).toEqual({
+        root: ROOT,
+        fps: 50,
+        recording: true,
+        task: "pick the cube",
+        frames: 0,
+        episodesSaved: 0,
+      });
+    });
+
+    it("does nothing when the directory dialog is cancelled", async () => {
+      mockSaveDialog.mockResolvedValue(null);
+      await useStore.getState().startLive();
+
+      await useStore.getState().recordStart("teleop");
+
+      expect(mockInvoke).not.toHaveBeenCalledWith("live_record_start", expect.anything());
+      expect(useStore.getState().liveRec).toBeNull();
+    });
+
+    it("never reaches the backend without a session or with a blank label", async () => {
+      await useStore.getState().recordStart("teleop"); // no live session
+      await useStore.getState().startLive();
+      await useStore.getState().recordStart("   ");
+
+      expect(mockInvoke).not.toHaveBeenCalledWith("live_record_start", expect.anything());
+      expect(mockSaveDialog).not.toHaveBeenCalled();
+    });
+
+    it("continues the open dataset for the next take without asking again", async () => {
+      await useStore.getState().startLive();
+      await useStore.getState().recordStart("first", 50);
+      await useStore.getState().recordStop(true);
+      mockSaveDialog.mockClear();
+
+      await useStore.getState().recordStart("second", 50);
+
+      expect(mockSaveDialog).not.toHaveBeenCalled();
+      expect(lastStartReq()).toEqual({ root: ROOT, task: "second", fps: 50 });
+      // the second take's episode count carries the first one
+      expect(useStore.getState().liveRec).toMatchObject({
+        recording: true,
+        task: "second",
+        episodesSaved: 1,
+      });
+    });
+
+    it("counts a saved take as an episode and ends the take", async () => {
+      await useStore.getState().startLive();
+      await useStore.getState().recordStart("teleop");
+
+      await useStore.getState().recordStop(true);
+
+      expect(mockInvoke).toHaveBeenCalledWith("live_record_stop", { save: true });
+      const s = useStore.getState();
+      expect(s.liveRec).toMatchObject({
+        recording: false,
+        task: null,
+        frames: 0,
+        episodesSaved: 1,
+      });
+      expect(s.liveRecHint).toBeNull();
+    });
+
+    it("keeps the dataset open but uncounted when a take is discarded", async () => {
+      await useStore.getState().startLive();
+      await useStore.getState().recordStart("teleop");
+      mockInvoke.mockResolvedValueOnce({ saved: false, episodeIndex: null, frames: 40 });
+
+      await useStore.getState().recordStop(false);
+
+      const s = useStore.getState();
+      expect(s.liveRec).toMatchObject({ root: ROOT, recording: false, episodesSaved: 0 });
+      expect(s.liveRecHint).toMatch(/discarded/);
+    });
+
+    it("unsticks the panel when saving a take that captured nothing errs", async () => {
+      // the backend refuses to save an empty take — but the take IS over, so
+      // the panel must leave recording state and say what happened
+      await useStore.getState().startLive();
+      await useStore.getState().recordStart("teleop");
+      mockInvoke.mockRejectedValueOnce("no frames were captured in this take");
+
+      await useStore.getState().recordStop(true);
+
+      const s = useStore.getState();
+      expect(s.liveRec).toMatchObject({ root: ROOT, recording: false, episodesSaved: 0 });
+      expect(s.liveRecHint).toBe("no frames were captured in this take");
+      expect(s.error).toBeNull(); // nothing is broken; this is not banner-worthy
+
+      // and the next take starts normally, on the same dataset
+      await useStore.getState().recordStart("teleop");
+      expect(useStore.getState().liveRec).toMatchObject({ recording: true });
+    });
+
+    it("counts the take's frames off the state stream", async () => {
+      await useStore.getState().startLive();
+      await useStore.getState().recordStart("teleop");
+
+      emit("live://state", mockState({ recording: true, recFrames: 12 }));
+      _flushLive();
+
+      expect(useStore.getState().liveRec).toMatchObject({ recording: true, frames: 12 });
+    });
+
+    it("reads a take dying with no command behind it as a discard, once", async () => {
+      await useStore.getState().startLive();
+      await useStore.getState().recordStart("teleop");
+      emit("live://state", mockState({ recording: true, recFrames: 12 }));
+      _flushLive();
+
+      // live_reset auto-discards the take; the flag flipping off IS the notice
+      emit("live://state", mockState({ recording: false }));
+      _flushLive();
+
+      const s = useStore.getState();
+      expect(s.liveRec).toMatchObject({ recording: false, task: null, frames: 0 });
+      expect(s.liveRecHint).toMatch(/discarded/);
+
+      // one-shot: every later event says the same thing and must stay quiet
+      useStore.setState({ liveRecHint: null });
+      emit("live://state", mockState({ recording: false }));
+      _flushLive();
+      expect(useStore.getState().liveRecHint).toBeNull();
+    });
+
+    it("ignores a stale not-recording event that crossed the start reply", async () => {
+      await useStore.getState().startLive();
+      await useStore.getState().recordStart("teleop");
+
+      // emitted BEFORE the take began — it says nothing about the take
+      emit("live://state", mockState({ recording: false }));
+      _flushLive();
+
+      const s = useStore.getState();
+      expect(s.liveRec).toMatchObject({ recording: true, task: "teleop" });
+      expect(s.liveRecHint).toBeNull();
+    });
+
+    it("does not mistake a stop of our own for a discard", async () => {
+      await useStore.getState().startLive();
+      await useStore.getState().recordStart("teleop");
+      emit("live://state", mockState({ recording: true, recFrames: 5 }));
+      _flushLive();
+
+      let release: (v: unknown) => void = () => {};
+      mockInvoke.mockImplementationOnce(() => new Promise((r) => (release = r)));
+      const stopping = useStore.getState().recordStop(true);
+      // the take stops on the backend before the reply gets back to us
+      emit("live://state", mockState({ recording: false }));
+      _flushLive();
+      expect(useStore.getState().liveRecHint).toBeNull();
+
+      release({ saved: true, episodeIndex: 0, frames: 5 });
+      await stopping;
+
+      const s = useStore.getState();
+      expect(s.liveRec).toMatchObject({ recording: false, episodesSaved: 1 });
+      expect(s.liveRecHint).toBeNull();
+    });
+
+    it("closes the dataset and offers it to Data mode", async () => {
+      await useStore.getState().startLive();
+      await useStore.getState().recordStart("teleop");
+      await useStore.getState().recordStop(true);
+
+      await useStore.getState().recordFinish();
+
+      expect(mockInvoke).toHaveBeenCalledWith("live_record_finish");
+      const s = useStore.getState();
+      expect(s.liveRec).toBeNull();
+      expect(s.liveRecDone).toEqual({ root: ROOT, episodes: 1 });
+
+      mockInvoke.mockImplementation(async (cmd: string) =>
+        cmd === "dataset_open" ? { path: ROOT, episodes: [] } : undefined,
+      );
+      await useStore.getState().openRecordedDataset();
+
+      expect(mockInvoke).toHaveBeenCalledWith("dataset_open", { path: ROOT });
+      expect(useStore.getState().mode).toBe("data");
+      expect(useStore.getState().liveRecDone).toBeNull();
+    });
+
+    it("refuses to finish mid-take (the backend would too)", async () => {
+      await useStore.getState().startLive();
+      await useStore.getState().recordStart("teleop");
+
+      await useStore.getState().recordFinish();
+
+      expect(mockInvoke).not.toHaveBeenCalledWith("live_record_finish");
+      expect(useStore.getState().liveRec).toMatchObject({ recording: true });
+    });
+
+    it("clears the slice when the session ends, keeping the dataset reachable", async () => {
+      await useStore.getState().startLive();
+      await useStore.getState().recordStart("teleop");
+      await useStore.getState().recordStop(true);
+
+      // the backend finalizes the open dataset on its way out
+      emit("live://ended", { sessionId: 1, reason: "stopped" });
+
+      const s = useStore.getState();
+      expect(s.liveRec).toBeNull();
+      expect(s.liveRecDone).toEqual({ root: ROOT, episodes: 1 });
+      expect(s.liveRecHint).toBeNull();
+    });
+
+    it("says so when the session ends mid-take", async () => {
+      await useStore.getState().startLive();
+      await useStore.getState().recordStart("teleop");
+
+      emit("live://ended", { sessionId: 1, reason: "error: mujoco step diverged" });
+
+      const s = useStore.getState();
+      expect(s.liveRec).toBeNull();
+      expect(s.liveRecDone).toBeNull(); // nothing was saved into it
+      expect(s.liveRecHint).toMatch(/discarded/);
+    });
   });
 });

@@ -3190,7 +3190,11 @@ pub fn run() {
             live::live_pause,
             live::live_reset,
             live::live_stop,
-            live::live_status
+            live::live_status,
+            live::live_record_start,
+            live::live_record_stop,
+            live::live_record_finish,
+            live::live_record_status
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

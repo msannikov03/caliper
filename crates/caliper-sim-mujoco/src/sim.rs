@@ -410,6 +410,38 @@ impl MujocoSim {
             .collect()
     }
 
+    /// `(name, world LINEAR velocity)` for every prop, in build order, from the
+    /// last `step`/`forward`. Empty for raw-MJCF loads.
+    ///
+    /// A prop rides a `<freejoint>`, and MuJoCo defines that joint's first
+    /// three `qvel` entries as the body's linear velocity in WORLD coordinates
+    /// — the exact three numbers `caliper_learn.success.state_from_mujoco`
+    /// reads, so a "has it come to rest" check answers the same in both faces.
+    /// A prop body with no free joint is a generator bug and reported as an
+    /// error rather than as a fabricated zero velocity (which would read as
+    /// "settled").
+    pub fn prop_velocities(&self) -> Result<Vec<(String, [f64; 3])>, MujocoError> {
+        let model = self.data.model();
+        let types = model.jnt_type();
+        let bodies = model.jnt_bodyid();
+        let dof_adr = model.jnt_dofadr();
+        let qv = self.data.qvel();
+        self.props
+            .iter()
+            .map(|(name, bid)| {
+                let jid = (0..types.len())
+                    .find(|&j| types[j] == MjtJoint::mjJNT_FREE && bodies[j] as usize == *bid)
+                    .ok_or_else(|| {
+                        MujocoError::Backend(format!(
+                            "prop `{name}` has no free joint, so its velocity cannot be read"
+                        ))
+                    })?;
+                let a = dof_adr[jid] as usize;
+                Ok((name.clone(), [qv[a], qv[a + 1], qv[a + 2]]))
+            })
+            .collect()
+    }
+
     // ---- grasp welds ----
     //
     // An HONEST FAKE, and labeled as one: a real parallel gripper grasps by

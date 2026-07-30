@@ -12,6 +12,7 @@
 // ============================================================
 
 import type { PropTrack, SimProp } from "./props";
+import type { SuccessPredicate } from "./task";
 
 /** Camel-case mirror of `LiveStartReq` — what `live_start` is asked with. */
 export interface LiveStartReq {
@@ -24,6 +25,12 @@ export interface LiveStartReq {
   gripperJoint?: string | null;
   /** which end of that joint's range CLOSES it; omitted = "lo" */
   gripperClosed?: "lo" | "hi" | null;
+  /** ground-plane height of the scene (mujoco); omitted = 0 */
+  ground?: number;
+  /** success predicate to judge the session against, in the
+   *  `caliper-task.json` schema — handed over verbatim from `task_open` and
+   *  never inspected here. Omitted = no verdict is computed. */
+  success?: SuccessPredicate;
 }
 
 /** Camel-case mirror of `GripperDto` — the session's gripper channel: one
@@ -87,6 +94,9 @@ export interface LiveStateEvent {
   /** prop currently WELDED to the gripper (grasp heuristic), else null —
    *  always null on builtin, which has no contacts to grasp with */
   held?: string | null;
+  /** the session's success verdict for THIS state, or null when nothing is
+   *  scoring it (no predicate, or an engine with no props to judge) */
+  success?: boolean | null;
 }
 
 /** Camel-case mirror of `LiveRecordStartedDto` (reply to `live_record_start`).
@@ -142,6 +152,9 @@ export interface LiveInfo {
   gripperState: GripperState | null;
   /** prop welded to the gripper right now, null when nothing is held */
   held: string | null;
+  /** latest streamed verdict of the session's success predicate: true/false
+   *  per INSTANT (never latched), null when nothing is scoring the session */
+  success: boolean | null;
 }
 
 /** Fresh live slice for a session the backend just started. */
@@ -157,6 +170,9 @@ export function liveInfoFromStarted(dto: LiveStartedDto): LiveInfo {
     gripper: dto.gripper ?? null,
     gripperState: null,
     held: null,
+    // no verdict until the first event: a session that IS being scored reports
+    // one on every state, and one that is not reports null forever
+    success: null,
   };
 }
 
@@ -344,6 +360,10 @@ export function liveStatePatch(
       // which is exactly what an older one means
       gripperState: ev.gripper ?? null,
       held: ev.held ?? null,
+      // the verdict describes the poses in THIS event, so it replaces
+      // wholesale like the rest of them (absent = an older backend = nothing
+      // scoring the session, which is what null already means)
+      success: ev.success ?? null,
     },
     livePropPoses: ev.props,
   };

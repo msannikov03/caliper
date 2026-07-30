@@ -179,6 +179,7 @@ describe("palette — dataset command gating", () => {
     contactEngine: false,
     actions: {
       openUrdf: noop,
+      openTask: noop,
       openPath: noop,
       setMode: noop,
       planHome: noop,

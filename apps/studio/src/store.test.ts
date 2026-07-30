@@ -38,8 +38,9 @@ vi.mock("@tauri-apps/api/event", () => ({
   }),
 }));
 
-// The native save dialog the recording path opens to pick a dataset directory.
-vi.mock("@tauri-apps/plugin-dialog", () => ({ save: vi.fn() }));
+// The two native dialogs the store opens: `save` picks a dataset directory for
+// a take, `open` picks a task file for openTask().
+vi.mock("@tauri-apps/plugin-dialog", () => ({ save: vi.fn(), open: vi.fn() }));
 
 // Replace xyflow utilities with minimal pure implementations.
 // applyNodeChanges / applyEdgeChanges are only used in the pass-through change
@@ -51,9 +52,10 @@ vi.mock("@xyflow/react", () => ({
 }));
 
 import { invoke } from "@tauri-apps/api/core";
-import { save } from "@tauri-apps/plugin-dialog";
+import { open, save } from "@tauri-apps/plugin-dialog";
 import {
   useStore,
+  DEFAULT_REC_FPS,
   handleGraphError,
   bumpNodeSeq,
   mergeRecent,
@@ -64,8 +66,9 @@ import {
   _flushLive,
   _resetLive,
 } from "./store";
-import type { RobotInfo, TrajectoryDto, StudioState } from "./store";
+import type { RobotInfo, TaskDto, TrajectoryDto, StudioState } from "./store";
 import type { GripperInfo, LiveStartedDto, LiveStateEvent } from "./sim/live";
+import type { SimProp } from "./sim/props";
 import { serializeGraph } from "./graph/serialize";
 import { defaultParams } from "./graph/spec";
 import type { KindName } from "./graph/spec";
@@ -73,6 +76,7 @@ import type { CNode, CEdge, Diagnostics, GraphRunResult } from "./graph/types";
 
 const mockInvoke = vi.mocked(invoke);
 const mockSaveDialog = vi.mocked(save);
+const mockOpenDialog = vi.mocked(open);
 
 // ---- shared fixtures ----
 
@@ -176,6 +180,7 @@ const STORE_RESET = {
   simEngine: "builtin" as const,
   simEngines: ["builtin"],
   simProps: [],
+  task: null,
   live: null,
   livePropPoses: [] as number[][],
   liveTarget: [] as number[],
@@ -1826,5 +1831,293 @@ describe("live session — store wiring", () => {
       expect(s.liveRecDone).toBeNull(); // nothing was saved into it
       expect(s.liveRecHint).toMatch(/discarded/);
     });
+  });
+});
+
+// ---- task artifacts (Wave C): open a *.caliper-task.json and run it ----
+
+describe("task artifacts — store wiring", () => {
+  const PREDICATE = { kind: "lifted", prop: "cube", height: 0.05, ref: "initial" };
+  /** A task prop as the wire delivers it: absent size fields for the kinds that
+   *  do not use them, and a contact material the frontend never interprets. */
+  const CUBE: SimProp = {
+    name: "cube",
+    kind: "box",
+    halfExtents: [0.05, 0.05, 0.05],
+    pos: [0, 0, 0.05],
+    mass: 0.05,
+    material: "wood",
+  };
+  const TASK_PATH = "/tasks/lift_cube.caliper-task.json";
+
+  function mockTaskDto(over: Partial<TaskDto> = {}): TaskDto {
+    return {
+      name: "lift-cube",
+      robotPath: "/fx/gripper_arm.urdf",
+      robot: MOCK_ROBOT,
+      q0: [0.3, -0.2],
+      ground: 0.02,
+      props: [CUBE],
+      zones: [{ name: "bin", center: [0.4, 0.2, 0.02], half: [0.05, 0.05, 0.02], rgba: null }],
+      gripper: { joint: "j1", closed: "hi" },
+      success: PREDICATE,
+      successDescription: "cube is lifted 0.05 m above its initial height",
+      horizonS: 20,
+      fps: 50,
+      ...over,
+    };
+  }
+
+  function mockStarted(over: Partial<LiveStartedDto> = {}): LiveStartedDto {
+    return {
+      sessionId: 1,
+      engine: "mujoco",
+      h: 0.002,
+      emitHz: 59.5,
+      ndof: 2,
+      props: [],
+      gripper: null,
+      ...over,
+    };
+  }
+
+  function mockState(over: Partial<LiveStateEvent> = {}): LiveStateEvent {
+    return {
+      sessionId: 1,
+      tick: 10,
+      t: 0.2,
+      q: [0.3, -0.2],
+      qd: [0, 0],
+      frames: [[1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]],
+      tip: [0.3, 0, 0.2],
+      ncon: 1,
+      props: [[0, 0, 0.05, 1, 0, 0, 0]],
+      paused: false,
+      target: [0.3, -0.2],
+      recording: false,
+      recFrames: 0,
+      ...over,
+    };
+  }
+
+  /** `task_open` answers with `dto` (or rejects with `fail`); every follow-up
+   *  the adopt path fires answers empty-but-valid. */
+  function backend(dto: TaskDto | null, fail?: string) {
+    mockInvoke.mockImplementation(async (cmd: string) => {
+      switch (cmd) {
+        case "task_open":
+          if (!dto) throw fail ?? "task_open failed";
+          return dto;
+        case "robot_info":
+          return MOCK_ROBOT;
+        case "get_frames":
+          return [];
+        case "list_poses":
+          return [];
+        case "sim_engines":
+          return ["builtin", "mujoco"];
+        case "live_start":
+          return mockStarted();
+        default:
+          return undefined;
+      }
+    });
+  }
+
+  function emit(channel: string, payload: unknown) {
+    liveHandlers[channel]({ payload });
+  }
+
+  it("adopts the robot the backend already loaded, plus the scene and start pose", async () => {
+    backend(mockTaskDto());
+
+    await useStore.getState().openTask(TASK_PATH);
+
+    expect(mockInvoke).toHaveBeenCalledWith("task_open", { path: TASK_PATH });
+    // the robot rode along with the reply — asking for it again would be a
+    // second load of the same file
+    expect(mockInvoke).not.toHaveBeenCalledWith("robot_info", expect.anything());
+    const s = useStore.getState();
+    expect(s.robot).toBe(MOCK_ROBOT);
+    expect(s.urdfPath).toBe("/fx/gripper_arm.urdf");
+    expect(s.q).toEqual([0.3, -0.2]); // the task's q0, through the FK refresh
+    expect(mockInvoke).toHaveBeenCalledWith("get_frames", { q: [0.3, -0.2] });
+    expect(s.mode).toBe("simulate");
+    expect(s.error).toBeNull();
+  });
+
+  it("pre-fills the prop editor with the task's scene, material and all", async () => {
+    backend(mockTaskDto());
+
+    await useStore.getState().openTask(TASK_PATH);
+
+    const s = useStore.getState();
+    expect(s.simProps).toEqual([CUBE]);
+    // opaque passthrough: the material is carried, never interpreted
+    expect(s.simProps[0].material).toBe("wood");
+    // props and verdicts are contact-engine features
+    expect(s.simEngine).toBe("mujoco");
+  });
+
+  it("keeps the task half of the reply as the task slice — and only that", async () => {
+    const dto = mockTaskDto();
+    backend(dto);
+
+    await useStore.getState().openTask(TASK_PATH);
+
+    // no `robot` and no `props`: the robot is adopted AS the robot, and the
+    // props are the prop editor's scene — neither is stored twice
+    expect(useStore.getState().task).toEqual({
+      path: TASK_PATH,
+      name: "lift-cube",
+      robotPath: "/fx/gripper_arm.urdf",
+      q0: [0.3, -0.2],
+      ground: 0.02,
+      zones: dto.zones,
+      gripper: { joint: "j1", closed: "hi" },
+      success: PREDICATE,
+      successDescription: "cube is lifted 0.05 m above its initial height",
+      horizonS: 20,
+      fps: 50,
+    });
+  });
+
+  it("defaults the record panel to the task's own label and rate", async () => {
+    backend(mockTaskDto({ fps: 30 }));
+
+    await useStore.getState().openTask(TASK_PATH);
+
+    expect(useStore.getState().liveRecTask).toBe("lift-cube");
+    expect(useStore.getState().liveRecFps).toBe(30);
+  });
+
+  it("falls back to the default rate when the task declares none", async () => {
+    backend(mockTaskDto({ fps: null }));
+
+    await useStore.getState().openTask(TASK_PATH);
+
+    expect(useStore.getState().liveRecFps).toBe(DEFAULT_REC_FPS);
+  });
+
+  it("starts at zero when the task declares no q0", async () => {
+    backend(mockTaskDto({ q0: null }));
+
+    await useStore.getState().openTask(TASK_PATH);
+
+    expect(useStore.getState().q).toEqual([0, 0]);
+  });
+
+  it("stays out of Simulate mode (loudly) when the task's robot has no dynamics", async () => {
+    backend(mockTaskDto({ robot: { ...MOCK_ROBOT, hasInertia: false } }));
+
+    await useStore.getState().openTask(TASK_PATH);
+
+    const s = useStore.getState();
+    expect(s.mode).toBe("jog"); // simulate's own gating disables that tab
+    expect(s.error).toMatch(/no inertial data/);
+    expect(s.task?.name).toBe("lift-cube");
+  });
+
+  it("picks the file in the native dialog when called with no path", async () => {
+    backend(mockTaskDto());
+    mockOpenDialog.mockResolvedValueOnce(TASK_PATH);
+
+    await useStore.getState().openTask();
+
+    expect(mockInvoke).toHaveBeenCalledWith("task_open", { path: TASK_PATH });
+  });
+
+  it("does nothing at all when that dialog is cancelled", async () => {
+    backend(mockTaskDto());
+    mockOpenDialog.mockResolvedValueOnce(null);
+
+    await useStore.getState().openTask();
+
+    expect(mockInvoke).not.toHaveBeenCalled();
+    expect(useStore.getState().task).toBeNull();
+  });
+
+  it("surfaces a bad task file and re-asserts the robot this UI is showing", async () => {
+    useStore.setState({ robot: MOCK_ROBOT, urdfPath: "/fx/showcase6.urdf" });
+    backend(null, "task `lift-cube`: q0 has 3 values but `panda` has 2 joints");
+
+    await useStore.getState().openTask(TASK_PATH);
+
+    const s = useStore.getState();
+    expect(s.error).toMatch(/q0 has 3 values/);
+    expect(s.task).toBeNull();
+    // task_open loads the robot BEFORE that check, so app state may now hold
+    // the task's robot — re-assert ours so the two ends cannot disagree
+    expect(mockInvoke).toHaveBeenCalledWith("robot_info", { path: "/fx/showcase6.urdf" });
+  });
+
+  it("a plain robot load drops the task (that robot is not the task's)", async () => {
+    backend(mockTaskDto());
+    await useStore.getState().openTask(TASK_PATH);
+    expect(useStore.getState().task).not.toBeNull();
+
+    await useStore.getState().loadRobot("/fx/showcase6.urdf");
+
+    const s = useStore.getState();
+    expect(s.task).toBeNull();
+    expect(s.simProps).toEqual([]);
+    expect(s.simEngine).toBe("builtin");
+    expect(s.mode).toBe("jog");
+  });
+
+  it("starts a live session on the task: its ground, gripper, scene and verdict", async () => {
+    backend(mockTaskDto());
+    await useStore.getState().openTask(TASK_PATH);
+
+    await useStore.getState().startLive();
+
+    expect(mockInvoke).toHaveBeenCalledWith("live_start", {
+      req: {
+        q0: [0.3, -0.2],
+        engine: "mujoco",
+        props: [CUBE],
+        ground: 0.02,
+        gripperJoint: "j1",
+        gripperClosed: "hi",
+        success: PREDICATE,
+      },
+    });
+  });
+
+  it("sends none of that when no task is loaded", async () => {
+    useStore.setState({
+      robot: MOCK_ROBOT,
+      q: [0, 0],
+      mode: "simulate",
+      simEngine: "mujoco",
+      simEngines: ["builtin", "mujoco"],
+    });
+    backend(mockTaskDto());
+
+    await useStore.getState().startLive();
+
+    expect(mockInvoke).toHaveBeenCalledWith("live_start", {
+      req: { q0: [0, 0], engine: "mujoco", props: [] },
+    });
+  });
+
+  it("tracks the streamed verdict per instant, without latching it", async () => {
+    backend(mockTaskDto());
+    await useStore.getState().openTask(TASK_PATH);
+    await useStore.getState().startLive();
+    expect(useStore.getState().live?.success).toBeNull(); // nothing judged yet
+
+    emit("live://state", mockState({ success: false }));
+    _flushLive();
+    expect(useStore.getState().live?.success).toBe(false);
+
+    emit("live://state", mockState({ tick: 20, success: true }));
+    _flushLive();
+    expect(useStore.getState().live?.success).toBe(true);
+
+    // the prop rolls back out of the zone: the badge follows the stream down
+    emit("live://state", mockState({ tick: 30, success: false }));
+    _flushLive();
+    expect(useStore.getState().live?.success).toBe(false);
   });
 });

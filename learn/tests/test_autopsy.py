@@ -11,6 +11,7 @@ stats are computed FROM the dataset, so the clean pairing really is clean
 
 import json
 import math
+import pathlib
 import shutil
 
 import numpy as np
@@ -451,6 +452,96 @@ def test_cli_eval_smoke(capsys, clean_ckpt, robot):
     assert payload["n_episodes"] == 2 and len(payload["episodes"]) == 2
     # eval findings are warn-grade — never an error exit
     assert rc == 0
+
+
+@pytest.fixture(scope="module")
+def cube_task_file(tmp_path_factory):
+    """A `*.caliper-task.json` for the showcase6 fixture: one prop parked far
+    from the arm, inside a zone that already contains it — so the predicate
+    reads TRUE and a passing rate proves the criterion was really consulted
+    (a wiring bug that silently dropped it would score 0/N)."""
+    path = tmp_path_factory.mktemp("task") / "park_cube.caliper-task.json"
+    path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "name": "park-cube",
+                "robot": str(pathlib.Path(URDF).resolve()),
+                "scene": {
+                    "ground": 0.0,
+                    "props": [
+                        {
+                            "name": "cube",
+                            "kind": "box",
+                            "halfExtents": [0.03, 0.03, 0.03],
+                            "pos": [5.0, 5.0, 0.03],
+                            "mass": 0.05,
+                            "material": "wood",
+                        }
+                    ],
+                    "zones": [
+                        {"name": "bin", "center": [5.0, 5.0, 0.03], "half": [0.2, 0.2, 0.2]}
+                    ],
+                },
+                "success": {"kind": "placed_in_zone", "prop": "cube", "zone": "bin"},
+                "horizonS": 0.2,  # 5 control steps at FPS
+                "fps": FPS,
+            }
+        )
+    )
+    return path
+
+
+def test_cli_eval_with_a_task_artifact(capsys, clean_ckpt, cube_task_file):
+    rc = main(["eval", str(clean_ckpt), "--task", str(cube_task_file), "--episodes", "2", "--json"])
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert payload["n_episodes"] == 2
+    # The file's own verdict, quoted in the result — never a bare rate.
+    assert "cube's center is inside" in payload["success_criterion"]
+    assert payload["n_success"] == 2  # the predicate held from the first step
+    assert [e["steps"] for e in payload["episodes"]] == [1, 1]
+
+
+def test_cli_autopsy_with_a_task_artifact(capsys, clean_ckpt, clean_ds, cube_task_file):
+    """--task also supplies autopsy's robot, so the E and L sections run without
+    --urdf and the verdict states what counted as success."""
+    rc = main(
+        [
+            "autopsy",
+            str(clean_ckpt),
+            str(clean_ds),
+            "--task",
+            str(cube_task_file),
+            "--episodes",
+            "2",
+            "--ticks",
+            "4",
+            "--json",
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert payload["eval"] is not None and payload["latency"] is not None
+    assert payload["eval"]["n_episodes"] == 2
+    assert "where success =" in payload["verdict"]
+
+
+def test_cli_task_form_conflicts_are_loud(clean_ckpt, clean_ds, cube_task_file):
+    # The two forms name two different robots and two different verdicts.
+    with pytest.raises(SystemExit, match="already carries the robot"):
+        main(["eval", str(clean_ckpt), "--task", str(cube_task_file), "--urdf", URDF])
+    # eval cannot run without a task at all.
+    with pytest.raises(SystemExit, match="no task"):
+        main(["eval", str(clean_ckpt)])
+    # A half-specified reach form is refused rather than silently skipped.
+    with pytest.raises(SystemExit, match="needs all of"):
+        main(["autopsy", str(clean_ckpt), str(clean_ds), "--urdf", URDF, "--frame", "flange"])
+    # coverage takes exactly one robot source.
+    with pytest.raises(SystemExit, match="exactly one robot source"):
+        main(["coverage", str(clean_ds), str(clean_ds), "--urdf", URDF, "--task", str(cube_task_file)])
+    with pytest.raises(SystemExit, match="exactly one robot source"):
+        main(["coverage", str(clean_ds), str(clean_ds)])
 
 
 def test_cli_profile_smoke(capsys, clean_ckpt):

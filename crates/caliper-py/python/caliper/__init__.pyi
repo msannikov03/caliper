@@ -83,6 +83,13 @@ def calibrate_joint_offsets(
 # case-insensitive) or a custom dict {"solref": (timeconst, dampratio),
 # "solimp": (dmin, dmax, width), "friction": (slide, torsion, roll)}.
 _Material = Union[str, dict[str, Sequence[float]]]
+# A free-floating prop, in the `*.caliper-task.json` prop spelling:
+# {"name": str, "kind": "box"|"sphere"|"cylinder", "halfExtents": _Vec3 (box),
+#  "radius": float (sphere/cylinder), "length": float (cylinder, FULL length),
+#  "pos": _Vec3, "quat": Sequence[float] (w-first, optional),
+#  "mass": float (kg, default 0.1), "rgba": Sequence[float] (optional),
+#  "material": _Material (optional, overrides the document material)}.
+_Prop = dict[str, Any]
 
 def model_to_mjcf(
     robot: "Robot",
@@ -94,6 +101,7 @@ def model_to_mjcf(
     actuators: bool = ...,
     kp: float = ...,
     kv: float = ...,
+    props: Optional[Sequence[_Prop]] = ...,
 ) -> str:
     """Generate a minimal MuJoCo MJCF document (XML string) from the robot.
 
@@ -109,6 +117,15 @@ def model_to_mjcf(
     `actuators=True` the document carries one `<position>` servo per joint
     (`kp`/`kv` gains) instead of the default torque-direct layout, mirroring
     the CLI's `mjcf --actuators`.
+
+    `props` adds free-floating primitive bodies — the objects a manipulation
+    task moves (see `_Prop`). Each becomes a `<freejoint>` body with an
+    explicit COM inertial computed from its mass and shape, emitted AFTER the
+    robot bodies, so the robot keeps the qpos/qvel PREFIX and every prop adds
+    7 qpos / 6 qvel behind it. Prop dicts are validated by the same rulebook a
+    `*.caliper-task.json` scene gets: unknown keys, unknown kinds, missing
+    dimensions and impossible values all raise `ValueError`. `extra_xml` still
+    composes (it lands before the robot bodies, props after).
     """
     ...
 

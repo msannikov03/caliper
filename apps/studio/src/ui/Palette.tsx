@@ -48,6 +48,7 @@ export function Palette({ onClose }: { onClose: () => void }) {
       contactEngine,
       actions: {
         openUrdf: () => void openUrdf(),
+        openTask: () => void useStore.getState().openTask(),
         openPath: (path, record) => void selectRobot(path, record),
         setMode: (m) => useStore.getState().setMode(m),
         planHome: () => void useStore.getState().planMoveJ(home()),

@@ -82,19 +82,26 @@ class SimCameraScene:
     def from_robot(cls, robot, *, width: int = 96, height: int = 96,
                    camera: str = DEFAULT_CAMERA, ground: float | None = None,
                    extra_xml: str = "", reach: float | None = None,
-                   compress_level: int = 6) -> "SimCameraScene":
+                   compress_level: int = 6, props=None) -> "SimCameraScene":
         """Build from a caliper Robot via `caliper.model_to_mjcf`.
 
         `extra_xml` is appended verbatim inside `<worldbody>` AFTER the camera
         — the hook for prop `<geom>`s (targets, tables, obstacles). The default
         camera is over-the-shoulder, auto-scaled to the robot's reach (override
         with `reach`, or supply your own `<camera>` in `extra_xml` + `camera=`).
+
+        `props` are structured free-floating props (the
+        `caliper.model_to_mjcf(props=...)` dicts). They add 7 qpos each, BEHIND
+        the robot's, so a caller rendering a live sim must hand `render()` that
+        sim's full qpos — which is exactly what `VecSimEnv` does when it builds
+        its scenes from the same prop list.
         """
         import caliper  # lazy runtime dep (built via maturin)
 
         r = robot_reach(robot) if reach is None else float(reach)
         xml = caliper.model_to_mjcf(
             robot, ground=ground, extra_xml=camera_xml(r, camera) + extra_xml,
+            props=props,
         )
         return cls(xml, width=width, height=height, camera=camera,
                    compress_level=compress_level)

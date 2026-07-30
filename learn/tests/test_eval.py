@@ -1,8 +1,11 @@
 """Seeded eval harness tests: a scripted controller clears an easy reach task,
 a null policy scores ~0, determinism is byte-exact on the serialized result,
-sweep ranks good above null, Wilson CI matches hand arithmetic, and every
-finding has a positive (crafted defect detected) AND a negative (clean run,
-zero findings) case. CPU-only, seconds."""
+sweep ranks good above null, Wilson CI matches hand arithmetic, the task-artifact
+entry point (`eval_task_from_file`) wires a whole `*.caliper-task.json`, and
+every finding has a positive (crafted defect detected) AND a negative (clean
+run, zero findings) case. CPU-only, seconds."""
+
+import pathlib
 
 import numpy as np
 import pytest
@@ -18,12 +21,22 @@ from caliper_learn.eval import (  # noqa: E402
     EvalConfig,
     EvalResult,
     EvalTask,
+    eval_task_from_file,
     evaluate,
     reach_eval_task,
     render_text,
     sweep,
     to_json,
     wilson_interval,
+)
+
+
+PICK_TASK = (
+    pathlib.Path(__file__).resolve().parents[2]
+    / "oracle"
+    / "fixtures"
+    / "tasks"
+    / "pick_cube.caliper-task.json"
 )
 
 
@@ -261,3 +274,30 @@ def test_unsupported_policy_type_raises(easy_reach):
         evaluate(lambda s: np.zeros(1), task, EvalConfig(n_episodes=1))  # wrong shape
     with pytest.raises(ValueError):
         evaluate(null_policy, task, EvalConfig(n_episodes=0))
+
+
+def test_eval_task_from_a_task_artifact():
+    """`--task FILE` in library form: the artifact supplies the robot, the
+    scene, the start pose, the rate, the step budget and the verdict."""
+    task = eval_task_from_file(PICK_TASK)
+    assert int(task.robot.ndof) == 3
+    assert task.fps == 50
+    assert task.max_steps == 1000  # the 20 s horizonS at 50 Hz
+    assert task.ground == 0.0 and task.q0 == [0.0, 0.0, 0.02]
+    assert [p["name"] for p in task.props] == ["cube"]
+    assert task.extra_xml == ""  # props no longer ride in as raw XML
+    # Nothing is invented: a task file states what SUCCESS is, not what a
+    # shaped reward would be.
+    assert task.reward_fn is None and task.termination_fn is None
+    assert task.success_predicate.name == "placed_in_zone:cube"
+
+    # ... and it runs. A hold-still policy never places the cube, so the report
+    # is 0/N — with the criterion quoted, not just the rate.
+    short = eval_task_from_file(PICK_TASK, max_steps=3)
+    assert short.max_steps == 3
+    res = evaluate(lambda s: s[:3], short, EvalConfig(n_episodes=2, base_seed=0))
+    assert res.n_episodes == 2 and res.n_success == 0
+    assert res.success_criterion == task.success_predicate.describe()
+    codes = {f.code for f in res.findings}
+    assert ALL_EPISODES_FAILED in codes and ZERO_REWARD_SIGNAL in codes
+    assert "cube's center is inside" in render_text(res)

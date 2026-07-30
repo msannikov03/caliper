@@ -59,6 +59,16 @@ obs = env.reset()
 obs, reward, terminated, truncated, info = env.step(actions)  # (8, ndof) qpos targets
 ```
 
+Scenes and tasks: `VecSimEnv(props=[...])` places free props through the same
+Rust prop path the task format uses (materials included; they also render in
+image observations), `success=` reports [success
+predicates](../docs/book/src/capabilities/verdicts.md) per step, and
+`VecSimEnv.from_task(load_task("pick.caliper-task.json"))` wires a whole
+[task artifact](../docs/book/src/reference/task-artifact.md) — props, success,
+`q0`, ground, horizon — in one call. `caliper-learn eval/autopsy/coverage`
+accept `--task FILE` (for eval/autopsy it replaces `--urdf/--frame/--target`;
+explicit `--fps`/`--max-steps` still win over the file's values).
+
 ## Deploying lerobot Hub checkpoints
 
 `hub.load_lerobot_policy(dir)` loads a lerobot-0.4.4-convention checkpoint (config.json +

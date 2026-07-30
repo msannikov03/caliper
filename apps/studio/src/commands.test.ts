@@ -26,6 +26,7 @@ function mkCtx(over: Partial<CommandCtx> = {}): CommandCtx {
     contactEngine: false, // default pins the no-mujoco build baseline
     actions: {
       openUrdf: noop,
+      openTask: noop,
       openPath: noop,
       setMode: noop,
       planHome: noop,
@@ -103,6 +104,22 @@ describe("buildCommands", () => {
     }
     expect(byId(cmds, "robot.reload").enabled).toBe(false);
     expect(byId(cmds, "robot.open").enabled).toBe(true); // Open… is always live
+    // a task file carries its own robot, so it is gated on nothing either
+    expect(byId(cmds, "task.open").enabled).toBe(true);
+  });
+
+  it("offers Open task… beside Open URDF…, ungated, in every mode", () => {
+    let opened = 0;
+    for (const mode of ["jog", "simulate", "data"] as const) {
+      const ctx = mkCtx({ mode, robotLoaded: false, hasInertia: false, urdfPath: null });
+      ctx.actions.openTask = () => opened++;
+      const cmd = byId(buildCommands(ctx), "task.open");
+      expect(cmd.section).toBe("Robot");
+      expect(cmd.enabled).toBe(true);
+      expect(cmd.hint).toBe("*.caliper-task.json");
+      cmd.run();
+    }
+    expect(opened).toBe(3);
   });
 
   it("gates mode-scoped actions on the current mode", () => {

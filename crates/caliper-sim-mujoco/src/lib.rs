@@ -1,6 +1,6 @@
 //! MuJoCo contact simulation behind a clean seam.
 //!
-//! Two layers, both engine-side (no Studio/py surface this wave):
+//! Two simulation layers:
 //!
 //! 1. [`mjcf`] — generate a MINIMAL MJCF document from a caliper
 //!    [`Model`](caliper_model::Model): kinematic tree, hinge/slide joints,
@@ -14,6 +14,12 @@
 //!    [`caliper_hal::RobotBackend`] impl, so the EXISTING
 //!    `ControlLoop`/`SafetyMonitor`/teleop/recording stack drives a contact
 //!    sim unchanged.
+//!
+//! Plus [`task`] — the `*.caliper-task.json` ARTIFACT (robot + scene + zones +
+//! gripper + success criterion) and its success-predicate evaluator, sharing
+//! one JSON schema with `caliper_learn.success` so a task scores the same in
+//! Studio and in a python rollout. Always compiled — reading and judging a task
+//! needs no MuJoCo.
 //!
 //! Plus [`lint`] — the contact STABILITY LINTER: the pure trace classifier is
 //! always compiled; the rollout entry (`lint::lint_contact_stability`) needs
@@ -51,6 +57,7 @@
 
 pub mod lint;
 pub mod mjcf;
+pub mod task;
 
 #[cfg(feature = "mujoco")]
 mod backend;

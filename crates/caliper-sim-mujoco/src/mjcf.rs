@@ -727,7 +727,7 @@ fn hull_mesh_asset(name: &str, points: &[Point3<f64>]) -> Result<String, MujocoE
 
 /// Reject a bad prop BEFORE it reaches the MuJoCo compiler (clearer errors,
 /// and the generator stays deterministic-or-Err, never partially emitted).
-fn validate_prop(p: &PropSpec) -> Result<(), MujocoError> {
+pub(crate) fn validate_prop(p: &PropSpec) -> Result<(), MujocoError> {
     if p.name.trim().is_empty() {
         return Err(MujocoError::Mjcf("prop name must be non-empty".into()));
     }

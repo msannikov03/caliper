@@ -38,6 +38,7 @@ export function Toolbar({ version, onPalette }: { version: string; onPalette: ()
   const loadRecent = useStore((s) => s.loadRecent);
   const fixtures = useStore((s) => s.fixtures);
   const loadFixtures = useStore((s) => s.loadFixtures);
+  const openTask = useStore((s) => s.openTask);
   // the select mirrors whatever the store last (attempted to) load
   const sel = useStore((s) => s.urdfPath) ?? "";
 
@@ -66,6 +67,15 @@ export function Toolbar({ version, onPalette }: { version: string; onPalette: ()
         onClick={() => void openUrdf()}
       >
         Open URDF…
+      </button>
+      {/* a task brings its own robot, so this needs nothing loaded either */}
+      <button
+        className="btn ghost"
+        disabled={loading}
+        title="open a *.caliper-task.json — robot, scene and success predicate"
+        onClick={() => void openTask()}
+      >
+        Open task…
       </button>
       <select
         className="fixture-select"

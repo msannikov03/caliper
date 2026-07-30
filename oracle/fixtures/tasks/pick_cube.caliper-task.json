@@ -1,0 +1,37 @@
+{
+  "version": 1,
+  "name": "pick-cube",
+  "robot": "../robots/gripper_arm.urdf",
+  "q0": [0.0, 0.0, 0.02],
+  "scene": {
+    "ground": 0.0,
+    "props": [
+      {
+        "name": "cube",
+        "kind": "box",
+        "halfExtents": [0.05, 0.05, 0.05],
+        "pos": [0.0, 0.0, 0.05],
+        "mass": 0.05,
+        "rgba": [0.9, 0.4, 0.2, 1.0],
+        "material": "wood"
+      }
+    ],
+    "zones": [
+      {
+        "name": "bin",
+        "center": [0.4, 0.2, 0.02],
+        "half": [0.05, 0.05, 0.02],
+        "rgba": [0.2, 0.8, 0.4, 0.35]
+      }
+    ]
+  },
+  "gripper": { "joint": "gripper", "closed": "lo" },
+  "success": {
+    "kind": "placed_in_zone",
+    "prop": "cube",
+    "zone": { "center": [0.4, 0.2, 0.02], "half": [0.05, 0.05, 0.02] },
+    "settled_speed": 0.01
+  },
+  "horizonS": 20.0,
+  "fps": 50
+}

@@ -191,6 +191,16 @@
   white-space: nowrap; /* a long prop name elides; the title carries it */
 }
 
+/* --- simulate panel: task verdict (Wave C) ---
+   The one badge that reports a JUDGEMENT rather than a state, so it fills
+   instead of tinting; "not yet" stays a plain muted badge (a verdict that has
+   not happened must not compete with the live readouts around it). */
+.sim-panel .badge.success {
+  background: var(--accent-dim);
+  border-color: var(--accent-glow);
+  color: var(--accent);
+}
+
 /* --- simulate panel: teleop recording (A3) ---
    Sits under the live transport and borrows its secondary-chrome treatment;
    the ONE exception is the record control, which is red and pulses while a

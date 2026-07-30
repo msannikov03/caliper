@@ -44,11 +44,28 @@
 //! forearm when the gripper closes will be taken. And a MuJoCo weld is a soft
 //! constraint, so a carried prop sags a millimetre or two under a hard swing
 //! rather than tracking rigidly.
+//!
+//! # Verdicts (Wave C)
+//!
+//! A session can also carry the SUCCESS PREDICATE of a task artifact
+//! ([`LiveStartReq::success`], normally handed over verbatim by `task_open`):
+//! the same JSON, judged by the same evaluator
+//! ([`caliper_sim_mujoco::task::success`]), that scores a python rollout. It is
+//! validated in `live_start` — before any thread exists — and then judged once
+//! per emitted state from the sim's own prop poses and velocities, so
+//! `live://state.success` always describes the poses in that same event.
+//!
+//! `live_reset` starts a fresh episode for the verdict too: a `lifted` bar is
+//! re-anchored at the pose the reset installed, never at the previous
+//! episode's. And `success` is `null` — not `false` — whenever nothing is being
+//! scored (no predicate, or the builtin engine, which has no props for a
+//! predicate to be about).
 
 use crate::{bake_frame_row, logged, AppState, PropDto, PropTrackDto};
 use caliper::hal::{ControlLoop, Frame, Gains, PhysicsSimBackend, TeleopSetpoint};
 use caliper::model::Model;
 use caliper_dataset::{DatasetSpec, DatasetWriter, FeatureSpec};
+use caliper_sim_mujoco::task::success::{Predicate, SuccessState, SuccessTracker};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -107,6 +124,13 @@ pub struct LiveStartReq {
     /// Which end of the gripper joint's range CLOSES it: `"lo"` (the default,
     /// and the usual convention) or `"hi"`.
     gripper_closed: Option<String>,
+    /// Success predicate to judge this session against, in the
+    /// `caliper-task.json` / `caliper_learn.success` JSON schema (typically
+    /// straight from `task_open`). Validated in `live_start` — an unknown key,
+    /// an unresolved zone name or a prop the scene does not contain is an Err
+    /// before any thread exists. `None` = no verdict is computed.
+    #[serde(default)]
+    success: Option<serde_json::Value>,
 }
 
 #[derive(Serialize)]
@@ -184,6 +208,12 @@ pub struct LiveStateEvent {
     /// nothing is held. Always `null` on the builtin engine, which has no
     /// contacts to grasp with.
     held: Option<String>,
+    /// The session's success verdict for THIS state, or `null` when there is
+    /// nothing to judge — no predicate was supplied, or the engine is the
+    /// builtin one, which has no props for a predicate to be about. `null` is
+    /// deliberately distinct from `false`: it means "not evaluated", never
+    /// "not yet succeeded".
+    success: Option<bool>,
 }
 
 #[derive(Serialize, Clone)]
@@ -575,6 +605,25 @@ impl LiveEngine {
         }
     }
 
+    /// The evaluator's view of the scene: every prop's world center and world
+    /// LINEAR velocity, by name. Empty on builtin (no props exist), which is
+    /// why a builtin session never reports a verdict.
+    fn success_state(&self) -> Result<SuccessState, String> {
+        match self {
+            LiveEngine::Builtin(_) => Ok(SuccessState::default()),
+            #[cfg(feature = "mujoco")]
+            LiveEngine::Mujoco(l) => {
+                let sim = l.backend().sim();
+                let pos = sim.prop_poses().into_iter().map(|(n, p, _)| (n, p));
+                // Velocities come along unconditionally: a `settled_speed`
+                // predicate that could not be answered would ERROR, and the
+                // session has them for free.
+                let vel = sim.prop_velocities().map_err(|e| e.to_string())?;
+                Ok(SuccessState::from_positions(pos).with_velocities(vel))
+            }
+        }
+    }
+
     /// Weld the first prop that is genuinely touching a robot geom, and return
     /// its name. `None` = nothing to grab (and always `None` on builtin, which
     /// has no contacts at all). The weld captures the CURRENT relative pose,
@@ -947,6 +996,18 @@ fn set_status(shared: &LiveShared, paused: bool, t: f64, tick: u64) {
     }
 }
 
+/// Start a fresh success episode: re-capture every `ref="initial"` baseline
+/// from the CURRENT state. Called at session start and after every reset — a
+/// lift is always measured from where this episode began, never from where the
+/// last one did.
+fn reset_success(success: &mut Option<SuccessTracker>, engine: &LiveEngine) -> Result<(), String> {
+    let Some(t) = success.as_mut() else {
+        return Ok(());
+    };
+    let st = engine.success_state()?;
+    t.reset(Some(&st)).map_err(|e| e.to_string())
+}
+
 fn state_event(
     engine: &LiveEngine,
     model: &Model,
@@ -954,11 +1015,23 @@ fn state_event(
     session_id: u64,
     paused: bool,
     gripper: Option<&GripperChannel>,
-) -> Option<LiveStateEvent> {
+    success: &mut Option<SuccessTracker>,
+) -> Result<LiveStateEvent, String> {
     let (q, qd, ncon, props) = engine.snapshot();
     if !(q.iter().all(|x| x.is_finite()) && qd.iter().all(|x| x.is_finite())) {
-        return None; // non-finite → the caller ends the session with an error
+        return Err("simulation state went non-finite".into());
     }
+    // Judged from the SAME state that is about to be emitted, so a `true` in an
+    // event always describes the poses in that event. A predicate that cannot
+    // be answered (a prop that vanished) ends the session loudly rather than
+    // streaming `null` as if nothing were being scored.
+    let verdict = match success.as_mut() {
+        None => None,
+        Some(t) => {
+            let st = engine.success_state()?;
+            Some(t.judge(&st).map_err(|e| format!("success: {e}"))?)
+        }
+    };
     let (frames, tip) = bake_frame_row(model, &q);
     let target = shared
         .target
@@ -972,7 +1045,7 @@ fn state_event(
         })
     });
     let held = shared.held.lock().ok().and_then(|h| h.clone());
-    Some(LiveStateEvent {
+    Ok(LiveStateEvent {
         session_id,
         tick: engine.tick(),
         t: engine.time(),
@@ -988,6 +1061,7 @@ fn state_event(
         rec_frames: shared.rec_frames.load(Ordering::Relaxed),
         gripper,
         held,
+        success: verdict,
     })
 }
 
@@ -1004,6 +1078,7 @@ fn run_session<E: LiveEmitter>(
     session_id: u64,
     shared: Arc<LiveShared>,
     gripper: Option<GripperChannel>,
+    success: Option<SuccessTracker>,
     emitter: E,
 ) {
     let mut rec: Option<Recorder> = None;
@@ -1016,6 +1091,7 @@ fn run_session<E: LiveEmitter>(
         session_id,
         &shared,
         gripper.as_ref(),
+        success,
         &emitter,
         &mut rec,
     );
@@ -1037,6 +1113,7 @@ fn session_loop<E: LiveEmitter>(
     session_id: u64,
     shared: &Arc<LiveShared>,
     gripper: Option<&GripperChannel>,
+    mut success: Option<SuccessTracker>,
     emitter: &E,
     rec: &mut Option<Recorder>,
 ) -> String {
@@ -1067,16 +1144,33 @@ fn session_loop<E: LiveEmitter>(
     }
     macro_rules! emit_state_or_die {
         ($paused:expr) => {
-            match state_event(&engine, model, shared, session_id, $paused, gripper) {
-                Some(ev) => {
+            match state_event(
+                &engine,
+                model,
+                shared,
+                session_id,
+                $paused,
+                gripper,
+                &mut success,
+            ) {
+                Ok(ev) => {
                     set_status(shared, $paused, ev.t, ev.tick);
                     emitter.state(&ev);
                 }
-                None => die!("simulation state went non-finite"),
+                Err(e) => die!(e),
+            }
+        };
+    }
+    // Re-anchor the success episode at the current state (start / after reset).
+    macro_rules! reset_success_or_die {
+        () => {
+            if let Err(e) = reset_success(&mut success, &engine) {
+                die!(e);
             }
         };
     }
 
+    reset_success_or_die!(); // the lift baseline is the pose we START from
     emit_state_or_die!(last_paused); // initial snapshot so the UI paints at once
 
     loop {
@@ -1123,6 +1217,9 @@ fn session_loop<E: LiveEmitter>(
             pacer.clear();
             last_wall = Instant::now();
             since_emit = 0;
+            // A reset is a fresh EPISODE for the verdict too: the props are back
+            // at their spawn poses, so that is where a lift is measured from.
+            reset_success_or_die!();
             emit_state_or_die!(last_paused);
             continue;
         }
@@ -1299,6 +1396,55 @@ fn resolve_gripper(
     }))
 }
 
+/// Parse + validate the session's success predicate against the scene it will
+/// judge, and decide whether this engine can judge it at all.
+///
+/// Everything a bad predicate can be is caught here: an unknown key or kind, a
+/// zone still referenced by NAME (`task_open` resolves those against the task
+/// file's `scene.zones`; a predicate arriving with one has no scene to resolve
+/// against), and a prop the session's scene does not contain — which would
+/// otherwise surface as a dead session on the first emitted state.
+///
+/// The BUILTIN engine has no props, so nothing a predicate could be about
+/// exists: the predicate is still validated for shape, but no tracker is
+/// installed and `live://state.success` stays `null` for the whole session. A
+/// silent `false` there would read as "not succeeded yet" instead of "nobody is
+/// scoring this".
+fn resolve_success(
+    spec: Option<&serde_json::Value>,
+    engine_name: &str,
+    props: &[PropDto],
+) -> Result<Option<SuccessTracker>, String> {
+    let Some(spec) = spec else { return Ok(None) };
+    let pred = Predicate::from_value(spec).map_err(|e| format!("success: {e}"))?;
+    if let Some(zone) = pred.unresolved_zone() {
+        return Err(format!(
+            "success refers to zone `{zone}` by name — a live session has no task file to \
+             resolve it against; open the task (which resolves its own zones) or spell the \
+             zone out as {{center, half}}"
+        ));
+    }
+    if engine_name != "mujoco" {
+        log::warn!(
+            target: "studio::live",
+            "a success predicate ({}) was supplied for the `{engine_name}` engine, which has \
+             no props to judge — the session will report success = null",
+            pred.name()
+        );
+        return Ok(None);
+    }
+    let known: Vec<&str> = props.iter().map(|p| p.name.as_str()).collect();
+    for prop in pred.prop_names() {
+        if !known.contains(&prop) {
+            return Err(format!(
+                "success scores prop `{prop}`, which this scene does not contain \
+                 (props: {known:?})"
+            ));
+        }
+    }
+    Ok(Some(SuccessTracker::new(pred)))
+}
+
 // ===== command impls (take &AppState so tests drive them without tauri) =====
 
 /// Raise `stop` on an existing session (reason per `superseded`) and join it.
@@ -1369,6 +1515,11 @@ pub(crate) fn live_start_on<E: LiveEmitter>(
             .to_string()
     });
 
+    // The verdict is resolved BEFORE the engine, for the same reason as the
+    // gripper channel: a predicate that cannot be judged in this scene must
+    // fail with nothing constructed.
+    let success = resolve_success(req.success.as_ref(), engine_name, &req.props)?;
+
     let (engine, h) = build_engine(
         &arc,
         engine_name,
@@ -1401,6 +1552,7 @@ pub(crate) fn live_start_on<E: LiveEmitter>(
                 session_id,
                 thread_shared,
                 thread_gripper,
+                success,
                 emitter,
             )
         })
@@ -1917,6 +2069,7 @@ mod tests {
                 emit_hz: None,
                 gripper_joint: None,
                 gripper_closed: None,
+                success: None,
             },
             em.clone(),
         )
@@ -2074,6 +2227,7 @@ mod tests {
                 emit_hz: None,
                 gripper_joint: None,
                 gripper_closed: None,
+                success: None,
             },
             em.clone(),
         )
@@ -2125,6 +2279,7 @@ mod tests {
                     quat: None,
                     mass: None,
                     rgba: None,
+                    material: None,
                 }],
                 ground: None,
                 kp: None,
@@ -2132,6 +2287,7 @@ mod tests {
                 emit_hz: None,
                 gripper_joint: None,
                 gripper_closed: None,
+                success: None,
             },
             em,
         )
@@ -2183,6 +2339,7 @@ mod tests {
             emit_hz: None,
             gripper_joint: joint.map(str::to_string),
             gripper_closed: closed.map(str::to_string),
+            success: None,
         }
     }
 
@@ -2382,6 +2539,82 @@ mod tests {
         );
         assert_eq!(s.target[g.index], 0.02, "and the target back to q0");
         assert!(s.held.is_none());
+        live_stop_impl(&state).unwrap();
+    }
+
+    // -- success predicates (Wave C) --
+
+    /// The lift predicate every success test below is built around.
+    fn lift_cube(height: f64) -> serde_json::Value {
+        serde_json::json!({"kind": "lifted", "prop": "cube", "height": height, "ref": "initial"})
+    }
+
+    /// A predicate is validated the moment it arrives, and a session that
+    /// cannot judge one is never started.
+    #[test]
+    fn a_bad_success_predicate_is_refused_before_the_session_exists() {
+        let state = gripper_state();
+        let cases = [
+            (
+                serde_json::json!({"kind": "lifted", "prop": "cube", "heigth": 0.05}),
+                "unknown key",
+            ),
+            (
+                serde_json::json!({"kind": "levitated", "prop": "cube", "height": 0.05}),
+                "unknown success predicate kind",
+            ),
+            (
+                serde_json::json!({"kind": "lifted", "prop": "cube", "height": 0.0}),
+                "not a lift",
+            ),
+            (
+                serde_json::json!({"kind": "placed_in_zone", "prop": "cube", "zone": "bin"}),
+                "by name",
+            ),
+            (
+                serde_json::json!({"kind": "all_of", "terms": []}),
+                "at least one term",
+            ),
+        ];
+        for (spec, want) in cases {
+            let mut req = gripper_req(vec![0.0, 0.0, 0.02], None, None);
+            req.success = Some(spec.clone());
+            let err = live_start_on(&state, req, Collect::default())
+                .map(|_| ())
+                .unwrap_err();
+            assert!(err.contains(want), "for {spec}\n  got: {err}");
+            assert!(
+                live_status_impl(&state).unwrap().is_none(),
+                "a refused start must leave no session"
+            );
+        }
+    }
+
+    /// The builtin engine has no props, so it scores nothing — and says so with
+    /// `null` rather than a `false` that would read as "not yet".
+    #[test]
+    fn builtin_reports_no_verdict_at_all() {
+        let state = gripper_state();
+        let mut req = gripper_req(vec![0.0, 0.0, 0.02], None, None);
+        req.success = Some(lift_cube(0.05));
+        let em = Collect::default();
+        live_start_on(&state, req, em.clone()).expect("builtin start with a predicate");
+        sleep_ms(120);
+        let states = em.states();
+        assert!(!states.is_empty());
+        assert!(
+            states.iter().all(|s| s.success.is_none()),
+            "builtin must report success = null"
+        );
+        live_stop_impl(&state).unwrap();
+    }
+
+    #[test]
+    fn no_predicate_means_no_verdict() {
+        let state = pendulum_state();
+        let (em, _dto) = start_builtin(&state, vec![0.1, 0.0]);
+        sleep_ms(80);
+        assert!(em.last_state().success.is_none());
         live_stop_impl(&state).unwrap();
     }
 
@@ -2752,6 +2985,7 @@ mod tests {
                 quat: None,
                 mass: None,
                 rgba: None,
+                material: None,
             }
         }
 
@@ -2771,6 +3005,7 @@ mod tests {
                     emit_hz: None,
                     gripper_joint: None,
                     gripper_closed: None,
+                    success: None,
                 },
                 em.clone(),
             )
@@ -2811,10 +3046,19 @@ mod tests {
                 quat: None,
                 mass: Some(0.05),
                 rgba: None,
+                material: None,
             }
         }
 
         fn start_grasp_session(state: &AppState) -> (Collect, LiveStartedDto) {
+            start_grasp_session_with(state, None)
+        }
+
+        /// The grasp rig, optionally judged by a success predicate.
+        fn start_grasp_session_with(
+            state: &AppState,
+            success: Option<serde_json::Value>,
+        ) -> (Collect, LiveStartedDto) {
             let em = Collect::default();
             let dto = live_start_on(
                 state,
@@ -2828,6 +3072,7 @@ mod tests {
                     emit_hz: None,
                     gripper_joint: None,
                     gripper_closed: None,
+                    success,
                 },
                 em.clone(),
             )
@@ -2939,6 +3184,111 @@ mod tests {
             );
             assert!(s.held.is_none(), "an open gripper grabbed something");
             live_stop_impl(&state).unwrap();
+        }
+
+        /// The Wave C payoff: a task's success criterion, judged live. Same
+        /// choreography as the grasp test — close on the cube, swing it up —
+        /// with the verdict flipping on the tick the lift clears its bar, and
+        /// re-anchoring (back to `false`) when the episode resets.
+        #[test]
+        fn a_lift_predicate_flips_true_when_the_prop_is_carried_up() {
+            let state = gripper_state();
+            let (em, dto) = start_grasp_session_with(&state, Some(lift_cube(0.05)));
+            let g = dto.gripper.expect("gripper_arm has a gripper channel");
+
+            // The baseline is the pose the session STARTED from, so a cube
+            // sitting where it spawned is not a lift.
+            sleep_ms(150);
+            let s = em.last_state();
+            assert_eq!(s.success, Some(false), "an untouched cube is not lifted");
+            let rest_z = s.props[0][2];
+
+            live_gripper_impl(&state, true).unwrap();
+            assert!(
+                wait_for(&em, 2000, |s| s.held.as_deref() == Some("cube")),
+                "the gripper never took the cube"
+            );
+            // Still not a lift while it rests on the ground.
+            assert_eq!(em.last_state().success, Some(false));
+
+            live_set_target_impl(&state, &[0.7, 0.0, g.closed_target]).unwrap();
+            assert!(
+                wait_for(&em, 3000, |s| s.success == Some(true)),
+                "carrying the cube up never satisfied the predicate (z {rest_z} → {}, \
+                 success {:?})",
+                em.last_state().props[0][2],
+                em.last_state().success
+            );
+            // The verdict describes the poses in its OWN event.
+            let s = em.last_state();
+            assert!(
+                s.props[0][2] > rest_z + 0.05,
+                "success true at z = {} (rest {rest_z})",
+                s.props[0][2]
+            );
+
+            // A reset re-anchors the baseline: the cube is back on the ground,
+            // and the next episode starts from `false` again.
+            live_reset_impl(&state, None).unwrap();
+            assert!(
+                wait_for(&em, 2000, |s| s.success == Some(false) && s.held.is_none()),
+                "reset must re-anchor the lift baseline (success {:?})",
+                em.last_state().success
+            );
+            live_stop_impl(&state).unwrap();
+        }
+
+        /// A `settled_speed` term needs prop VELOCITIES, and the live session
+        /// has them — a resting cube inside the zone is `placed`, the same cube
+        /// judged velocity-less would have been an error.
+        #[test]
+        fn a_settled_zone_predicate_is_answerable_live() {
+            let state = gripper_state();
+            let spec = serde_json::json!({
+                "kind": "placed_in_zone",
+                "prop": "cube",
+                "zone": {"center": [0.0, 0.0, 0.05], "half": [0.2, 0.2, 0.2]},
+                "settled_speed": 0.05,
+            });
+            let (em, _dto) = start_grasp_session_with(&state, Some(spec));
+            assert!(
+                wait_for(&em, 2000, |s| s.success == Some(true)),
+                "a cube at rest inside the zone should be `placed` (success {:?})",
+                em.last_state().success
+            );
+            live_stop_impl(&state).unwrap();
+        }
+
+        /// A predicate about a prop the scene does not contain is refused at
+        /// start, not discovered as a dead session on the first state event.
+        #[test]
+        fn a_predicate_about_a_missing_prop_is_refused() {
+            let state = gripper_state();
+            let em = Collect::default();
+            let err = live_start_on(
+                &state,
+                LiveStartReq {
+                    q0: vec![0.0, 0.0, 0.02],
+                    engine: Some("mujoco".into()),
+                    props: vec![cube_prop()],
+                    ground: Some(0.0),
+                    kp: None,
+                    kd: None,
+                    emit_hz: None,
+                    gripper_joint: None,
+                    gripper_closed: None,
+                    success: Some(lift_cube_named("ball")),
+                },
+                em,
+            )
+            .map(|_| ())
+            .unwrap_err();
+            assert!(err.contains("does not contain"), "got: {err}");
+            assert!(live_status_impl(&state).unwrap().is_none());
+        }
+
+        fn lift_cube_named(prop: &str) -> serde_json::Value {
+            serde_json::json!({"kind": "lifted", "prop": prop, "height": 0.05})
         }
 
         #[test]

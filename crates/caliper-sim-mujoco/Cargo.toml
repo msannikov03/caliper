@@ -34,6 +34,8 @@ mujoco = ["dep:mujoco-rs"]
 [dependencies]
 thiserror.workspace = true
 nalgebra.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 caliper-spatial.workspace = true
 caliper-model.workspace = true
 caliper-hal.workspace = true

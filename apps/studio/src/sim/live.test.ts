@@ -77,6 +77,7 @@ function mockInfo(over: Partial<LiveInfo> = {}): LiveInfo {
     gripper: null,
     gripperState: null,
     held: null,
+    success: null,
     ...over,
   };
 }
@@ -128,6 +129,10 @@ describe("liveInfoFromStarted", () => {
     expect(liveInfoFromStarted(mockStarted({ gripper: null })).gripper).toBeNull();
     const { gripper: _dropped, ...noField } = mockStarted();
     expect(liveInfoFromStarted(noField).gripper).toBeNull();
+  });
+
+  it("starts with no verdict (the first state event brings one, or never does)", () => {
+    expect(liveInfoFromStarted(mockStarted()).success).toBeNull();
   });
 });
 
@@ -198,6 +203,19 @@ describe("liveStatePatch", () => {
     liveStatePatch(prev, mockEvent({ t: 9, ncon: 5 }));
     expect(prev.t).toBe(0.5);
     expect(prev.ncon).toBe(0);
+  });
+
+  it("carries the streamed success verdict, per instant and unlatched", () => {
+    const held = liveStatePatch(mockInfo(), mockEvent({ success: true }));
+    expect(held.live.success).toBe(true);
+    // a session that succeeded and then lost it reads false again — the badge
+    // shows what the stream says, it never remembers a verdict
+    expect(liveStatePatch(held.live, mockEvent({ success: false })).live.success).toBe(false);
+  });
+
+  it("reads an absent (or null) verdict as nobody scoring the session", () => {
+    expect(liveStatePatch(mockInfo({ success: true }), mockEvent()).live.success).toBeNull();
+    expect(liveStatePatch(mockInfo(), mockEvent({ success: null })).live.success).toBeNull();
   });
 
   it("carries the streamed gripper command + held prop into the slice", () => {

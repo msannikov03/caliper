@@ -486,6 +486,64 @@ fn box_prop_settles_on_plane() {
     assert!(sim.body_pose("nope").is_err());
 }
 
+/// Prop LINEAR velocity, the number a "has it come to rest" success check
+/// reads: it must be the world-frame derivative of the prop's own pose, and it
+/// must go to zero once the prop is resting on the plane.
+#[test]
+fn prop_velocity_tracks_the_pose_derivative() {
+    let m = model("dyn_pendulum2.urdf");
+    let opt = MjcfOptions {
+        ground_plane: Some(0.0),
+        props: vec![PropSpec {
+            name: "ball".into(),
+            shape: PropShape::Sphere { r: 0.05 },
+            pos: [0.6, 0.0, 0.5],
+            quat: None,
+            mass: 0.2,
+            rgba: None,
+            material: None,
+        }],
+        ..Default::default()
+    };
+    let mut sim = MujocoSim::from_caliper_model_with(&m, &opt).unwrap();
+    assert_eq!(
+        sim.prop_velocities().unwrap()[0].1,
+        [0.0; 3],
+        "starts at rest"
+    );
+
+    // Mid-fall: free fall for 0.2 s is −g·t, and the finite difference of the
+    // pose over one step must agree with the reported velocity.
+    sim.step(0.2).unwrap();
+    let z_before = sim.prop_poses()[0].1[2];
+    let v = sim.prop_velocities().unwrap();
+    assert_eq!(v.len(), 1);
+    assert_eq!(v[0].0, "ball");
+    assert!(
+        (v[0].1[2] + 9.81 * 0.2).abs() < 0.05,
+        "free-fall velocity should be ≈ −1.962 m/s, got {:?}",
+        v[0].1
+    );
+    sim.step(1e-3).unwrap();
+    let fd = (sim.prop_poses()[0].1[2] - z_before) / 1e-3;
+    assert!(
+        (fd - v[0].1[2]).abs() < 0.05,
+        "reported {} vs finite difference {fd}",
+        v[0].1[2]
+    );
+
+    // Settled on the plane: the velocity a settled_speed check compares against
+    // is genuinely ~0, not merely a small pose delta.
+    sim.step(2.0).unwrap();
+    let speed = sim.prop_velocities().unwrap()[0]
+        .1
+        .iter()
+        .map(|x| x * x)
+        .sum::<f64>()
+        .sqrt();
+    assert!(speed < 0.01, "resting ball still moving at {speed} m/s");
+}
+
 /// (g) Prop trajectories are bitwise deterministic across identical runs.
 #[test]
 fn prop_pose_determinism() {

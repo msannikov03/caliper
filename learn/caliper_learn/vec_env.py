@@ -58,12 +58,16 @@ Design notes (read before touching):
   jitter moves the RENDER scene's camera only; mass/damping do not affect
   rendering, so scenes are not rebuilt.
 
-- PROPS (free-floating objects) live in the scene through `extra_xml`: the
-  Python `caliper.model_to_mjcf` has no structured `props=` argument (the
-  Rust `MjcfOptions::props` path is not exposed through PyO3 yet), so a prop
-  is a `<body><freejoint/>...</body>` passed verbatim. Their free joints add
-  7 qpos / 6 qvel EACH, and `extra_xml` is injected BEFORE the robot bodies,
-  so the robot's dofs are NOT the qpos prefix in that case. Every robot-side
+- PROPS (free-floating objects) enter the scene two ways. `props=[{...}]` is
+  the structured one: the same prop dicts a `*.caliper-task.json` scene
+  carries, handed to `caliper.model_to_mjcf(props=...)`, which builds each
+  `<freejoint>` body with an inertial computed from its mass and shape by the
+  ENGINE — one implementation of prop inertia and contact materials, not a
+  hand-written copy per caller. `extra_xml` remains for everything the prop
+  vocabulary does not model (cameras, lights, static geometry) and the two
+  compose. Either way a prop's free joint adds 7 qpos / 6 qvel; structured
+  props land AFTER the robot bodies (the robot keeps the qpos prefix) while
+  `extra_xml` is injected BEFORE them (it does not). Every robot-side
   read/write therefore goes through `_q_sel`/`_v_sel`, resolved by JOINT NAME
   (`mujoco_name` = caliper's spelling with whitespace → `_`, the same
   resolution `caliper-sim-mujoco`'s own sim layer does). With no props the
@@ -72,6 +76,13 @@ Design notes (read before touching):
   a free body is its OWN kinematic tree, so `M` has no robot↔prop coupling
   and contact forces reach the arm as external forces (which is the point —
   the arm should feel the object).
+
+- `q0=` moves the reset distribution: jitter is drawn around `q0` instead of
+  each joint's limit MIDPOINT, then clipped to the joint limits (a task's start
+  pose near a limit must not sample past it). Without `q0` nothing changes and
+  the sampled poses are bit-identical to before. `VecSimEnv.from_task(task)`
+  wires a loaded `task.LearnTask` — props, success, q0, ground, fps — in one
+  call, so the file that defines a task is the only place its scene is spelled.
 
 - `success=<predicate>` (see `success.py`) scores the scene: each env gets its
   OWN clone (predicates capture per-episode baselines), reset at every episode
@@ -191,6 +202,8 @@ class VecSimEnv:
         joint_damping: float = 0.0,
         randomization: RandomizationSpec | None = None,
         success=None,
+        props=None,
+        q0=None,
     ):
         import caliper  # lazy runtime dep (built via maturin)
         import mujoco  # lazy: keep caliper_learn importable without mujoco
@@ -237,9 +250,11 @@ class VecSimEnv:
         self._max_episode_steps = max_episode_steps
         self._seed0 = int(seed)
 
+        self.props = [dict(p) for p in props] if props else []
         xml = caliper.model_to_mjcf(
             robot, ground=ground, extra_xml=extra_xml or None,
             timestep=timestep, joint_damping=joint_damping,
+            props=self.props or None,
         )
         self.model = mujoco.MjModel.from_xml_string(xml)
         self._q_sel, self._v_sel, self._v_ix = _robot_selectors(
@@ -262,19 +277,43 @@ class VecSimEnv:
         self._mid = self._bounds.mean(axis=1)
         self._half = 0.5 * (self._bounds[:, 1] - self._bounds[:, 0])
 
+        # Reset center: each joint's limit midpoint, or `q0` when the caller
+        # (usually a task file) names a start pose. Checked against the REAL
+        # URDF limits only — `_bounds` fabricates ±pi for unbounded joints, and
+        # refusing a legal 4 rad start on such a joint would be a false alarm.
+        self._q0 = None
+        if q0 is not None:
+            q_start = np.asarray(q0, dtype=np.float64).reshape(-1)
+            if q_start.shape != (self.ndof,):
+                raise ValueError(
+                    f"q0 has {q_start.size} value(s), robot has {self.ndof} dof"
+                )
+            if not np.all(np.isfinite(q_start)):
+                raise ValueError(f"q0 must be finite, got {q0!r}")
+            for i, lim in enumerate(robot.joint_limits):
+                if lim is not None and not (lim[0] <= q_start[i] <= lim[1]):
+                    raise ValueError(
+                        f"q0[{i}] = {q_start[i]} is outside joint "
+                        f"{robot.joint_names[i]!r}'s limits [{lim[0]}, {lim[1]}]"
+                    )
+            self._q0 = q_start
+        self._center = self._mid if self._q0 is None else self._q0
+
         self._scenes = None
         if obs_images:
             from .sim_camera import SimCameraScene
 
             h, w = int(image_size[0]), int(image_size[1])
-            # The render scene must be the SAME scene: `extra_xml` goes through
-            # too, or a prop the policy is supposed to grasp would be missing
-            # from the very images it is trained on. The scene's camera adds no
-            # dofs, so its qpos layout matches this env's and `_obs` can hand
-            # it the full state (props included, at their live pose).
+            # The render scene must be the SAME scene: `extra_xml` AND `props`
+            # go through too, or a prop the policy is supposed to grasp would be
+            # missing from the very images it is trained on. The scene's camera
+            # adds no dofs and the props are built from the same list in the
+            # same order, so its qpos layout matches this env's and `_obs` can
+            # hand it the full state (props included, at their live pose).
             self._scenes = [
                 SimCameraScene.from_robot(
-                    robot, width=w, height=h, ground=ground, extra_xml=extra_xml
+                    robot, width=w, height=h, ground=ground, extra_xml=extra_xml,
+                    props=self.props or None,
                 )
                 for _ in range(self.num_envs)
             ]
@@ -296,6 +335,41 @@ class VecSimEnv:
 
         self._rngs = [np.random.default_rng(self._seed0 + i) for i in range(self.num_envs)]
         self._elapsed = np.zeros(self.num_envs, dtype=np.int64)
+
+    # ----- from a task artifact --------------------------------------------
+
+    @classmethod
+    def from_task(cls, task, num_envs: int = 1, *, robot=None, **kwargs) -> "VecSimEnv":
+        """N envs of a loaded task file (`task.load_task`) — the scene, the
+        verdict and the start pose all come from the artifact.
+
+        Wired from the task: `props` (its scene), `success` (its predicate,
+        cloned per env as always), `q0`, `ground` (0.0 when the file omits it),
+        `fps`, and `max_episode_steps` = its `horizonS` in control steps. Any
+        of those can be overridden by a keyword argument; everything else
+        (`obs_images`, `randomization`, gains, ...) is passed straight through.
+
+        `robot` defaults to `caliper.Robot.from_urdf(task.robot_path)` — pass an
+        already-loaded Robot to skip the second parse. The task's `gripper`
+        block is NOT consumed here: this env has no gripper channel (actions are
+        plain qpos targets for every joint, the gripper joint included), and it
+        is read by the teleop/Studio faces instead.
+        """
+        if robot is None:
+            import caliper  # lazy runtime dep (built via maturin)
+
+            robot = caliper.Robot.from_urdf(str(task.robot_path))
+        fps = int(kwargs.pop("fps", task.fps if task.fps is not None else 50))
+        opts = {
+            "fps": fps,
+            "ground": task.ground_height(),
+            "props": task.props or None,
+            "q0": task.q0,
+            "success": task.success,
+            "max_episode_steps": task.steps(fps),
+        }
+        opts.update(kwargs)
+        return cls(robot, num_envs, **opts)
 
     # ----- task hooks ------------------------------------------------------
 
@@ -421,7 +495,8 @@ class VecSimEnv:
 
     def _reset_env(self, i: int) -> None:
         """Seeded initial-state jitter: uniform within `init_jitter` fraction
-        of each joint's limit range around its midpoint; zero velocity.
+        of each joint's limit range around its midpoint (or around `q0` when
+        one was given, clipped back into the limits); zero velocity.
 
         With `randomization`, the draw comes FIRST from the same per-env
         stream (fixed order → a seed reproduces draw + jitter together);
@@ -440,7 +515,14 @@ class VecSimEnv:
         d, m = self._data[i], self._models[i]
         self._mujoco.mj_resetData(m, d)  # props return to their MJCF spawn pose
         u = self._rngs[i].uniform(-1.0, 1.0, size=self.ndof)
-        d.qpos[self._q_sel] = self._mid + self._init_jitter * self._half * u
+        q = self._center + self._init_jitter * self._half * u
+        if self._q0 is not None:
+            # Around the midpoint the jitter provably stays inside the limits;
+            # around an arbitrary q0 it does not, so clip. Only on this path —
+            # clipping the midpoint draw could move it by an ulp, and the
+            # no-q0 sampling is bit-identical to the pre-q0 code.
+            q = np.clip(q, self._bounds[:, 0], self._bounds[:, 1])
+        d.qpos[self._q_sel] = q
         d.qvel[self._v_sel] = 0.0
         if self._rand is not None:
             apply_to_env(self._draws[i], self, index=i)  # gains/spawn/camera

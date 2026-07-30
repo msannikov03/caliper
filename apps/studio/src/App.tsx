@@ -4,6 +4,7 @@ import { Grid, OrbitControls, GizmoHelper, GizmoViewport } from "@react-three/dr
 import { invoke } from "@tauri-apps/api/core";
 import { RobotView } from "./three/RobotView";
 import { PropsLayer } from "./three/PropsLayer";
+import { ZonesLayer } from "./three/ZonesLayer";
 import { IkGizmo } from "./three/IkGizmo";
 import { Toolbar, openUrdf } from "./ui/Toolbar";
 import { Palette } from "./ui/Palette";
@@ -201,6 +202,8 @@ export default function App() {
             <RobotView />
             {/* contact-sim free props follow the same playback clock */}
             <PropsLayer />
+            {/* target zones of the loaded task — static, non-physical */}
+            <ZonesLayer />
             {!docked && <IkGizmo />}
           </Canvas>
           {!docked && <JointPanel />}

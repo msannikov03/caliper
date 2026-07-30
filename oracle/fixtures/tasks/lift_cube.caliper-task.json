@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "name": "lift-cube",
+  "robot": "../robots/gripper_arm.urdf",
+  "q0": [0.0, 0.0, 0.02],
+  "scene": {
+    "props": [
+      {
+        "name": "cube",
+        "kind": "box",
+        "halfExtents": [0.05, 0.05, 0.05],
+        "pos": [0.0, 0.0, 0.05],
+        "mass": 0.05
+      }
+    ],
+    "zones": [
+      {
+        "name": "bin",
+        "center": [0.4, 0.2, 0.02],
+        "half": [0.05, 0.05, 0.02]
+      }
+    ]
+  },
+  "success": {
+    "kind": "all_of",
+    "terms": [
+      { "kind": "lifted", "prop": "cube", "height": 0.05, "ref": "initial" },
+      { "kind": "placed_in_zone", "prop": "cube", "zone": "bin", "settled_speed": 0.01 }
+    ]
+  },
+  "fps": 50
+}

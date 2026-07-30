@@ -59,6 +59,7 @@ export interface CommandCtx {
   contactEngine: boolean;
   actions: {
     openUrdf: () => void;
+    openTask: () => void; // native open dialog → task_open (+ Simulate mode)
     openPath: (path: string, record: boolean) => void;
     setMode: (m: StudioMode) => void;
     planHome: () => void; // planMoveJ(0…0)
@@ -127,6 +128,16 @@ export function buildCommands(ctx: CommandCtx): Command[] {
     section: "Robot",
     enabled: true,
     run: actions.openUrdf,
+  });
+  // a task file carries its own robot, so this is as ungated as Open URDF… —
+  // it needs nothing loaded, and it loads everything it needs
+  cmds.push({
+    id: "task.open",
+    title: "Open task…",
+    hint: "*.caliper-task.json",
+    section: "Robot",
+    enabled: true,
+    run: actions.openTask,
   });
   cmds.push({
     id: "robot.reload",

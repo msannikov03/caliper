@@ -105,6 +105,30 @@ not releases); from `0.1.0` on, every release gets a proper entry.
   became name-resolved — a prop free-joint in `extra_xml` previously landed
   *before* the robot in qpos order, so scene props would have silently
   received the arm's commands; props now also render in image observations.
+- **The task artifact** (`*.caliper-task.json`, version 1, under the
+  stability contract): one JSON file — robot, scene props/materials, named
+  zones, gripper override, success predicate, horizon, fps — consumed by
+  every face. Studio's *Open task…* loads the robot, places the scene, draws
+  the zones, pre-fills recording, and streams a live `SUCCESS` verdict;
+  `caliper_learn.load_task` / `VecSimEnv.from_task` / `caliper-learn eval
+  --task` / `autopsy --task` consume the same file; the success predicates
+  are implemented in both Rust and Python with a shared parity table
+  (knife-edge rows included) run by both suites. Unknown keys at any level
+  are rejected loudly. Along the way: `PropDto`/Studio props gained
+  `material`, the Python face's `model_to_mjcf` gained a structured `props=`
+  kwarg (one source of truth — the Rust prop path), `VecSimEnv` takes
+  `props=`, and `MujocoSim` exposes `prop_velocities()`.
+- **Faster mesh-robot loads.** Distinct collision-mesh hulls are now computed
+  in parallel up front (scoped std threads, no new dependency) and the link
+  walk takes cache hits: SO-101 with real meshes loads in 5.0 ms release
+  (was 16.3) and 0.42 s debug (was 2.70) — bit-identical hulls, pinned by a
+  determinism test comparing the primed path against the serial one.
+- **CI: lerobot pairing watch + Linux runtime job.** `pairing-watch.yml`
+  runs monthly against the *newest* lerobot from PyPI (unpinned, py3.12) and
+  fails on any skipped gate — a moved converter or changed import shape turns
+  red instead of silently skipping. The new `linux` job in `ci.yml` runs the
+  Rust workspace plus the built wheel + core oracle on `ubuntu-latest` on
+  every push.
 
 ### Changed
 - `caliper record` default dataset format is **v3.0** (was v2.1); the legacy

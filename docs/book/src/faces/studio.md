@@ -69,6 +69,12 @@ Alongside the baked rollouts, Simulate mode runs a **live stepped session**:
 - **Stop** ends the session. A stepping error also ends it, with the reason
   surfaced rather than a silent freeze.
 
+- **Open a task** — *Open task…* (toolbar or ⌘K) loads a
+  [`*.caliper-task.json`](../reference/task-artifact.md): its robot, its
+  props (materials included), its target zones drawn as translucent boxes,
+  the gripper override, recording pre-filled with the task's name and fps —
+  and while live, a `SUCCESS` badge judges every streamed state against the
+  task's success predicate (per instant, never latched).
 - **Grasp props** — robots with a gripper joint (auto-detected by name, or
   named explicitly) get a gripper open/close control (button, `G`, or gamepad
   X); closing on a touching prop welds it to the gripper — the standard sim

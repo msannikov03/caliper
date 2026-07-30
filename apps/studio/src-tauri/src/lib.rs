@@ -519,8 +519,16 @@ fn load_robot(path: String) -> Result<RobotSummary, String> {
 /// the model cached here, so the engine owns all kinematics.
 #[tauri::command]
 fn robot_info(path: String, state: tauri::State<'_, AppState>) -> Result<RobotInfo, String> {
+    load_robot_into_state(&path, &state)
+}
+
+/// THE model-loading path: parse, publish into `AppState` (model + `read_mesh`
+/// allowlist), and return the wire structure. `robot_info` and `task_open` both
+/// go through here, so a task's robot lands in state exactly like a hand-picked
+/// URDF does — one loader, one allowlist, one log line.
+fn load_robot_into_state(path: &str, state: &AppState) -> Result<RobotInfo, String> {
     let t0 = std::time::Instant::now();
-    let p = Path::new(&path);
+    let p = Path::new(path);
     if !ext_ok(p) {
         return Err("only .urdf or .xacro files are supported".into());
     }
@@ -1513,22 +1521,38 @@ fn control_run_impl(
 /// One free-floating prop in a contact-sim request. `kind` selects the size
 /// fields exactly like `VisualDto`: box → `half_extents`; sphere → `radius`;
 /// cylinder → `radius` + `length` (FULL length, Z-aligned).
-#[derive(Deserialize)]
+///
+/// Serializable as well as deserializable, because `task_open` hands the props
+/// of a `*.caliper-task.json` back to the frontend in this exact shape — the
+/// scene the FE would have built by hand, so a task simply pre-fills the prop
+/// editor and `live_start` takes it back unchanged.
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(not(feature = "mujoco"), allow(dead_code))]
 struct PropDto {
     name: String,
     kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     half_extents: Option<[f64; 3]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     radius: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     length: Option<f64>,
     /// Initial world position of the primitive's center.
     pos: [f64; 3],
     /// Initial world orientation, w-first (MJCF order); `None` = identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     quat: Option<[f64; 4]>,
     /// Mass in kg (default 0.1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     mass: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     rgba: Option<[f32; 4]>,
+    /// Contact material for THIS prop: a preset name (`"wood"`) or the raw
+    /// `{solref, solimp, friction}` knobs — the same two forms a task file and
+    /// the python `material=` kwarg accept. Absent = MuJoCo's defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    material: Option<caliper_sim_mujoco::task::MaterialSpec>,
 }
 
 #[derive(Deserialize)]
@@ -1645,9 +1669,16 @@ fn prop_spec(p: &PropDto) -> Result<caliper_sim_mujoco::mjcf::PropSpec, String> 
         quat: p.quat,
         mass: p.mass.unwrap_or(0.1),
         rgba: p.rgba,
-        // Studio props use MuJoCo's default contact params; the material-preset
-        // UI (W4 ContactMaterial) is not wired to the Studio prop editor yet.
-        material: None,
+        // A prop's own contact material, when it carries one (a task file's
+        // `material`, or the prop editor's preset picker). Value errors —
+        // non-finite knobs, impedance out of range — are rejected by the
+        // generator's `ContactMaterial` validation, not by a copy of it here.
+        material: p
+            .material
+            .as_ref()
+            .map(caliper_sim_mujoco::task::MaterialSpec::to_contact_material)
+            .transpose()
+            .map_err(|e| format!("prop `{}`: {e}", p.name))?,
     })
 }
 
@@ -2118,6 +2149,150 @@ fn reach_check(req: ReachReq, state: tauri::State<'_, AppState>) -> Result<Reach
         }
         .into(),
         residual: v.residual,
+    })
+}
+
+// ===== task artifacts (`*.caliper-task.json`) =====
+
+/// One target zone of a task, for the renderer and the task panel. Zones are
+/// evaluator-side only — nothing is emitted into MJCF for them, so they never
+/// collide and never appear in a dataset.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ZoneDto {
+    name: String,
+    center: [f64; 3],
+    half: [f64; 3],
+    /// Render hint (a translucent box); `null` = let the renderer choose.
+    rgba: Option<[f32; 4]>,
+}
+
+/// The gripper override a task carries, in the same spelling `live_start`
+/// takes (`gripperJoint` / `gripperClosed`).
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TaskGripperDto {
+    joint: Option<String>,
+    closed: Option<String>,
+}
+
+/// An opened task: the robot is ALREADY LOADED into app state (same path
+/// `robot_info` takes, so `get_frames` / `solve_ik` / `read_mesh` work
+/// immediately), and everything else is the scene + verdict the FE needs to
+/// paint the task and to start a live session from it.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TaskDto {
+    name: String,
+    /// Resolved robot path (the task file's `robot`, made absolute against the
+    /// file's own directory).
+    robot_path: String,
+    /// The loaded robot, exactly as `robot_info` would have returned it.
+    robot: RobotInfo,
+    /// Start pose, when the task declares one (already length-checked against
+    /// the robot).
+    q0: Option<Vec<f64>>,
+    /// Ground-plane height (the task's `scene.ground`, defaulted).
+    ground: f64,
+    /// Props in the `live_start` / `sim_contact_run` wire shape.
+    props: Vec<PropDto>,
+    zones: Vec<ZoneDto>,
+    gripper: Option<TaskGripperDto>,
+    /// The success predicate as raw JSON — hand it straight back to
+    /// `live_start` (`success`) to have the live session judge it.
+    success: Option<serde_json::Value>,
+    /// The same predicate as one plain-English sentence, worded identically to
+    /// the python eval report.
+    success_description: Option<String>,
+    horizon_s: Option<f64>,
+    fps: Option<u32>,
+}
+
+/// Open a `*.caliper-task.json`: parse + validate it, LOAD its robot into app
+/// state, and return the whole task for display.
+///
+/// Every deviation is loud: an unknown key, a success predicate naming a prop
+/// the scene lacks, a `q0` that does not fit the robot, a zone reference with
+/// no zone. A task that opens is a task that can be run.
+#[tauri::command]
+fn task_open(path: String, state: tauri::State<'_, AppState>) -> Result<TaskDto, String> {
+    logged("task_open", task_open_impl(&path, &state))
+}
+
+/// Testable core of `task_open` (no `tauri::State`).
+fn task_open_impl(path: &str, state: &AppState) -> Result<TaskDto, String> {
+    use caliper_sim_mujoco::task::load_task;
+
+    let spec = load_task(path).map_err(|e| e.to_string())?;
+    let robot_path = spec.robot_path().display().to_string();
+    // The robot goes through the ONE loader, so app state, the mesh allowlist
+    // and the returned structure are exactly what `robot_info` produces.
+    let robot = load_robot_into_state(&robot_path, state)
+        .map_err(|e| format!("task `{}`: robot `{robot_path}`: {e}", spec.name))?;
+    if let Some(q0) = &spec.q0 {
+        if q0.len() != robot.ndof {
+            return Err(format!(
+                "task `{}`: q0 has {} values but `{}` has {} joints",
+                spec.name,
+                q0.len(),
+                robot.name,
+                robot.ndof
+            ));
+        }
+    }
+    let props = spec
+        .scene
+        .props
+        .iter()
+        .map(|p| PropDto {
+            name: p.name.clone(),
+            kind: p.kind.clone(),
+            half_extents: p.half_extents,
+            radius: p.radius,
+            length: p.length,
+            pos: p.pos,
+            quat: p.quat,
+            mass: p.mass,
+            rgba: p.rgba,
+            material: p.material.clone(),
+        })
+        .collect();
+    let zones = spec
+        .scene
+        .zones
+        .iter()
+        .map(|z| ZoneDto {
+            name: z.name.clone(),
+            center: z.center,
+            half: z.half,
+            rgba: z.rgba,
+        })
+        .collect();
+    log::info!(
+        target: "studio::cmd",
+        "task_open: '{}' robot='{}' props={} zones={} success={}",
+        spec.name,
+        robot_path,
+        spec.scene.props.len(),
+        spec.scene.zones.len(),
+        spec.success.is_some()
+    );
+    Ok(TaskDto {
+        name: spec.name.clone(),
+        robot_path,
+        robot,
+        q0: spec.q0.clone(),
+        ground: spec.scene.ground_height(),
+        props,
+        zones,
+        gripper: spec.gripper.as_ref().map(|g| TaskGripperDto {
+            joint: g.joint.clone(),
+            closed: g.closed.clone(),
+        }),
+        success: spec.success.as_ref().map(|p| p.to_value()),
+        success_description: spec.success.as_ref().map(|p| p.describe()),
+        horizon_s: spec.horizon_s,
+        fps: spec.fps,
     })
 }
 
@@ -3185,6 +3360,7 @@ pub fn run() {
             dataset_set_tags,
             urdf_doctor,
             dataset_doctor,
+            task_open,
             live::live_start,
             live::live_set_target,
             live::live_gripper,
@@ -3377,6 +3553,197 @@ mod tests {
         );
     }
 
+    // -- task artifacts --
+
+    fn task_fixture(name: &str) -> PathBuf {
+        PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../oracle/fixtures/tasks"
+        ))
+        .join(name)
+    }
+
+    /// `task_open` on the shipped fixture: the robot lands in app state, and the
+    /// DTO is everything the FE needs to paint the task and start a session.
+    #[test]
+    fn task_open_loads_the_robot_and_the_scene() {
+        let state = AppState::default();
+        let dto = task_open_impl(
+            &task_fixture("pick_cube.caliper-task.json")
+                .display()
+                .to_string(),
+            &state,
+        )
+        .expect("the fixture opens");
+
+        assert_eq!(dto.name, "pick-cube");
+        assert!(dto.robot_path.ends_with("gripper_arm.urdf"));
+        assert_eq!(dto.robot.name, "gripper_arm");
+        assert_eq!(dto.robot.ndof, 3);
+        assert_eq!(dto.q0, Some(vec![0.0, 0.0, 0.02]));
+        assert_eq!(dto.ground, 0.0);
+        assert_eq!(dto.horizon_s, Some(20.0));
+        assert_eq!(dto.fps, Some(50));
+
+        // The robot is REALLY loaded — the same state `get_frames`/`solve_ik`
+        // read, not a copy that only this DTO knows about.
+        {
+            let guard = state.model.lock().unwrap();
+            let m = guard.as_ref().expect("model published to app state");
+            assert_eq!(m.name, "gripper_arm");
+            assert_eq!(m.joint_names, ["j1", "j2", "gripper"]);
+        }
+
+        assert_eq!(dto.props.len(), 1);
+        let p = &dto.props[0];
+        assert_eq!((p.name.as_str(), p.kind.as_str()), ("cube", "box"));
+        assert_eq!(p.half_extents, Some([0.05; 3]));
+        assert_eq!(p.mass, Some(0.05));
+        assert_eq!(
+            p.material,
+            Some(caliper_sim_mujoco::task::MaterialSpec::Preset(
+                "wood".into()
+            ))
+        );
+
+        assert_eq!(dto.zones.len(), 1);
+        assert_eq!(dto.zones[0].name, "bin");
+        assert_eq!(dto.zones[0].center, [0.4, 0.2, 0.02]);
+        assert_eq!(dto.zones[0].rgba, Some([0.2, 0.8, 0.4, 0.35]));
+
+        let g = dto.gripper.as_ref().expect("the fixture overrides it");
+        assert_eq!(g.joint.as_deref(), Some("gripper"));
+        assert_eq!(g.closed.as_deref(), Some("lo"));
+
+        // The success value is exactly what `live_start` takes back, and the
+        // description is the sentence the python eval report prints.
+        let raw = dto.success.clone().expect("the fixture has a verdict");
+        caliper_sim_mujoco::task::success::Predicate::from_value(&raw)
+            .expect("the DTO's success JSON is a valid predicate");
+        assert_eq!(raw["kind"], "placed_in_zone");
+        assert_eq!(
+            dto.success_description.as_deref(),
+            Some(
+                "cube's center is inside the 0.100 x 0.100 x 0.040 m box centered at \
+                 (0.400, 0.200, 0.020) and has come to rest (speed <= 0.010 m/s)"
+            )
+        );
+
+        // ... and the wire shape is camelCase all the way down.
+        let wire = serde_json::to_value(&dto).unwrap();
+        for key in [
+            "robotPath",
+            "successDescription",
+            "horizonS",
+            "props",
+            "zones",
+        ] {
+            assert!(wire.get(key).is_some(), "missing `{key}` in {wire}");
+        }
+        assert!(wire["props"][0].get("halfExtents").is_some());
+        assert!(
+            wire["props"][0].get("radius").is_none(),
+            "absent size fields must stay absent"
+        );
+    }
+
+    /// A task that names a zone in `success` comes back with it spelled out, so
+    /// whatever consumes the DTO never has to know about the name form.
+    #[test]
+    fn task_open_resolves_a_zone_named_in_success() {
+        let state = AppState::default();
+        let dto = task_open_impl(
+            &task_fixture("lift_cube.caliper-task.json")
+                .display()
+                .to_string(),
+            &state,
+        )
+        .expect("the fixture opens");
+        let raw = dto.success.expect("has a verdict");
+        assert_eq!(raw["kind"], "all_of");
+        let placed = &raw["terms"][1];
+        assert_eq!(placed["kind"], "placed_in_zone");
+        assert_eq!(
+            placed["zone"]["center"],
+            serde_json::json!([0.4, 0.2, 0.02])
+        );
+        assert!(
+            dto.success_description
+                .as_deref()
+                .is_some_and(|s| s.contains(" and ")),
+            "an all_of describes both terms"
+        );
+    }
+
+    #[test]
+    fn task_open_fails_loudly() {
+        let state = AppState::default();
+        let err = task_open_impl("/nope/missing.caliper-task.json", &state)
+            .map(|_| ())
+            .unwrap_err();
+        assert!(err.contains("reading task file"), "got: {err}");
+        // a URDF is not a task file
+        let err = task_open_impl(&fixture("toy.urdf").display().to_string(), &state)
+            .map(|_| ())
+            .unwrap_err();
+        assert!(err.contains("not a valid caliper task file"), "got: {err}");
+        assert!(
+            state.model.lock().unwrap().is_none(),
+            "a refused task must not publish a robot"
+        );
+    }
+
+    /// A prop's contact material reaches the generator — the wiring that made
+    /// `PropSpec::material` reachable from Studio at all.
+    #[cfg(feature = "mujoco")]
+    #[test]
+    fn a_prop_material_reaches_the_generator() {
+        use caliper_sim_mujoco::mjcf::ContactMaterial;
+        use caliper_sim_mujoco::task::{CustomMaterial, MaterialSpec};
+
+        let with = |material| PropDto {
+            name: "crate".into(),
+            kind: "box".into(),
+            half_extents: Some([0.05; 3]),
+            radius: None,
+            length: None,
+            pos: [0.0, 0.0, 0.5],
+            quat: None,
+            mass: None,
+            rgba: None,
+            material,
+        };
+        assert_eq!(prop_spec(&with(None)).unwrap().material, None);
+        // preset names are case-insensitive, exactly like the python face
+        assert_eq!(
+            prop_spec(&with(Some(MaterialSpec::Preset("Wood".into()))))
+                .unwrap()
+                .material,
+            Some(ContactMaterial::Wood)
+        );
+        assert_eq!(
+            prop_spec(&with(Some(MaterialSpec::Custom(CustomMaterial {
+                solref: [0.01, 1.0],
+                solimp: [0.9, 0.95, 0.002],
+                friction: [1.2, 0.01, 0.0002],
+            }))))
+            .unwrap()
+            .material,
+            Some(ContactMaterial::Custom {
+                solref: (0.01, 1.0),
+                solimp: (0.9, 0.95, 0.002),
+                friction: (1.2, 0.01, 0.0002),
+            })
+        );
+        // An unknown preset is refused HERE, naming the prop; out-of-range
+        // custom VALUES are the generator's own rulebook (mjcf tests cover it).
+        let err = prop_spec(&with(Some(MaterialSpec::Preset("granite".into())))).unwrap_err();
+        assert!(
+            err.contains("prop `crate`") && err.contains("unknown material preset"),
+            "got: {err}"
+        );
+    }
+
     /// Contact-sim bake: a dropped box prop settles on the ground plane; the
     /// DTO carries aligned prop tracks + contact counts (kind = "contact").
     #[cfg(feature = "mujoco")]
@@ -3397,6 +3764,7 @@ mod tests {
                 quat: None,
                 mass: Some(0.2),
                 rgba: Some([0.8, 0.2, 0.2, 1.0]),
+                material: None,
             }],
             duration_s: Some(2.0),
             fps: Some(25.0),

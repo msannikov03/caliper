@@ -20,7 +20,10 @@ use caliper_dataset::{
     DatasetReader as EngineReaderV3, DatasetSpec as DatasetSpecV3, DatasetWriter as EngineWriterV3,
     FeatureSpec,
 };
-use caliper_sim_mujoco::mjcf::{Actuation, ContactMaterial, MjcfOptions, mjcf_from_model};
+use caliper_sim_mujoco::mjcf::{
+    Actuation, ContactMaterial, MjcfOptions, PropSpec, mjcf_from_model,
+};
+use caliper_sim_mujoco::task::TaskProp;
 use nalgebra::{DMatrix, Matrix3, UnitQuaternion, Vector3};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
@@ -2369,6 +2372,90 @@ fn contact_material(m: &MaterialInput) -> PyResult<ContactMaterial> {
     }
 }
 
+/// A python value as JSON, so a prop dict can be handed to the ONE Rust
+/// rulebook that already reads props ([`TaskProp`], the `*.caliper-task.json`
+/// prop type) instead of a second hand-written copy of it living here.
+///
+/// Only the shapes a prop spec can contain are accepted: `None`, bool, int,
+/// float, str, dict, and any iterable (so tuples and numpy arrays work
+/// wherever a list does). Non-finite numbers are refused HERE rather than
+/// becoming JSON `null` — a NaN half-extent must not arrive at the generator
+/// disguised as a missing key.
+fn json_from_py(v: &Bound<'_, PyAny>) -> PyResult<serde_json::Value> {
+    let err = pyo3::exceptions::PyValueError::new_err;
+    if v.is_none() {
+        return Ok(serde_json::Value::Null);
+    }
+    // bool BEFORE int: in Python `bool` is a subclass of `int`.
+    if let Ok(b) = v.cast::<pyo3::types::PyBool>() {
+        return Ok(serde_json::Value::Bool(b.is_true()));
+    }
+    if let Ok(i) = v.extract::<i64>() {
+        return Ok(serde_json::Value::from(i));
+    }
+    if let Ok(f) = v.extract::<f64>() {
+        return serde_json::Number::from_f64(f)
+            .map(serde_json::Value::Number)
+            .ok_or_else(|| {
+                err(format!(
+                    "non-finite number {f} in a prop spec — positions, dimensions, \
+                     masses and colors must all be finite"
+                ))
+            });
+    }
+    // str BEFORE the iterable fallback (a str iterates into characters).
+    if let Ok(s) = v.extract::<String>() {
+        return Ok(serde_json::Value::String(s));
+    }
+    if let Ok(d) = v.cast::<PyDict>() {
+        let mut map = serde_json::Map::new();
+        for (k, val) in d.iter() {
+            let key: String = k
+                .extract()
+                .map_err(|_| err("prop spec keys must be strings".to_string()))?;
+            map.insert(key, json_from_py(&val)?);
+        }
+        return Ok(serde_json::Value::Object(map));
+    }
+    if let Ok(items) = v.try_iter() {
+        let mut out = Vec::new();
+        for item in items {
+            out.push(json_from_py(&item?)?);
+        }
+        return Ok(serde_json::Value::Array(out));
+    }
+    Err(err(
+        "a prop spec takes dicts, lists, numbers, strings and None only".to_string(),
+    ))
+}
+
+/// Python prop dicts → engine [`PropSpec`]s via [`TaskProp`]: the same field
+/// spelling, the same defaults (mass 0.1) and the same rulebook a task file
+/// gets, so `props=[…]` and a `*.caliper-task.json` scene cannot drift.
+/// Unknown keys raise — a `halfExtent` typo must not silently produce a
+/// default-sized box.
+fn prop_specs(props: &Bound<'_, PyAny>) -> PyResult<Vec<PropSpec>> {
+    let err = pyo3::exceptions::PyValueError::new_err;
+    let value = json_from_py(props)?;
+    let items = value.as_array().ok_or_else(|| {
+        err(
+            "props must be a list of prop dicts, e.g. [{\"name\": \"cube\", \"kind\": \"box\", \
+             \"halfExtents\": [.025, .025, .025], \"pos\": [0.3, 0, 0.025]}]"
+                .to_string(),
+        )
+    })?;
+    items
+        .iter()
+        .enumerate()
+        .map(|(i, item)| {
+            let prop: TaskProp = serde_json::from_value(item.clone())
+                .map_err(|e| err(format!("props[{i}]: {e}")))?;
+            prop.to_prop_spec()
+                .map_err(|e| err(format!("props[{i}]: {e}")))
+        })
+        .collect()
+}
+
 /// Generate a minimal MuJoCo MJCF document (an XML string) from a robot
 /// model: kinematic tree, hinge/slide joints, inertials, primitive collision
 /// geoms, optional ground plane. Pure string generation — nothing here links
@@ -2395,8 +2482,20 @@ fn contact_material(m: &MaterialInput) -> PyResult<ContactMaterial> {
 /// gains — `ctrl` then holds target joint positions) instead of the default
 /// torque-direct (actuator-less) document, mirroring the CLI's
 /// `mjcf --actuators`.
+///
+/// `props` adds free-floating primitive bodies — the objects a manipulation
+/// task moves. Each is a dict in the `*.caliper-task.json` prop spelling:
+/// `{"name", "kind": "box"|"sphere"|"cylinder", "halfExtents"|"radius"|
+/// "length", "pos", "quat"?, "mass"?, "rgba"?, "material"?}` (quaternions
+/// w-first; `mass` defaults to 0.1 kg; `material` takes the same two forms as
+/// the `material` kwarg and overrides it for that prop). Each prop becomes a
+/// `<freejoint>` body with an explicit COM inertial computed from its mass and
+/// shape, emitted AFTER the robot bodies — so the robot keeps the `qpos` /
+/// `qvel` PREFIX and every prop adds 7 qpos / 6 qvel behind it. Unknown keys
+/// and impossible dimensions raise; `extra_xml` still composes (it is injected
+/// before the robot bodies, props after).
 #[pyfunction]
-#[pyo3(signature = (robot, ground=None, extra_xml=None, timestep=1e-3, joint_damping=0.0, material=None, actuators=false, kp=100.0, kv=10.0))]
+#[pyo3(signature = (robot, ground=None, extra_xml=None, timestep=1e-3, joint_damping=0.0, material=None, actuators=false, kp=100.0, kv=10.0, props=None))]
 #[allow(clippy::too_many_arguments)]
 fn model_to_mjcf(
     py: Python<'_>,
@@ -2409,6 +2508,7 @@ fn model_to_mjcf(
     actuators: bool,
     kp: f64,
     kv: f64,
+    props: Option<&Bound<'_, PyAny>>,
 ) -> PyResult<String> {
     let opt = MjcfOptions {
         timestep,
@@ -2421,6 +2521,7 @@ fn model_to_mjcf(
             Actuation::TorqueDirect
         },
         default_material: material.as_ref().map(contact_material).transpose()?,
+        props: props.map(prop_specs).transpose()?.unwrap_or_default(),
         ..Default::default()
     };
     let doc = mjcf_from_model(&robot.inner.model, &opt)

@@ -1,10 +1,12 @@
 import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-// the ONE dialog the store opens itself: a take cannot start without a dataset
-// directory, and the recording state machine (root memory, take vs dataset
-// lifetime) is all here — splitting the picker out would split that in two.
-import { save as saveDialog } from "@tauri-apps/plugin-dialog";
+// The two dialogs the store opens itself. The save picker: a take cannot start
+// without a dataset directory, and the recording state machine (root memory,
+// take vs dataset lifetime) is all here — splitting the picker out would split
+// that in two. The open picker: `openTask` takes an optional path, so the
+// dialog is the argument's own default rather than a separate entry point.
+import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import { applyNodeChanges, applyEdgeChanges, addEdge } from "@xyflow/react";
 import type { Connection, NodeChange, EdgeChange } from "@xyflow/react";
@@ -22,6 +24,8 @@ import { defaultParams, outPortType, inPortTypes, PORT_COLORS, NODE_SPECS } from
 import { serializeGraph, parseGraph } from "./graph/serialize";
 import { hasContactEngine, withProp } from "./sim/props";
 import type { PropKind, PropTrack, SimProp } from "./sim/props";
+import { taskInfoFromDto, taskLiveStartFields } from "./sim/task";
+import type { TaskInfo, TaskSpecDto } from "./sim/task";
 import {
   classifyLiveState,
   liveEndedPatch,
@@ -205,6 +209,13 @@ export interface NamedPoseDto {
   q: number[];
 }
 
+/** `task_open` reply: the task half (see sim/task.ts) plus the robot the same
+ *  call already loaded into app state — exactly what `robot_info` returns, so
+ *  `get_frames` / `solve_ik` / `read_mesh` work the moment it lands. */
+export interface TaskDto extends TaskSpecDto {
+  robot: RobotInfo;
+}
+
 // ---- dataset browser (Data mode) — mirrors the Dataset* DTOs in lib.rs ----
 
 /** One user data feature (flat float32 vector) of the dataset. */
@@ -313,6 +324,18 @@ export interface StudioState {
   // store↔UI import cycle. Falls back to the first sample fixture when there is
   // no session, the file vanished, or the load fails — never errors the UI.
   restoreSession: (load: (path: string, record: boolean) => Promise<void>) => Promise<void>;
+
+  // task artifacts (Wave C) — a `*.caliper-task.json` describes a whole
+  // manipulation task: its robot, its scene, the gripper channel to drive and
+  // the success predicate a live session is judged by. The slice is the task
+  // half of the `task_open` reply; its PROPS live in `simProps` (a task simply
+  // pre-fills the prop editor) and its robot is adopted like any other load.
+  // Cleared by every plain robot load: a hand-opened URDF is not the task's.
+  task: TaskInfo | null;
+  /** Open a task file — the native picker when no path is given. The backend
+   *  loads its robot, and this adopts the scene, the start pose and the
+   *  verdict, landing in Simulate mode ready for a live session. */
+  openTask: (path?: string) => Promise<void>;
 
   // actions
   loadRobot: (path: string) => Promise<void>;
@@ -536,6 +559,7 @@ export const useStore = create<StudioState>((set, get) => ({
   simEngines: ["builtin"],
   simEngine: "builtin",
   simProps: [],
+  task: null,
   live: null,
   livePropPoses: [],
   liveTarget: [],
@@ -647,51 +671,80 @@ export const useStore = create<StudioState>((set, get) => ({
     });
     try {
       const robot = await invoke<RobotInfo>("robot_info", { path });
-      stopClock();
-      set({
-        robot,
-        q: new Array(robot.ndof).fill(0),
-        frames: [],
-        report: null,
-        ikOk: null,
-        ikResidual: null,
-        traj: null,
-        simTraj: null,
-        mode: "jog",
-        playing: false,
-        playhead: 0,
-        poses: [],
-        // contact-sim state is per-robot (prop poses live in its workspace)
-        simEngine: "builtin",
-        simProps: [],
-        // live-drive state is ndof-bound
-        liveTarget: [],
-        liveJoint: 0,
-        liveDriving: false,
-        // a new robot invalidates the (ndof-bound) graph
-        graphNodes: [],
-        graphEdges: [],
-        graphScopes: [],
-        graphLive: false,
-        graphBanner: null,
-        graphName: "",
-      });
-      await get().refreshFrames();
-      await get().refreshPoses();
-      void get().refreshGraphList();
-      // engine availability is a build capability — fetch is cheap; a failure
-      // (older backend without the command) degrades to builtin-only.
-      void invoke<string[]>("sim_engines")
-        .then((simEngines) => set({ simEngines }))
-        .catch(() => set({ simEngines: ["builtin"] }));
-      // background diagnosis: a load can SUCCEED while the doctor still finds
-      // Errors (e.g. an unresolvable collision mesh = a silently dropped
-      // collider) — those surface in the banner area; clean/warn stays quiet
-      void get()._diagnoseUrdf(path, false);
+      await adoptRobot(robot, path, {}, get, set);
     } catch (e) {
       set({ error: String(e), robot: null });
       // the load failed — ask the doctor WHY (best-effort, async)
       void get()._diagnoseUrdf(path, true);
+    } finally {
+      set({ loading: false });
+    }
+  },
+
+  async openTask(path) {
+    let file = path;
+    if (!file) {
+      const picked = await openDialog({
+        multiple: false,
+        directory: false,
+        title: "Open a caliper task",
+        // the double extension is not a filter the native pickers match, so the
+        // filter is the plain one (same as the graph files) and the NAME carries
+        // the convention
+        filters: [{ name: "Caliper task (*.caliper-task.json)", extensions: ["json"] }],
+      });
+      if (typeof picked !== "string") return; // dialog cancelled
+      file = picked;
+    }
+    // a live session belongs to the robot + scene it started on, exactly like a
+    // plain robot load
+    if (get().live) void get().stopLive();
+    set({ loading: true, error: null });
+    try {
+      const dto = await invoke<TaskDto>("task_open", { path: file });
+      const task = taskInfoFromDto(dto, file);
+      // Simulate is the mode a task is FOR (a live session judged by its
+      // predicate); a robot that cannot be simulated says so instead of
+      // landing on a tab its own gating disables.
+      const canSim = dto.robot.hasInertia;
+      await adoptRobot(
+        dto.robot,
+        dto.robotPath,
+        {
+          urdfPath: dto.robotPath,
+          task,
+          // the task's scene IS the prop editor's scene, and props + verdicts
+          // are contact-engine features (a build without mujoco falls back to
+          // builtin in startLive, exactly as it does for a hand-built scene)
+          simProps: dto.props,
+          simEngine: "mujoco",
+          q: dto.q0 ?? new Array(dto.robot.ndof).fill(0),
+          mode: canSim ? "simulate" : "jog",
+          // the record panel starts on the task's own label and rate: a dataset
+          // recorded for a task should carry that task's name
+          liveRecTask: task.name,
+          liveRecFps: task.fps ?? DEFAULT_REC_FPS,
+        },
+        get,
+        set,
+      );
+      // after the adopt: the FK refresh inside it clears the error banner on
+      // success, so a complaint set before it would not survive
+      if (!canSim) {
+        set({
+          error: `task \`${task.name}\`: robot \`${dto.robot.name}\` has no inertial data — a live session needs one`,
+        });
+      }
+    } catch (e) {
+      set({ error: String(e) });
+      // `task_open` validates the start pose AFTER loading the task's robot, so
+      // a failure can leave the backend holding a robot this UI is not showing.
+      // Re-assert ours (same idempotent loader, result discarded — our state
+      // already describes it) so the two ends cannot disagree.
+      const shown = get().urdfPath;
+      if (shown && get().robot) {
+        void invoke<RobotInfo>("robot_info", { path: shown }).catch(() => {});
+      }
     } finally {
       set({ loading: false });
     }
@@ -986,7 +1039,7 @@ export const useStore = create<StudioState>((set, get) => ({
 
   // ---- live sim session (streamed, not baked) ----
   async startLive() {
-    const { q, robot, simProps, simEngine, simEngines, live } = get();
+    const { q, robot, simProps, simEngine, simEngines, live, task } = get();
     if (!robot || live) return; // one session at a time (the backend agrees)
     if (!robot.hasInertia) {
       set({ error: "this robot has no inertial data" });
@@ -1003,10 +1056,16 @@ export const useStore = create<StudioState>((set, get) => ({
       // subscribe BEFORE the invoke — the first state event can beat the reply
       // through the event loop, and classifyLiveState stashes it either way
       await subscribeLive(get, set);
-      // the gripper channel is left to the backend's auto-detect: nothing in
-      // the UI names a joint yet (gripperJoint / gripperClosed ride the req
-      // type for when it does)
-      const req: LiveStartReq = { q0: q, engine, props: engine === "mujoco" ? simProps : [] };
+      // without a task the gripper channel is left to the backend's
+      // auto-detect; a task names the joint, the ground it stands on and the
+      // predicate the session is judged by (all optional on the wire, so a
+      // hand-built session sends exactly what it always did)
+      const req: LiveStartReq = {
+        q0: q,
+        engine,
+        props: engine === "mujoco" ? simProps : [],
+        ...taskLiveStartFields(task),
+      };
       const dto = await invoke<LiveStartedDto>("live_start", { req });
       // the session holds q0 until a human drives it — seed the mirror from the
       // pose we started at, so the first jog is a delta off THAT, not off zero
@@ -1611,6 +1670,74 @@ export const useStore = create<StudioState>((set, get) => ({
 /// The active playback clip: a baked sim rollout takes precedence over a motion traj.
 function activeClip(s: StudioState): TrajectoryDto | null {
   return s.simTraj ?? s.traj;
+}
+
+// ---- robot adoption (module scope) ----
+
+/// The store-side half of a successful robot load, shared by `loadRobot` and
+/// `openTask`. The backend already HAS the robot in its app state (both commands
+/// go through the one loader), so nothing here fetches it again: this resets the
+/// per-robot state, lands the pose, and fires the usual follow-ups (FK, poses,
+/// graph list, engine capability, background diagnosis of `path`).
+///
+/// `extra` overrides the reset — a task brings its own pose, props, mode and
+/// task slice — and is applied in the SAME set(), so the FK refresh below sees
+/// the final pose and there is exactly one round-trip.
+async function adoptRobot(
+  robot: RobotInfo,
+  path: string,
+  extra: Partial<StudioState>,
+  get: () => StudioState,
+  set: (p: Partial<StudioState>) => void,
+): Promise<void> {
+  stopClock();
+  set({
+    robot,
+    q: new Array(robot.ndof).fill(0),
+    frames: [],
+    report: null,
+    ikOk: null,
+    ikResidual: null,
+    traj: null,
+    simTraj: null,
+    mode: "jog",
+    playing: false,
+    playhead: 0,
+    poses: [],
+    // any doctor verdict described the PREVIOUS file
+    doctor: null,
+    doctorPath: null,
+    repairedFrom: null,
+    // contact-sim state is per-robot (prop poses live in its workspace), and a
+    // task is per-robot by definition — a hand-opened URDF is not the task's
+    simEngine: "builtin",
+    simProps: [],
+    task: null,
+    // live-drive state is ndof-bound
+    liveTarget: [],
+    liveJoint: 0,
+    liveDriving: false,
+    // a new robot invalidates the (ndof-bound) graph
+    graphNodes: [],
+    graphEdges: [],
+    graphScopes: [],
+    graphLive: false,
+    graphBanner: null,
+    graphName: "",
+    ...extra,
+  });
+  await get().refreshFrames();
+  await get().refreshPoses();
+  void get().refreshGraphList();
+  // engine availability is a build capability — fetch is cheap; a failure
+  // (older backend without the command) degrades to builtin-only.
+  void invoke<string[]>("sim_engines")
+    .then((simEngines) => set({ simEngines }))
+    .catch(() => set({ simEngines: ["builtin"] }));
+  // background diagnosis: a load can SUCCEED while the doctor still finds
+  // Errors (e.g. an unresolvable collision mesh = a silently dropped
+  // collider) — those surface in the banner area; clean/warn stays quiet
+  void get()._diagnoseUrdf(path, false);
 }
 
 // ---- dataset helpers (module scope) ----

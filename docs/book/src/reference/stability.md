@@ -103,6 +103,13 @@ runs in CI:
   seeded splitmix64 PRNG. Same input + same seed = same bytes out, pinned by
   determinism tests and usable as a CI assertion
   ([Headless CI recipe](./headless-ci.md)).
+- **The lerobot pairing is watched, not assumed.** A monthly CI canary
+  (`pairing-watch.yml`) builds the current wheel, installs the *newest*
+  lerobot from PyPI (deliberately unpinned), and runs the oracle's round-trip
+  gates on py3.12 — with "any skipped gate = failure", so a converter that
+  moves again or an import shape that changes turns the run red instead of
+  silently skipping. Linux runtime is verified on every push by the `linux`
+  CI job (workspace tests + built wheel + core oracle on `ubuntu-latest`).
 
 ## What is *not* promised (pre-1.0)
 

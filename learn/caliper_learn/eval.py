@@ -22,6 +22,10 @@ What runs where:
   then mean return). Candidates are lerobot Hub checkpoint directories (loaded
   via `hub.load_lerobot_policy`) or in-memory policies/callables, so a scripted
   baseline ranks in the same table as a trained checkpoint.
+- `eval_task_from_file(path)` / `EvalTask.from_task(task)` — the task-artifact
+  entry point: a `*.caliper-task.json` carries the robot, the scene (props), the
+  start pose, the rate, the time budget and the success criterion, so
+  "evaluate THIS task" is one file rather than six arguments that can disagree.
 - `render_text` / `to_json` — tidy report / deterministic JSON (sorted keys).
 
 Policies: a `hub.LoadedPolicy` (dict observations — measured q is mapped onto
@@ -46,7 +50,7 @@ import math
 import statistics
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Callable, Optional, Union
+from typing import Callable, Optional, Sequence, Union
 
 import numpy as np
 
@@ -97,10 +101,12 @@ class EvalTask:
     stays "steps to success". Nothing else changes: the same seeds, the same
     Wilson interval over the same counts.
 
-    `extra_xml` / `ground` are handed to the eval env verbatim. A manipulation
-    task NEEDS `extra_xml`: props enter the scene only through it (see the
-    `VecSimEnv` doc), so a predicate over a prop with an empty `extra_xml` is a
-    predicate over a prop that is not there — it raises rather than scoring 0.
+    `props` / `extra_xml` / `ground` / `q0` are handed to the eval env verbatim.
+    A manipulation task NEEDS its props: a predicate over a prop that is not in
+    the scene raises rather than scoring 0. `props` is the structured list (the
+    `*.caliper-task.json` prop dicts, built by the engine); `extra_xml` is still
+    there for cameras, lights and static geometry. `EvalTask.from_task` /
+    `eval_task_from_file` build all of this from a task artifact.
     """
 
     robot: object
@@ -113,6 +119,52 @@ class EvalTask:
     success_predicate: Union[SuccessPredicate, dict, None] = None
     extra_xml: str = ""
     ground: Optional[float] = None
+    props: Sequence[dict] = ()
+    q0: Optional[Sequence[float]] = None
+
+    @classmethod
+    def from_task(
+        cls,
+        task,
+        *,
+        robot=None,
+        reward_fn: Optional[RewardFn] = None,
+        termination_fn: Optional[TerminationFn] = None,
+        **overrides,
+    ) -> "EvalTask":
+        """An EvalTask from a loaded task artifact (`task.load_task`).
+
+        The artifact supplies the robot, the scene (props + ground), the start
+        pose, the control rate and the verdict; `max_steps` is its `horizonS`
+        converted at that rate (`LearnTask.steps`, rounded up), falling back to
+        this class's default when the file sets no horizon. Any field can be
+        overridden by keyword.
+
+        No `reward_fn` is invented: a task file states what SUCCESS is, not what
+        a shaped reward would be, so returns stay 0.0 and the harness says so
+        (E003) instead of quoting a made-up number. Pass one if you have it.
+        `termination_fn` is likewise optional — with a success predicate the
+        episode already stops the moment the predicate fires.
+        """
+        if robot is None:
+            import caliper  # lazy runtime dep (built via maturin)
+
+            robot = caliper.Robot.from_urdf(str(task.robot_path))
+        fps = int(overrides.pop("fps", task.fps if task.fps is not None else cls.fps))
+        steps = task.steps(fps)
+        fields = {
+            "robot": robot,
+            "reward_fn": reward_fn,
+            "termination_fn": termination_fn,
+            "max_steps": cls.max_steps if steps is None else steps,
+            "fps": fps,
+            "success_predicate": task.success,
+            "props": tuple(task.props),
+            "ground": task.ground_height(),
+            "q0": task.q0,
+        }
+        fields.update(overrides)
+        return cls(**fields)
 
 
 @dataclass(frozen=True)
@@ -272,6 +324,8 @@ def evaluate(policy, task: EvalTask, cfg: EvalConfig = EvalConfig()) -> EvalResu
         init_jitter=task.init_jitter,
         ground=task.ground,
         extra_xml=task.extra_xml,
+        props=tuple(task.props) or None,
+        q0=task.q0,
         success=predicate,
     ) as env:
         env.set_task(task.reward_fn, task.termination_fn)
@@ -401,6 +455,22 @@ def _diagnose(
             )
         )
     return findings
+
+
+# ----- task-artifact entry point -----------------------------------------------
+
+
+def eval_task_from_file(path, **overrides) -> EvalTask:
+    """Load a `*.caliper-task.json` and turn it into an `EvalTask`.
+
+    The file carries the scene AND the verdict together, which is what makes a
+    manipulation eval expressible at all: a bare `--success` predicate would
+    have nothing to score, because the props it names live in the same file.
+    `overrides` go to `EvalTask.from_task` (e.g. `reward_fn=`, `max_steps=`).
+    """
+    from .task import load_task  # lazy only for symmetry; the module is pure python
+
+    return EvalTask.from_task(load_task(path), **overrides)
 
 
 # ----- the one built-in task factory ------------------------------------------

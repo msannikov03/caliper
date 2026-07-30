@@ -34,6 +34,14 @@ SCENE rather than the arm — `Lifted`, `PlacedInZone`, `AllOf`/`AnyOf` — shar
 by `VecSimEnv(success=...)` (per-step `info["success"]`), the eval harness
 (`EvalTask.success_predicate`, Wilson-95 over predicate-scored episodes) and
 the autopsy verdict, so a grasp/place run has ONE definition of "it worked".
+
+TASK ARTIFACTS (`task`): `load_task` reads a `*.caliper-task.json` — robot +
+scene (free props, target zones) + start pose + gripper + success predicate +
+time budget — the same schema `caliper_sim_mujoco::task` writes, verified
+against it by a shared parity table. `VecSimEnv.from_task(task)` and
+`eval_task_from_file(path)` / `caliper-learn eval --task` consume it, so a
+manipulation task is ONE diffable file instead of an argument list that can
+disagree with itself.
 """
 
 # Version identity: single-sourced from the installed distribution's metadata
@@ -72,6 +80,7 @@ from .eval import (
     EvalResult,
     EvalTask,
     SweepEntry,
+    eval_task_from_file,
     evaluate,
     reach_eval_task,
     render_text,
@@ -106,6 +115,7 @@ from .success import (
 )
 from .success import as_predicate as as_success_predicate
 from .success import from_dict as success_from_dict
+from .task import TASK_VERSION, LearnTask, load_task, task_from_dict
 from .vec_env import VecSimEnv, reach_task, rollout_random
 from .video import VideoRecorder, attach_video_metadata, encode_episode_video
 
@@ -134,6 +144,11 @@ __all__ = [
     "as_success_predicate",
     "success_from_dict",
     "state_from_mujoco",
+    # task artifacts (*.caliper-task.json)
+    "LearnTask",
+    "load_task",
+    "task_from_dict",
+    "TASK_VERSION",
     # dtype-"video" camera storage (mp4 encode + post-write bridge)
     "VideoRecorder",
     "attach_video_metadata",
@@ -152,6 +167,7 @@ __all__ = [
     "evaluate",
     "sweep",
     "reach_eval_task",
+    "eval_task_from_file",
     "render_text",
     "to_json",
     "wilson_interval",

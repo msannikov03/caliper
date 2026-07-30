@@ -34,7 +34,10 @@ default = []
 # docs/book/src/capabilities/contact-sim.md, "Shipping the app with contact sim".
 # Without the feature the commands stay registered and fail gracefully
 # (`sim_engines` omits "mujoco", `sim_contact_run` returns a clear Err).
-mujoco = ["dep:caliper-sim-mujoco", "caliper-sim-mujoco/mujoco"]
+# (The crate itself is an UNCONDITIONAL dependency: its MJCF generator and the
+# `*.caliper-task.json` artifact + success evaluator are pure Rust and are used
+# by `task_open` in every build. Only its own `mujoco` feature links libmujoco.)
+mujoco = ["caliper-sim-mujoco/mujoco"]
 
 [dependencies]
 tauri = { version = "2", features = [] }
@@ -49,6 +52,6 @@ caliper = { workspace = true }
 caliper-collision = { workspace = true }
 caliper-dataset = { workspace = true }
 caliper-doctor = { workspace = true }
-caliper-sim-mujoco = { workspace = true, optional = true }
+caliper-sim-mujoco = { workspace = true }
 nalgebra = { workspace = true }
 

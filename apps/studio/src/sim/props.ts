@@ -8,24 +8,37 @@
 /** Free-prop primitive kinds the backend accepts (`PropDto.kind`). */
 export type PropKind = "box" | "sphere" | "cylinder";
 
-/** One user-added free prop — camelCase mirror of `PropDto` in
- *  src-tauri/src/lib.rs. `kind` selects the populated size fields:
- *  box → halfExtents; sphere → radius; cylinder → radius + length
- *  (FULL length, Z-aligned, MJCF/URDF convention). */
+/** Contact material for one prop: a preset name (`"wood"`) or the raw MuJoCo
+ *  knobs (`{solref, solimp, friction}`). OPAQUE to the frontend — it only ever
+ *  arrives from a task file and goes back to the backend unchanged. */
+export type MaterialSpec = string | Record<string, unknown>;
+
+/** One free prop — camelCase mirror of `PropDto` in src-tauri/src/lib.rs.
+ *  `kind` selects the populated size fields: box → halfExtents; sphere →
+ *  radius; cylinder → radius + length (FULL length, Z-aligned, MJCF/URDF
+ *  convention).
+ *
+ *  The size/appearance fields are optional because the wire omits absent ones
+ *  (serde `skip_serializing_if`): props built here always fill them, props that
+ *  arrived from a `task_open` reply may not, and an absent field means "the
+ *  backend's default" — so it is passed back through untouched rather than
+ *  guessed at here. */
 export interface SimProp {
   name: string;
   kind: PropKind;
-  halfExtents: [number, number, number] | null;
-  radius: number | null;
-  length: number | null;
+  halfExtents?: [number, number, number] | null;
+  radius?: number | null;
+  length?: number | null;
   /** initial world position of the primitive's center (URDF world, Z-up) */
   pos: [number, number, number];
   /** initial world orientation, w-first (MJCF order); null = identity */
-  quat: [number, number, number, number] | null;
-  /** mass in kg */
-  mass: number;
+  quat?: [number, number, number, number] | null;
+  /** mass in kg; absent = the backend's default */
+  mass?: number;
   /** display color in [0,1]; null → the renderer's neutral accent */
-  rgba: [number, number, number, number] | null;
+  rgba?: [number, number, number, number] | null;
+  /** contact material, when the prop came from a task file */
+  material?: MaterialSpec;
 }
 
 /** Baked world-pose track of one prop — mirror of `PropTrackDto`.

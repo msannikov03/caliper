@@ -1,7 +1,9 @@
 """VecSimEnv substrate tests: shapes, determinism, auto-reset, the one example
 task (reach_task), the fps/timestep cadence warning, rollout_random stream
-independence, and the image-observation smoke. CPU-only, seconds."""
+independence, structured props / q0 / from_task, and the image-observation
+smoke. CPU-only, seconds."""
 
+import pathlib
 import warnings
 
 import numpy as np
@@ -11,7 +13,10 @@ mujoco = pytest.importorskip("mujoco")
 caliper = pytest.importorskip("caliper")
 
 from caliper_learn.collect import _resolve_urdf  # noqa: E402
+from caliper_learn.task import load_task  # noqa: E402
 from caliper_learn.vec_env import VecSimEnv, reach_task, rollout_random  # noqa: E402
+
+TASKS = pathlib.Path(__file__).resolve().parents[2] / "oracle" / "fixtures" / "tasks"
 
 
 @pytest.fixture(scope="module")
@@ -155,6 +160,125 @@ def test_reach_task_reward_increases(robot):
     assert abs(rewards[-1]) < 0.7 * abs(rewards[0])  # closed a real fraction of the gap
 
 
+# ----- structured props / q0 / from_task --------------------------------------
+
+
+CUBE = {
+    "name": "cube",
+    "kind": "box",
+    "halfExtents": [0.025, 0.025, 0.025],
+    "pos": [0.3, 0.0, 0.3],
+    "mass": 0.05,
+}
+
+
+def test_props_add_a_free_body_the_robot_dofs_still_lead(robot):
+    """The structured prop path: the engine builds the body, the robot keeps the
+    qpos prefix, and the prop is addressable BY NAME through success_state()."""
+    n = robot.ndof
+    with VecSimEnv(robot, 2, fps=50, seed=0, ground=0.0, props=[CUBE]) as env:
+        assert env.model.nq == n + 7 and env.model.nv == n + 6
+        obs = env.reset(seed=0)
+        # Observations still cover the ROBOT only.
+        assert obs["state"].shape == (2, 2 * n)
+        state = env.success_state(0)
+        # Addressable under both spellings the exporter produces.
+        assert state.pos("cube") == pytest.approx(CUBE["pos"])
+        assert state.pos("prop_cube") == pytest.approx(CUBE["pos"])
+        assert state.vel("cube") == pytest.approx([0.0, 0.0, 0.0])
+        # Dropped from 0.3 m, it falls: props are simulated, not decoration.
+        for _ in range(20):
+            env.step(obs["state"][:, :n].astype(np.float64))
+        assert env.success_state(0).pos("cube")[2] < CUBE["pos"][2]
+        # ... and each env has its own copy of it.
+        assert env.success_state(1).pos("cube")[2] < CUBE["pos"][2]
+
+
+def test_props_and_extra_xml_compose(robot):
+    with VecSimEnv(
+        robot,
+        1,
+        fps=50,
+        seed=0,
+        extra_xml='<camera name="ots" pos="1 -1 1"/>',
+        props=[CUBE],
+    ) as env:
+        assert env.model.nq == robot.ndof + 7
+        assert mujoco.mj_name2id(env.model, mujoco.mjtObj.mjOBJ_CAMERA, "ots") >= 0
+        # Joint-name resolution, not prefix arithmetic: still the robot's block.
+        obs = env.reset(seed=0)
+        assert obs["state"].shape == (1, 2 * robot.ndof)
+
+
+def test_q0_moves_the_reset_center_and_stays_in_limits(robot):
+    n = robot.ndof
+    lims = robot.joint_limits
+    q0 = [0.0 if lim is None else lim[1] for lim in lims]  # every joint AT its upper limit
+    with VecSimEnv(robot, 4, fps=50, seed=0, q0=q0, init_jitter=0.5) as env:
+        q = env.reset(seed=0)["state"][:, :n]
+        bounds = env.action_bounds()
+        # Jitter around an at-limit pose is clipped back inside the limits...
+        assert np.all(q >= bounds[:, 0] - 1e-12) and np.all(q <= bounds[:, 1] + 1e-12)
+        # ... and sits in the upper half, not around the midpoint.
+        assert np.all(q.mean(axis=0) > env._mid)
+
+    # Without q0 the sampling is bit-identical to the pre-q0 behavior.
+    a = VecSimEnv(robot, 2, fps=50, seed=0).reset(seed=0)["state"]
+    b = VecSimEnv(robot, 2, fps=50, seed=0, q0=None).reset(seed=0)["state"]
+    assert np.array_equal(a, b)
+
+    with pytest.raises(ValueError, match="robot has"):
+        VecSimEnv(robot, 1, q0=[0.0] * (n + 1))
+    with pytest.raises(ValueError, match="q0 must be finite"):
+        VecSimEnv(robot, 1, q0=[float("nan")] * n)
+    bounded = next((i for i, lim in enumerate(lims) if lim is not None), None)
+    if bounded is not None:
+        bad = [0.0 if lim is None else lim[0] for lim in lims]
+        bad[bounded] = lims[bounded][0] - 1.0
+        with pytest.raises(ValueError, match="outside joint"):
+            VecSimEnv(robot, 1, q0=bad)
+
+
+def test_structured_props_survive_model_randomization(robot):
+    """The MJCF rebuild keeps the prop, and `mass_scale` scales the ROBOT's
+    bodies only — a randomized arm must not silently randomize the payload it is
+    being evaluated on."""
+    from caliper_learn.randomize import RandomizationSpec
+
+    spec = RandomizationSpec(mass_scale=(0.5, 0.6), joint_damping=(0.0, 0.1))
+    with VecSimEnv(robot, 2, fps=50, seed=0, ground=0.0, props=[CUBE], randomization=spec) as env:
+        env.reset(seed=0)
+        assert [m.nq for m in env._models] == [robot.ndof + 7] * 2  # prop kept
+        for m in env._models:
+            bid = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, "prop_cube")
+            assert m.body_mass[bid] == pytest.approx(CUBE["mass"])
+
+
+def test_from_task_wires_the_whole_artifact():
+    """One file in, a scored env out: scene, verdict, start pose, rate, budget."""
+    task = load_task(TASKS / "pick_cube.caliper-task.json")
+    with VecSimEnv.from_task(task, 2) as env:
+        assert env.ndof == 3 and env.fps == task.fps
+        assert env.model.nq == env.ndof + 7  # the task's one prop
+        assert env._max_episode_steps == task.steps(task.fps) == 1000
+        assert env.success_predicate is task.success
+        obs = env.reset(seed=0)
+        # q0 = [0, 0, 0.02] with the default 0.2 jitter: near the start pose,
+        # nowhere near the joint midpoints for the two ±1.5 rad joints.
+        assert np.all(np.abs(obs["state"][:, :2]) < 0.31)
+        state = env.success_state(0)
+        assert state.pos("cube") == pytest.approx(task.props[0]["pos"])
+        # The predicate is live and cloned per env (no shared baseline).
+        _o, _r, _te, _tr, info = env.step(obs["state"][:, :3].astype(np.float64))
+        assert info["success"].shape == (2,) and not info["success"].any()
+
+    # An already-loaded robot is reused rather than re-parsed.
+    r = caliper.Robot.from_urdf(str(task.robot_path))
+    with VecSimEnv.from_task(task, 1, robot=r, fps=25) as env:
+        assert env.robot is r and env.fps == 25
+        assert env._max_episode_steps == task.steps(25) == 500
+
+
 def test_obs_images_smoke(robot):
     n = robot.ndof
     with VecSimEnv(robot, 2, fps=50, obs_images=True, image_size=(64, 64), seed=0) as env:
@@ -167,3 +291,23 @@ def test_obs_images_smoke(robot):
         # the two envs render independently but from identical state distributions'
         # own draws — just require non-degenerate pixels (an actual scene, not black)
         assert obs["image"].max() > 0
+
+
+def test_obs_images_render_the_props_too(robot):
+    """The render scene must BE the scene: a prop the policy is meant to grasp
+    cannot be missing from the images it trains on. The scene's qpos layout has
+    to match the env's for `render(full qpos)` to be accepted at all."""
+    n = robot.ndof
+    with VecSimEnv(
+        robot, 1, fps=50, obs_images=True, image_size=(64, 64), seed=0,
+        ground=0.0, props=[CUBE],
+    ) as env:
+        assert env._scenes[0].model.nq == env.model.nq
+        obs = env.reset(seed=0)
+        assert obs["image"].shape == (1, 64, 64, 3)
+        # Move the prop far out of frame and the pixels must change.
+        before = obs["image"].copy()
+        env._data[0].qpos[n : n + 3] = [5.0, 5.0, 5.0]
+        mujoco.mj_forward(env.model, env._data[0])
+        after = env._obs()["image"]
+        assert not np.array_equal(before, after)

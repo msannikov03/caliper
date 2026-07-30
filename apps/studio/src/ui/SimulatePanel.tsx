@@ -1,6 +1,7 @@
 import { REC_FPS_CHOICES, useStore } from "../store";
 import { frameIndexAt, hasContactEngine, MAX_PROPS } from "../sim/props";
 import { gripperControl, gripperSeated } from "../sim/live";
+import { recFpsChoices, successBadge } from "../sim/task";
 import "./panels.css";
 
 /** Kind glyphs for the compact prop list rows. */
@@ -41,6 +42,7 @@ export function SimulatePanel() {
   const recordStop = useStore((s) => s.recordStop);
   const recordFinish = useStore((s) => s.recordFinish);
   const openRecordedDataset = useStore((s) => s.openRecordedDataset);
+  const task = useStore((s) => s.task);
   if (mode !== "simulate" || !robot) return null;
   const noInertia = !robot.hasInertia;
   const driftPct = simTraj ? (simTraj.energyDrift * 100).toFixed(3) : null;
@@ -73,6 +75,9 @@ export function SimulatePanel() {
       ? `commanded ${jaw.closed ? "closed" : "open"} — the jaw is at ${jaw.q.toFixed(3)}, ` +
         `target ${(jaw.closed ? live.gripper.closedTarget : live.gripper.openTarget).toFixed(3)}`
       : "";
+  // the streamed verdict of the task's success predicate — per instant, never
+  // latched, and absent entirely when nothing is scoring the session
+  const verdict = successBadge(live?.success, task?.successDescription ?? null);
   const bakeOff = noInertia || live !== null;
   const bakeTitle = (ready: string) =>
     live ? "stop live to bake" : noInertia ? "robot has no inertial data" : ready;
@@ -104,6 +109,23 @@ export function SimulatePanel() {
         </button>
       </div>
       <div className="live-block">
+        {/* the loaded task, so the panel never looks like a hand-built scene */}
+        {task && (
+          <div className="sim-badges">
+            <span className="badge" title={task.path}>
+              task {task.name}
+            </span>
+            {task.horizonS !== null && <span className="badge">horizon {task.horizonS}s</span>}
+          </div>
+        )}
+        {task?.successDescription && <p className="hint">{task.successDescription}</p>}
+        {/* a task IS its scene and its verdict, and both are contact-engine
+            features — a build without one would otherwise just look empty */}
+        {task && !mujoco && (
+          <p className="hint rec-hint">
+            this build has no mujoco contact engine — the task's props and verdict are inert
+          </p>
+        )}
         <div className="sim-badges">
           {live && <span className="badge live">● LIVE</span>}
           <span className="badge" title="engine backing a live session">
@@ -123,6 +145,11 @@ export function SimulatePanel() {
           {rec?.recording && (
             <span className="badge rec" title={`recording "${rec.task}" at ${rec.fps} fps`}>
               ● REC
+            </span>
+          )}
+          {verdict && (
+            <span className={verdict.className} title={verdict.title}>
+              {verdict.label}
             </span>
           )}
         </div>
@@ -196,7 +223,7 @@ export function SimulatePanel() {
                 }
                 onChange={(e) => useStore.setState({ liveRecFps: Number(e.target.value) })}
               >
-                {REC_FPS_CHOICES.map((f) => (
+                {recFpsChoices(REC_FPS_CHOICES, task?.fps).map((f) => (
                   <option key={f} value={f}>
                     {f} fps
                   </option>

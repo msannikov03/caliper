@@ -18,6 +18,11 @@ pub const DEFAULT_DATA_PATH: &str = "data/chunk-{chunk_index:03d}/file-{file_ind
 /// v3.0 episodes-metadata path template (`DEFAULT_EPISODES_PATH`).
 pub const DEFAULT_EPISODES_PATH: &str =
     "meta/episodes/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet";
+/// v3.0 video path template (`lerobot.datasets.utils.DEFAULT_VIDEO_PATH`) —
+/// the `video_path` written into `info.json` for datasets with `dtype:
+/// "video"` features. Format it with [`format_video_path`].
+pub const DEFAULT_VIDEO_PATH: &str =
+    "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4";
 
 /// One entry of `info.json`'s `features` map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -31,6 +36,11 @@ pub struct FeatureInfo {
     /// lerobot's converter stamps every feature with the dataset fps.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fps: Option<u32>,
+    /// `dtype: "video"` features carry the container facts lerobot's
+    /// `get_video_info` reads back (`video.codec`, `video.pix_fmt`, …); absent
+    /// for every other dtype. Raw JSON to stay lossless across writers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub info: Option<serde_json::Value>,
 }
 
 /// `meta/info.json` — field set matches what lerobot 0.4.4 writes for v3.0
@@ -77,11 +87,32 @@ mod mb_size {
 
 /// Render a v3.0 path template — Python `str.format` restricted to the
 /// `{chunk_index}` / `{file_index}` placeholders with an optional `:0Nd` spec,
-/// which is all lerobot's templates use.
+/// which is all lerobot's data/episodes templates use.
 pub fn format_chunk_file_path(
     template: &str,
     chunk_index: u64,
     file_index: u64,
+) -> Result<String, Error> {
+    format_path(template, chunk_index, file_index, None)
+}
+
+/// Render a v3.0 video path template ([`DEFAULT_VIDEO_PATH`]) — the
+/// chunk/file placeholders plus the `{video_key}` one lerobot's video
+/// template adds.
+pub fn format_video_path(
+    template: &str,
+    video_key: &str,
+    chunk_index: u64,
+    file_index: u64,
+) -> Result<String, Error> {
+    format_path(template, chunk_index, file_index, Some(video_key))
+}
+
+fn format_path(
+    template: &str,
+    chunk_index: u64,
+    file_index: u64,
+    video_key: Option<&str>,
 ) -> Result<String, Error> {
     let mut out = String::with_capacity(template.len() + 8);
     let mut rest = template;
@@ -92,6 +123,15 @@ pub fn format_chunk_file_path(
             Error::Format(format!("unbalanced '{{' in path template '{template}'"))
         })?;
         let placeholder = &after[..close];
+        // `{video_key}` substitutes a string verbatim (no format spec), so it
+        // short-circuits the integer padding below.
+        if placeholder == "video_key"
+            && let Some(key) = video_key
+        {
+            out.push_str(key);
+            rest = &after[close + 1..];
+            continue;
+        }
         let (name, spec) = match placeholder.split_once(':') {
             Some((n, s)) => (n, s),
             None => (placeholder, "d"),
@@ -154,6 +194,17 @@ mod tests {
             format_chunk_file_path(DEFAULT_EPISODES_PATH, 1, 2).unwrap(),
             "meta/episodes/chunk-001/file-002.parquet"
         );
+    }
+
+    #[test]
+    fn formats_video_template() {
+        assert_eq!(
+            format_video_path(DEFAULT_VIDEO_PATH, "observation.images.cam", 1, 23).unwrap(),
+            "videos/observation.images.cam/chunk-001/file-023.mp4"
+        );
+        // `{video_key}` is only substitutable through the video formatter; the
+        // data/episodes one still rejects it as an unknown placeholder.
+        assert!(format_chunk_file_path(DEFAULT_VIDEO_PATH, 0, 0).is_err());
     }
 
     #[test]

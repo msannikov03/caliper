@@ -6,11 +6,12 @@ as a native LeRobotDataset v3.0 through `caliper.RecorderV3`.
 Two camera storages, same rendered pixels either way:
 - default: a `dtype: "image"` feature (pre-encoded PNG bytes in the data
   parquet, no video/ffmpeg);
-- `video=True`: a `dtype: "video"` feature — RecorderV3 records vectors only,
-  frames go through `caliper_learn.video.VideoRecorder` into per-episode
-  `videos/{key}/...` mp4s, and `attach_video_metadata` registers them in
-  `meta/` after close (the python bridge until the Rust writer grows video
-  columns; see `video.py` for the exact lerobot-mirrored encode settings).
+- `video=True`: a `dtype: "video"` feature — the camera is declared on
+  `RecorderV3` as a video feature (no data-parquet column), frames go through
+  `caliper_learn.video.VideoRecorder` into per-episode `videos/{key}/...`
+  mp4s, and each episode's slot plus the pixel stats are registered on the
+  recorder itself, so `meta/` is written once by the Rust writer (see
+  `video.py` for the exact lerobot-mirrored encode settings).
 
 Deterministic given `seed0`: the planner and start/goal sampling are seeded
 (same scheme as `collect.collect_demos`), MuJoCo offscreen pixels are
@@ -85,12 +86,19 @@ def collect_camera_dataset(
         scene = SimCameraScene.from_robot(robot, width=width, height=height, ground=ground)
 
     if video:
-        from .video import VideoRecorder, attach_video_metadata
+        from .video import VideoRecorder
 
-        # Vector features only: a dtype-"video" key must have NO data-parquet
-        # column (lerobot's load skips video keys in the parquet schema).
-        rec = caliper.RecorderV3(robot, str(out_dir), fps=fps)
-        vrec = VideoRecorder(str(out_dir), image_key, fps, codec=video_codec)
+        # The key is declared as a VIDEO feature: it gets no data-parquet
+        # column (lerobot's load skips video keys in the parquet schema), only
+        # the four videos/{key}/... columns the writer fills from the
+        # registrations below.
+        vrec = VideoRecorder(
+            str(out_dir), image_key, fps, codec=video_codec,
+            height=scene.height, width=scene.width,
+        )
+        rec = caliper.RecorderV3(
+            robot, str(out_dir), fps=fps, video_features=[vrec.feature_spec()],
+        )
     else:
         rec = caliper.RecorderV3(
             robot, str(out_dir), fps=fps,
@@ -120,13 +128,15 @@ def collect_camera_dataset(
                 else:
                     rec.append(qs[k], nxt, k / fps,
                                images={image_key: scene.encode_png(frame)})
-            rec.finalize_episode()
             if vrec is not None:
+                # Encode this episode's mp4 first: the writer records where
+                # the frames live, and checks the file is really there.
                 vrec.finalize_episode()
-        root = rec.close()
+                rec.register_episode_video(image_key, **vrec.last_slot())
+            rec.finalize_episode()
         if vrec is not None:
-            attach_video_metadata(root, [vrec])
-        return root
+            rec.set_video_stats(image_key, **vrec.feature_stats_flat())
+        return rec.close()
     finally:
         if own_scene:
             scene.close()

@@ -25,9 +25,10 @@ MJCF edits for model params, in-place application for runtime params, wired
 into `VecSimEnv(randomization=...)`) and `coverage_gen` (the doctor→generator
 loop: data_doctor D007 coverage holes → targeted planner episodes → doctor
 re-run, `caliper-learn coverage`). `video` closes the last lerobot-parity
-hole: dtype-"video" camera storage (per-episode mp4s, lerobot-mirrored encode
-settings, `attach_video_metadata` post-write bridge) — `collect_camera_dataset
-(video=True)`.
+hole: dtype-"video" camera storage (per-episode mp4s with lerobot-mirrored
+encode settings, registered on `caliper.RecorderV3` as a native video feature)
+— `collect_camera_dataset(video=True)`; `attach_video_metadata` remains as the
+repair tool for datasets written without the feature.
 
 SUCCESS PREDICATES (`success`): composable, JSON-describable tests over the
 SCENE rather than the arm — `Lifted`, `PlacedInZone`, `AllOf`/`AnyOf` — shared
@@ -149,7 +150,7 @@ __all__ = [
     "load_task",
     "task_from_dict",
     "TASK_VERSION",
-    # dtype-"video" camera storage (mp4 encode + post-write bridge)
+    # dtype-"video" camera storage (mp4 encode; attach_* = repair tool)
     "VideoRecorder",
     "attach_video_metadata",
     "encode_episode_video",

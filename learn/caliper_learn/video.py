@@ -1,5 +1,5 @@
-"""MP4 video encoding for LeRobotDataset v3.0 — the `dtype: "video"` half of
-camera storage that the Rust writer does not cover yet.
+"""MP4 video encoding for LeRobotDataset v3.0 — the encoder half of lerobot's
+`dtype: "video"` camera storage.
 
 `caliper.RecorderV3` stores cameras as `dtype: "image"` (PNG bytes embedded in
 the data parquet). Real lerobot datasets more commonly store cameras as
@@ -10,12 +10,21 @@ grows four columns per key — `videos/{key}/chunk_index`, `.../file_index`,
 `.../from_timestamp`, `.../to_timestamp` — which `LeRobotDataset._query_videos`
 uses to locate the file and decode at `from_timestamp + frame_timestamp`.
 
-This module is the python-side bridge until the Rust writer grows video
-columns (NO Rust changes in this wave — documented deferral):
+Those columns are now the RUST writer's: this module encodes the mp4s and
+hands the writer each episode's slot in the layout, so a video dataset is
+written in ONE pass with no post-write rewrite of anything:
 
-    caliper.RecorderV3 (vector features only)   # data + meta skeleton
-    + VideoRecorder (camera frames -> mp4)      # videos/{key}/... files
-    -> attach_video_metadata(root, [vrec, ..])  # post-write pyarrow rewrite
+    rec = caliper.RecorderV3(robot, out, fps=fps,
+                             video_features=[vrec.feature_spec()])
+    ... rec.append(state, action, t); vrec.append(frame) ...
+    vrec.finalize_episode()                              # encodes the mp4
+    rec.register_episode_video(key, **vrec.last_slot())  # its meta/ row
+    rec.finalize_episode()
+    ... rec.set_video_stats(key, **vrec.feature_stats_flat()); rec.close()
+
+`attach_video_metadata` still exists for datasets already on disk WITHOUT the
+feature (a v3.0 dataset recorded vector-only plus mp4s beside it) — a
+back-compat repair tool, no longer the writing path; see its docstring.
 
 ENCODE SETTINGS mirror lerobot 0.4.4 `encode_video_frames`
 (`lerobot/datasets/video_utils.py`): default vcodec `libsvtav1`,
@@ -56,8 +65,8 @@ from pathlib import Path
 import numpy as np
 
 DEFAULT_CODEC = "libsvtav1"
-#: v3.0 video path template (`lerobot.datasets.utils.DEFAULT_VIDEO_PATH`),
-#: written into `info.json` by `attach_video_metadata`.
+#: v3.0 video path template (`lerobot.datasets.utils.DEFAULT_VIDEO_PATH`) —
+#: the layout this module writes and the Rust writer resolves mp4s against.
 DEFAULT_VIDEO_PATH = "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4"
 
 # lerobot's encode defaults (video_utils.py: encode_video_frames +
@@ -228,16 +237,21 @@ def _encode_ffmpeg(arr: np.ndarray, fps: int, out_path: Path, codec: str) -> Non
 
 class VideoRecorder:
     """Per-episode camera buffer -> the v3.0 `videos/{key}/...` mp4 layout;
-    the camera-side companion of a VECTOR-ONLY `caliper.RecorderV3` (declare
-    no `image_features` — a dtype-"video" key must have NO data-parquet
-    column, or lerobot's schema-checked load rejects the dataset).
+    the camera-side companion of a `caliper.RecorderV3` that declares this key
+    in `video_features` (and NOT in `image_features` — a dtype-"video" key
+    must have NO data-parquet column, or lerobot's schema-checked load rejects
+    the dataset).
 
-    Cadence contract: `append(frame)` once per `RecorderV3.append(...)` call,
-    `finalize_episode()` right after `RecorderV3.finalize_episode()`, and
-    after `RecorderV3.close()` hand every recorder to
-    `attach_video_metadata(root, recorders)` — nothing is registered in
-    `meta/` until that post-write step. Also folds per-channel pixel stats
-    (lerobot's [0, 1] scale) across all frames for `meta/stats.json`.
+    Cadence contract, per episode: `append(frame)` once per
+    `RecorderV3.append(...)` call, then `finalize_episode()` (encodes the mp4)
+    BEFORE `RecorderV3.register_episode_video(key, **last_slot())` and the
+    recorder's own `finalize_episode()`. Once every episode is in, feed
+    `feature_stats_flat()` to `RecorderV3.set_video_stats` and close. Pass
+    `height`/`width` up front to describe the feature (`feature_spec()`)
+    before the first frame exists — they also lock the accepted frame shape.
+
+    Also folds per-channel pixel stats (lerobot's [0, 1] scale) across all
+    frames, exactly over the pixels handed in — the writer never sees them.
     """
 
     def __init__(
@@ -248,6 +262,8 @@ class VideoRecorder:
         *,
         codec: str = DEFAULT_CODEC,
         chunks_size: int = _CHUNKS_SIZE,
+        height: int | None = None,
+        width: int | None = None,
     ):
         ok, reason = available(codec)
         if not ok:
@@ -272,7 +288,20 @@ class VideoRecorder:
         self._lengths: list[int] = []
         self._chunk = 0
         self._file = 0
-        self._shape: tuple[int, int] | None = None  # (h, w), locked at frame 1
+        # (h, w): declared up front (so `feature_spec()` works before any
+        # frame) or locked by the first appended frame.
+        self._shape: tuple[int, int] | None = None
+        if (height is None) != (width is None):
+            raise ValueError("pass both height and width, or neither")
+        if height is not None:
+            if int(height) <= 0 or int(width) <= 0:
+                raise ValueError(f"height/width must be positive, got {height}x{width}")
+            if int(height) % 2 or int(width) % 2:
+                raise ValueError(
+                    f"frame size {height}x{width} has an odd dimension; "
+                    f"pix_fmt {_PIX_FMT} needs even height and width"
+                )
+            self._shape = (int(height), int(width))
         # Per-channel running pixel stats in [0, 1] (mirrors the Rust writer's
         # fold_image_stats): exact population stats over EVERY pixel.
         self._stat_min = np.full(3, np.inf)
@@ -303,8 +332,44 @@ class VideoRecorder:
     @property
     def episode_metadata(self) -> list[dict]:
         """One dict per finalized episode: the four `videos/{key}/...` columns
-        `attach_video_metadata` appends to `meta/episodes`."""
+        of `meta/episodes`, under their full column names."""
         return [dict(m) for m in self._episodes]
+
+    def feature_spec(self) -> tuple[str, int, int, int, str, str]:
+        """The `video_features` entry to declare this key on a
+        `caliper.RecorderV3`: `(key, height, width, 3, codec, pix_fmt)` with
+        `codec` the CONTAINER canonical name (`av1`/`h264`, see `_CANONICAL`)
+        — the same facts `feature_info()` reports, in constructor form.
+
+        Needs the frame shape, so construct with `height`/`width` when the
+        recorder is built before the first frame (the usual order: the dataset
+        spec is fixed at `RecorderV3(...)` time)."""
+        if self._shape is None:
+            raise RuntimeError(
+                "frame shape unknown; pass height=/width= to VideoRecorder (or append a "
+                "frame first) before declaring the feature"
+            )
+        h, w = self._shape
+        return (self._key, h, w, 3, _CANONICAL[self._codec], _PIX_FMT)
+
+    def last_slot(self) -> dict:
+        """The most recently finalized episode's four values under the
+        argument names `RecorderV3.register_episode_video` takes:
+        `chunk_index`, `file_index`, `from_timestamp`, `to_timestamp`."""
+        if not self._episodes:
+            raise RuntimeError("no episodes finalized; nothing to register")
+        prefix = f"videos/{self._key}/"
+        return {k[len(prefix):]: v for k, v in self._episodes[-1].items()}
+
+    def feature_stats_flat(self) -> dict:
+        """`feature_stats()` with per-channel values FLAT (one number per
+        channel instead of the `(c, 1, 1)` nesting) — the shape
+        `RecorderV3.set_video_stats(key, **stats)` takes; the writer applies
+        lerobot's nesting itself."""
+        s = self.feature_stats()
+        flat = {k: [float(v[0][0]) for v in s[k]] for k in ("min", "max", "mean", "std")}
+        flat["count"] = list(s["count"])
+        return flat
 
     def append(self, frame_hwc_u8) -> None:
         """Buffer one `(h, w, 3)` uint8 RGB frame (copied). The first frame
@@ -427,10 +492,19 @@ def _replace_atomic(path: Path, write: Callable[[Path], None]) -> None:
 
 
 def attach_video_metadata(root: str | Path, recorders) -> None:
-    """Post-write bridge: register `recorders`' videos in a finalized
-    `RecorderV3` dataset's `meta/` — THE step that turns "mp4 files on disk"
-    into a loadable dtype-"video" dataset. Explicitly the python-side bridge
-    until the Rust writer grows video columns.
+    """BACK-COMPAT REPAIR TOOL — not the writing path. Registers `recorders`'
+    videos in an ALREADY-FINALIZED `RecorderV3` dataset's `meta/`, turning
+    "mp4 files on disk beside a vector-only dataset" into a loadable
+    dtype-"video" dataset by rewriting the metadata after the fact.
+
+    New recordings do not need this: declare the key in `RecorderV3`'s
+    `video_features` and the writer emits the columns natively, in one pass
+    (see the module docstring). Reach for this only when the dataset was
+    already written WITHOUT the feature — e.g. produced by an older Caliper,
+    or a vector dataset you are retrofitting videos onto. The result is
+    identical either way; this path just rewrites three files that were
+    already committed, so it can fail (and refuse) in ways the native path
+    cannot reach.
 
     Rewrites, in crash-safe order (info.json LAST — its `video_path` doubles
     as the commit marker and the double-attach guard), each file via a

@@ -16,17 +16,29 @@
 //! stores the bytes verbatim in the `struct<bytes, path>` layout lerobot's
 //! own writer embeds, and computes the per-channel `(c, 1, 1)` stats lerobot
 //! expects in `meta/stats.json`.
+//!
+//! Cameras stored as lerobot's OTHER camera dtype, `video`, are supported too:
+//! declare [`FeatureKind::Video`] features, write the mp4s yourself (this
+//! crate encodes no video), and hand the writer each episode's slot in the
+//! `videos/{key}/chunk-XXX/file-XXX.mp4` layout via
+//! [`register_episode_video`](DatasetWriter::register_episode_video) plus the
+//! pixel stats via [`set_video_stats`](DatasetWriter::set_video_stats). The
+//! writer then owns everything `meta/` needs: the four `videos/{key}/*`
+//! episode columns, the `dtype: "video"` `info.json` entry with its container
+//! `info` sub-dict, and `video_path` — and it verifies at
+//! [`finalize`](DatasetWriter::finalize) that every referenced mp4 exists.
 
 use crate::meta::{
     DEFAULT_CHUNK_SIZE, DEFAULT_DATA_FILE_SIZE_IN_MB, DEFAULT_DATA_PATH, DEFAULT_EPISODES_PATH,
-    DEFAULT_VIDEO_FILE_SIZE_IN_MB, FeatureInfo, Info, format_chunk_file_path, next_chunk_file,
+    DEFAULT_VIDEO_FILE_SIZE_IN_MB, DEFAULT_VIDEO_PATH, FeatureInfo, Info, format_chunk_file_path,
+    next_chunk_file,
 };
 use crate::stats::{FeatureStats, aggregate_stats};
 use crate::{CODEBASE_VERSION, Error};
 use arrow::array::{
     Array, ArrayRef, BinaryBuilder, FixedSizeListBuilder, Float32Array, Float32Builder,
-    Float64Builder, Int64Array, Int64Builder, LargeStringArray, ListBuilder, StringBuilder,
-    StructArray,
+    Float64Array, Float64Builder, Int64Array, Int64Builder, LargeStringArray, ListBuilder,
+    StringBuilder, StructArray,
 };
 use arrow::datatypes::{DataType, Field, Fields, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
@@ -70,6 +82,28 @@ pub enum FeatureKind {
         width: usize,
         channels: usize,
     },
+    /// A camera stream stored as lerobot's `dtype: "video"`: the frames live
+    /// in `videos/{key}/chunk-XXX/file-XXX.mp4` and the data parquet carries
+    /// NO column for the key at all. The writer never encodes video — the
+    /// caller produces the mp4s and hands over each episode's slot in that
+    /// layout via
+    /// [`register_episode_video`](DatasetWriter::register_episode_video) plus
+    /// the pixel stats via [`set_video_stats`](DatasetWriter::set_video_stats);
+    /// the writer owns the four `videos/{key}/*` columns of `meta/episodes`,
+    /// the `info.json` entry, and `video_path`.
+    ///
+    /// `codec` is the CONTAINER-level canonical name lerobot's
+    /// `get_video_info` reads back (`"av1"`, `"h264"` — not the encoder name
+    /// `libsvtav1`), `pix_fmt` the pixel format the file was encoded in
+    /// (`"yuv420p"`); both are facts about the caller's encoder, so both are
+    /// caller-supplied.
+    Video {
+        height: usize,
+        width: usize,
+        channels: usize,
+        codec: String,
+        pix_fmt: String,
+    },
 }
 
 /// One user data feature. See [`FeatureKind`] for the per-frame payloads.
@@ -101,8 +135,34 @@ impl FeatureSpec {
         }
     }
 
+    /// A `dtype: "video"` camera feature of `height` × `width` pixels. See
+    /// [`FeatureKind::Video`] for what the writer does and does not own.
+    pub fn video(
+        name: impl Into<String>,
+        height: usize,
+        width: usize,
+        channels: usize,
+        codec: impl Into<String>,
+        pix_fmt: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            kind: FeatureKind::Video {
+                height,
+                width,
+                channels,
+                codec: codec.into(),
+                pix_fmt: pix_fmt.into(),
+            },
+        }
+    }
+
     pub fn is_image(&self) -> bool {
         matches!(self.kind, FeatureKind::Image { .. })
+    }
+
+    pub fn is_video(&self) -> bool {
+        matches!(self.kind, FeatureKind::Video { .. })
     }
 }
 
@@ -132,6 +192,16 @@ impl DatasetSpec {
     }
 }
 
+/// One episode's slot in the caller-produced mp4 layout — the four
+/// `videos/{key}/*` values of its `meta/episodes` row.
+#[derive(Clone, Copy, Debug)]
+struct VideoSlot {
+    chunk_index: u64,
+    file_index: u64,
+    from_timestamp: f64,
+    to_timestamp: f64,
+}
+
 struct EpisodeRecord {
     episode_index: i64,
     /// Episode-level task strings (the `tasks` list column of `meta/episodes`).
@@ -145,6 +215,9 @@ struct EpisodeRecord {
     from_index: i64,
     to_index: i64,
     stats: BTreeMap<String, FeatureStats>,
+    /// Per video feature, where this episode's frames live. Always covers
+    /// every declared video feature (`save_episode` refuses otherwise).
+    videos: BTreeMap<String, VideoSlot>,
 }
 
 struct OpenDataFile {
@@ -179,6 +252,9 @@ enum FeatureBuf {
     Vector(Vec<f32>),
     /// One pre-encoded PNG per frame.
     Image(Vec<ImageFrame>),
+    /// Video features buffer nothing — their frames never enter the data
+    /// parquet. The variant keeps `buf` index-aligned with `spec.features`.
+    Video,
 }
 
 /// Streaming LeRobotDataset v3.0 writer. See the [module docs](self).
@@ -191,6 +267,12 @@ pub struct DatasetWriter {
     buf_times: Vec<f64>,
     tasks: Vec<String>,
     episodes: Vec<EpisodeRecord>,
+    /// Video slots registered for the episode being recorded, keyed by feature
+    /// name; consumed by `save_episode`, dropped by `discard_buffered`.
+    pending_videos: BTreeMap<String, VideoSlot>,
+    /// Caller-supplied pixel stats per video feature (the writer decodes no
+    /// mp4s), merged into `meta/stats.json` at finalize.
+    video_stats: BTreeMap<String, FeatureStats>,
     global_index: i64,
     data: Option<OpenDataFile>,
     next_chunk: u64,
@@ -269,6 +351,38 @@ impl DatasetWriter {
                         )));
                     }
                 }
+                FeatureKind::Video {
+                    height,
+                    width,
+                    channels,
+                    codec,
+                    pix_fmt,
+                } => {
+                    if *height == 0 || *width == 0 {
+                        return Err(Error::State(format!(
+                            "video feature '{}': height and width must be >= 1, got {height}x{width}",
+                            f.name
+                        )));
+                    }
+                    // Decoded video frames are RGB (lerobot hands policies a
+                    // 3-channel CHW tensor whatever the container's chroma
+                    // layout); anything else would put a shape in info.json
+                    // that no decode can produce.
+                    if *channels != 3 {
+                        return Err(Error::State(format!(
+                            "video feature '{}': channels must be 3 (decoded video frames are \
+                             RGB), got {channels}",
+                            f.name
+                        )));
+                    }
+                    if codec.trim().is_empty() || pix_fmt.trim().is_empty() {
+                        return Err(Error::State(format!(
+                            "video feature '{}': codec and pix_fmt must be non-empty (the \
+                             container facts lerobot reads back from the mp4)",
+                            f.name
+                        )));
+                    }
+                }
             }
             if seen.contains(&f.name.as_str()) {
                 return Err(Error::State(format!("duplicate feature '{}'", f.name)));
@@ -290,6 +404,7 @@ impl DatasetWriter {
             .map(|f| match f.kind {
                 FeatureKind::Vector { .. } => FeatureBuf::Vector(Vec::new()),
                 FeatureKind::Image { .. } => FeatureBuf::Image(Vec::new()),
+                FeatureKind::Video { .. } => FeatureBuf::Video,
             })
             .collect();
         Ok(Self {
@@ -299,6 +414,8 @@ impl DatasetWriter {
             buf_times: Vec::new(),
             tasks: Vec::new(),
             episodes: Vec::new(),
+            pending_videos: BTreeMap::new(),
+            video_stats: BTreeMap::new(),
             global_index: 0,
             data: None,
             next_chunk: 0,
@@ -357,8 +474,48 @@ impl DatasetWriter {
                  delta-timestamp windowing and every timestamp stat"
             )));
         }
-        let n_vec = self.spec.features.iter().filter(|f| !f.is_image()).count();
-        let n_img = self.spec.features.len() - n_vec;
+        // Video features take no per-frame payload here at all — their frames
+        // live in the caller's mp4s, so they count towards neither list.
+        let n_img = self.spec.features.iter().filter(|f| f.is_image()).count();
+        let n_vec = self
+            .spec
+            .features
+            .iter()
+            .filter(|f| !f.is_image() && !f.is_video())
+            .count();
+        // Name/kind checks come FIRST: a payload passed for the wrong kind of
+        // feature would otherwise surface as an arithmetic complaint about
+        // list lengths, which points at the wrong thing entirely.
+        let video_misuse = |name: &str| {
+            Error::State(format!(
+                "feature '{name}' is a video feature; its frames live in the caller's mp4 files, \
+                 not in the data parquet — register each episode with register_episode_video"
+            ))
+        };
+        for (name, _) in values {
+            match self.spec.features.iter().find(|f| f.name == *name) {
+                Some(f) if f.is_image() => {
+                    return Err(Error::State(format!(
+                        "feature '{name}' is an image feature; pass it in `images`"
+                    )));
+                }
+                Some(f) if f.is_video() => return Err(video_misuse(name)),
+                Some(_) => {}
+                None => return Err(Error::State(format!("unknown feature '{name}'"))),
+            }
+        }
+        for (name, _) in images {
+            match self.spec.features.iter().find(|f| f.name == *name) {
+                Some(f) if f.is_video() => return Err(video_misuse(name)),
+                Some(f) if !f.is_image() => {
+                    return Err(Error::State(format!(
+                        "feature '{name}' is a vector feature; pass it in `values`"
+                    )));
+                }
+                Some(_) => {}
+                None => return Err(Error::State(format!("unknown image feature '{name}'"))),
+            }
+        }
         if values.len() != n_vec {
             return Err(Error::State(format!(
                 "frame has {} vector features, dataset declares {n_vec}",
@@ -376,34 +533,15 @@ impl DatasetWriter {
                 }
             )));
         }
-        for (name, _) in values {
-            match self.spec.features.iter().find(|f| f.name == *name) {
-                Some(f) if f.is_image() => {
-                    return Err(Error::State(format!(
-                        "feature '{name}' is an image feature; pass it in `images`"
-                    )));
-                }
-                Some(_) => {}
-                None => return Err(Error::State(format!("unknown feature '{name}'"))),
-            }
-        }
-        for (name, _) in images {
-            match self.spec.features.iter().find(|f| f.name == *name) {
-                Some(f) if !f.is_image() => {
-                    return Err(Error::State(format!(
-                        "feature '{name}' is a vector feature; pass it in `values`"
-                    )));
-                }
-                Some(_) => {}
-                None => return Err(Error::State(format!("unknown image feature '{name}'"))),
-            }
-        }
         // Validate everything (including a full decode of every PNG) before
         // mutating any buffer, so a failed frame never leaves the per-feature
         // buffers ragged.
         enum Ordered<'a> {
             Vector(&'a [f64]),
             Image(&'a [u8], PixelStats),
+            /// Nothing to buffer — keeps the sequence aligned with
+            /// `spec.features` / `buf`.
+            Video,
         }
         let mut ordered: Vec<Ordered<'_>> = Vec::with_capacity(self.spec.features.len());
         for feat in &self.spec.features {
@@ -452,6 +590,7 @@ impl DatasetWriter {
                     let stats = decode_png_stats(&feat.name, png, *height, *width, *channels)?;
                     ordered.push(Ordered::Image(png, stats));
                 }
+                FeatureKind::Video { .. } => ordered.push(Ordered::Video),
             }
         }
         for (buf, v) in self.buf.iter_mut().zip(ordered) {
@@ -465,11 +604,172 @@ impl DatasetWriter {
                         stats,
                     });
                 }
+                (FeatureBuf::Video, Ordered::Video) => {}
                 // Buffers are built from the same spec that `ordered` walked.
                 _ => unreachable!("buffer kind matches spec kind by construction"),
             }
         }
         self.buf_times.push(timestamp);
+        Ok(())
+    }
+
+    /// Declare where the episode currently being recorded lives in the mp4
+    /// layout of the [`FeatureKind::Video`] feature `key`: its
+    /// `videos/{key}/chunk_index`, `file_index`, `from_timestamp` and
+    /// `to_timestamp` — the four `meta/episodes` columns lerobot's
+    /// `_query_videos` navigates by (it decodes at
+    /// `from_timestamp + frame_timestamp` inside that file).
+    ///
+    /// Call once per video feature per episode, before
+    /// [`save_episode`](Self::save_episode); an episode saved with any
+    /// declared video feature unregistered is refused, and
+    /// [`discard_buffered`](Self::discard_buffered) drops the registrations
+    /// along with the frames.
+    ///
+    /// The indices are the CALLER's, not derived: the writer neither encodes
+    /// nor names those files, and the format allows both one-episode-per-file
+    /// and several episodes concatenated into one file (lerobot's own writer
+    /// does the latter until `video_files_size_in_mb` is hit). What the writer
+    /// does enforce is that the layout stays coherent — episodes may not move
+    /// backwards through the files, two episodes may not claim overlapping
+    /// spans of one file, and the span must be as long as the episode
+    /// ([`save_episode`](Self::save_episode) checks that last one, once the
+    /// frame count is known).
+    pub fn register_episode_video(
+        &mut self,
+        key: &str,
+        chunk_index: u64,
+        file_index: u64,
+        from_timestamp: f64,
+        to_timestamp: f64,
+    ) -> Result<(), Error> {
+        if self.finalized {
+            return Err(Error::State("writer already finalized".into()));
+        }
+        if !self
+            .spec
+            .features
+            .iter()
+            .any(|f| f.name == key && f.is_video())
+        {
+            return Err(Error::State(format!(
+                "'{key}' is not a declared video feature of this dataset"
+            )));
+        }
+        if self.pending_videos.contains_key(key) {
+            return Err(Error::State(format!(
+                "video feature '{key}' is already registered for the episode being recorded"
+            )));
+        }
+        if !from_timestamp.is_finite() || !to_timestamp.is_finite() {
+            return Err(Error::State(format!(
+                "video feature '{key}': timestamps {from_timestamp}/{to_timestamp} must be \
+                 finite — lerobot seeks the decoder to them"
+            )));
+        }
+        if from_timestamp < 0.0 || to_timestamp <= from_timestamp {
+            return Err(Error::State(format!(
+                "video feature '{key}': need 0 <= from_timestamp < to_timestamp, got \
+                 {from_timestamp}..{to_timestamp}"
+            )));
+        }
+        // The previous episode's slot for this key bounds this one: files are
+        // written in order, and two episodes sharing a file may not overlap.
+        if let Some(prev) = self
+            .episodes
+            .iter()
+            .rev()
+            .find_map(|e| e.videos.get(key).copied())
+        {
+            if (chunk_index, file_index) < (prev.chunk_index, prev.file_index) {
+                return Err(Error::State(format!(
+                    "video feature '{key}': episode {} lands in chunk {chunk_index}/file \
+                     {file_index}, before the previous episode's chunk {}/file {} — the mp4 \
+                     layout must advance",
+                    self.episodes.len(),
+                    prev.chunk_index,
+                    prev.file_index
+                )));
+            }
+            if (chunk_index, file_index) == (prev.chunk_index, prev.file_index)
+                && from_timestamp < prev.to_timestamp
+            {
+                return Err(Error::State(format!(
+                    "video feature '{key}': episode {} starts at {from_timestamp}s in the same \
+                     file the previous episode occupies up to {}s — the spans would overlap and \
+                     both episodes would decode the same frames",
+                    self.episodes.len(),
+                    prev.to_timestamp
+                )));
+            }
+        }
+        self.pending_videos.insert(
+            key.to_string(),
+            VideoSlot {
+                chunk_index,
+                file_index,
+                from_timestamp,
+                to_timestamp,
+            },
+        );
+        Ok(())
+    }
+
+    /// Pixel statistics for the [`FeatureKind::Video`] feature `key`, over
+    /// every frame of every episode, on lerobot's normalized [0, 1] scale:
+    /// per-channel `min`/`max`/`mean`/`std` plus `count = [total_frames]`.
+    /// They land in `meta/stats.json` with the `(c, 1, 1)` nesting lerobot's
+    /// normalization layers broadcast against CHW tensors.
+    ///
+    /// Caller-supplied because the writer decodes no video — the encoder side
+    /// already has the pixels. Call before [`finalize`](Self::finalize), which
+    /// refuses to close a dataset whose video features have no stats (a
+    /// missing entry silently breaks policy normalization).
+    pub fn set_video_stats(&mut self, key: &str, stats: FeatureStats) -> Result<(), Error> {
+        if self.finalized {
+            return Err(Error::State("writer already finalized".into()));
+        }
+        let channels = self
+            .spec
+            .features
+            .iter()
+            .find_map(|f| match &f.kind {
+                FeatureKind::Video { channels, .. } if f.name == key => Some(*channels),
+                _ => None,
+            })
+            .ok_or_else(|| {
+                Error::State(format!(
+                    "'{key}' is not a declared video feature of this dataset"
+                ))
+            })?;
+        for (what, v) in [
+            ("min", &stats.min),
+            ("max", &stats.max),
+            ("mean", &stats.mean),
+            ("std", &stats.std),
+        ] {
+            if v.len() != channels {
+                return Err(Error::State(format!(
+                    "video feature '{key}': {what} has {} entries, the feature has {channels} \
+                     channels",
+                    v.len()
+                )));
+            }
+            if let Some(bad) = v.iter().find(|x| !x.is_finite()) {
+                return Err(Error::State(format!(
+                    "video feature '{key}': {what} contains {bad}, which is not finite — \
+                     non-finite stats poison every normalization layer downstream"
+                )));
+            }
+        }
+        if stats.count.len() != 1 {
+            return Err(Error::State(format!(
+                "video feature '{key}': count must be a single frame total (lerobot's \
+                 convention), got {} entries",
+                stats.count.len()
+            )));
+        }
+        self.video_stats.insert(key.to_string(), stats);
         Ok(())
     }
 
@@ -513,6 +813,40 @@ impl DatasetWriter {
                 len
             )));
         }
+        // Every declared video feature must have this episode's slot, and the
+        // slot must span exactly this episode's frames — an unregistered or
+        // mis-sized video is a silently unreadable (or desynced) episode.
+        for feat in self.spec.features.iter().filter(|f| f.is_video()) {
+            let Some(slot) = self.pending_videos.get(&feat.name) else {
+                return Err(Error::State(format!(
+                    "video feature '{}' has no registration for the episode being saved; call \
+                     register_episode_video('{}', chunk, file, from_ts, to_ts) after its mp4 is \
+                     written",
+                    feat.name, feat.name
+                )));
+            };
+            let frames = (slot.to_timestamp - slot.from_timestamp) * f64::from(self.spec.fps);
+            if (frames - len as f64).abs() > 0.5 {
+                return Err(Error::State(format!(
+                    "video feature '{}': the registered span {}..{}s covers {frames:.3} frames at \
+                     {} fps, but the episode holds {len} — the video would desync from the frame \
+                     data",
+                    feat.name, slot.from_timestamp, slot.to_timestamp, self.spec.fps
+                )));
+            }
+        }
+        if let Some(name) = self
+            .pending_videos
+            .keys()
+            .find(|k| !self.spec.features.iter().any(|f| &&f.name == k))
+        {
+            // Unreachable through the public API (registration checks the
+            // spec), but a rename between the two would silently drop a video.
+            return Err(Error::State(format!(
+                "registration for unknown video feature '{name}'"
+            )));
+        }
+
         let episode_index = self.episodes.len() as i64;
         for t in episode_tasks {
             self.intern_task(t);
@@ -542,12 +876,14 @@ impl DatasetWriter {
             from_index: self.global_index,
             to_index: self.global_index + len as i64,
             stats,
+            videos: std::mem::take(&mut self.pending_videos),
         });
         self.global_index += len as i64;
         for buf in &mut self.buf {
             match buf {
                 FeatureBuf::Vector(b) => b.clear(),
                 FeatureBuf::Image(b) => b.clear(),
+                FeatureBuf::Video => {}
             }
         }
         self.buf_times.clear();
@@ -575,9 +911,13 @@ impl DatasetWriter {
             match b {
                 FeatureBuf::Vector(v) => v.clear(),
                 FeatureBuf::Image(v) => v.clear(),
+                FeatureBuf::Video => {}
             }
         }
         self.buf_times.clear();
+        // The take's videos die with it — the next episode registers its own
+        // slots (its mp4 is a different file, or a different span of one).
+        self.pending_videos.clear();
     }
 
     /// Flush everything and write the `meta/` sidecars. Errors if frames were
@@ -601,9 +941,12 @@ impl DatasetWriter {
         }
         // Mark first: a failed finalize must not run again from Drop.
         self.finalized = true;
+        // Close the data file BEFORE the video gate below: whatever else is
+        // wrong, the recorded frames must land with a valid parquet footer.
         if let Some(data) = self.data.take() {
             data.writer.close()?;
         }
+        self.check_videos_complete()?;
         self.write_episodes_parquet()?;
         self.write_tasks_parquet()?;
         let stats_maps: Vec<BTreeMap<String, FeatureStats>> =
@@ -613,7 +956,7 @@ impl DatasetWriter {
         // normalization layers can broadcast them against CHW tensors; vector
         // entries keep the flat lists lerobot writes for 1-D features.
         let image_names = self.image_feature_names();
-        let entries: BTreeMap<&String, StatsJson<'_>> = aggregated
+        let mut entries: BTreeMap<&String, StatsJson<'_>> = aggregated
             .iter()
             .map(|(name, s)| {
                 let entry = if image_names.contains(&name.as_str()) {
@@ -624,6 +967,12 @@ impl DatasetWriter {
                 (name, entry)
             })
             .collect();
+        // Video stats never pass through the per-episode aggregation (the
+        // writer sees no video pixels); they are the caller's whole-dataset
+        // numbers, nested like image stats.
+        for (name, s) in &self.video_stats {
+            entries.insert(name, StatsJson::Image(NestedFeatureStats::from(s)));
+        }
         fs::write(
             self.root.join("meta/stats.json"),
             serde_json::to_string_pretty(&entries)?,
@@ -647,6 +996,58 @@ impl DatasetWriter {
             .collect()
     }
 
+    /// Names of the declared video features, in declaration order (the order
+    /// their `meta/episodes` columns are appended in).
+    fn video_feature_names(&self) -> Vec<&str> {
+        self.spec
+            .features
+            .iter()
+            .filter(|f| f.is_video())
+            .map(|f| f.name.as_str())
+            .collect()
+    }
+
+    /// Pre-finalize gate for `dtype: "video"` features: every one needs pixel
+    /// stats, and every mp4 an episode row points at must actually be on disk.
+    /// Both are things the bridge checked before it would register a video —
+    /// a dataset that fails either loads as a broken LeRobotDataset (missing
+    /// normalization stats, or a decode that throws on the first frame).
+    fn check_videos_complete(&self) -> Result<(), Error> {
+        if let Some(name) = self.pending_videos.keys().next() {
+            return Err(Error::State(format!(
+                "video feature '{name}' is registered for an episode that was never saved — its \
+                 mp4 would be orphaned; call save_episode or discard_buffered first"
+            )));
+        }
+        for name in self.video_feature_names() {
+            if !self.video_stats.contains_key(name) {
+                return Err(Error::State(format!(
+                    "video feature '{name}' has no pixel stats; call set_video_stats('{name}', …) \
+                     before finalize"
+                )));
+            }
+        }
+        for ep in &self.episodes {
+            for (name, slot) in &ep.videos {
+                let rel = crate::meta::format_video_path(
+                    DEFAULT_VIDEO_PATH,
+                    name,
+                    slot.chunk_index,
+                    slot.file_index,
+                )?;
+                if !self.root.join(&rel).is_file() {
+                    return Err(Error::State(format!(
+                        "episode {} references video '{name}' at {rel}, which does not exist \
+                         under {} — the caller must write the mp4 before the dataset is closed",
+                        ep.episode_index,
+                        self.root.display()
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn intern_task(&mut self, task: &str) -> i64 {
         if let Some(i) = self.tasks.iter().position(|t| t == task) {
             return i as i64;
@@ -665,6 +1066,11 @@ impl DatasetWriter {
         let mut columns: Vec<ArrayRef> = Vec::new();
         for (feat, buf) in self.spec.features.iter().zip(&self.buf) {
             let arr: ArrayRef = match buf {
+                // A dtype-"video" key must have NO data-parquet column at all
+                // — lerobot's `get_hf_features_from_features` skips it, and a
+                // stray column makes the schema-checked load reject the
+                // dataset.
+                FeatureBuf::Video => continue,
                 FeatureBuf::Vector(buf) => {
                     let FeatureKind::Vector { dim, .. } = &feat.kind else {
                         unreachable!("buffer kind matches spec kind by construction");
@@ -801,6 +1207,11 @@ impl DatasetWriter {
                     FeatureStats::compute(&rows, *dim)
                 }
                 FeatureBuf::Image(buf) => fold_image_stats(buf),
+                // No pixels here to fold: video stats are whole-dataset and
+                // caller-supplied (`set_video_stats`), so a video feature gets
+                // no per-episode `stats/<feature>/*` columns — exactly what
+                // lerobot's own video datasets carry.
+                FeatureBuf::Video => continue,
             };
             stats.insert(feat.name.clone(), s);
         }
@@ -980,6 +1391,50 @@ impl DatasetWriter {
             &mut columns,
         );
 
+        // The four `videos/{key}/*` columns per video feature, last and in
+        // declaration order — where lerobot's `_query_videos` looks up which
+        // mp4 holds an episode and at what offset inside it.
+        for key in self.video_feature_names() {
+            let slots: Vec<VideoSlot> = self
+                .episodes
+                .iter()
+                .map(|e| {
+                    *e.videos
+                        .get(key)
+                        .expect("save_episode requires every video feature to be registered")
+                })
+                .collect();
+            push_i64(
+                &format!("videos/{key}/chunk_index"),
+                slots.iter().map(|s| s.chunk_index as i64).collect(),
+                &mut fields,
+                &mut columns,
+            );
+            push_i64(
+                &format!("videos/{key}/file_index"),
+                slots.iter().map(|s| s.file_index as i64).collect(),
+                &mut fields,
+                &mut columns,
+            );
+            for (suffix, vals) in [
+                (
+                    "from_timestamp",
+                    slots.iter().map(|s| s.from_timestamp).collect::<Vec<f64>>(),
+                ),
+                (
+                    "to_timestamp",
+                    slots.iter().map(|s| s.to_timestamp).collect::<Vec<f64>>(),
+                ),
+            ] {
+                fields.push(Field::new(
+                    format!("videos/{key}/{suffix}"),
+                    DataType::Float64,
+                    true,
+                ));
+                columns.push(Arc::new(Float64Array::from(vals)) as ArrayRef);
+            }
+        }
+
         let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)?;
         let rel = format_chunk_file_path(DEFAULT_EPISODES_PATH, 0, 0)?;
         let path = self.root.join(rel);
@@ -1063,6 +1518,7 @@ impl DatasetWriter {
                         None => serde_json::Value::Null,
                     },
                     fps: Some(self.spec.fps),
+                    info: None,
                 },
                 // Exactly the entry lerobot's own `LeRobotDataset.create`
                 // writes for `dtype: "image"`: shape is (h, w, c) and names
@@ -1077,6 +1533,34 @@ impl DatasetWriter {
                     shape: vec![*height as u64, *width as u64, *channels as u64],
                     names: serde_json::json!(["height", "width", "channels"]),
                     fps: Some(self.spec.fps),
+                    info: None,
+                },
+                // dtype "video": same shape/names contract as an image
+                // feature, plus the `info` sub-dict lerobot's `get_video_info`
+                // would read back off the file. `is_depth_map`/`has_audio` are
+                // false by construction — this writer registers RGB, audioless
+                // camera videos only.
+                FeatureKind::Video {
+                    height,
+                    width,
+                    channels,
+                    codec,
+                    pix_fmt,
+                } => FeatureInfo {
+                    dtype: "video".into(),
+                    shape: vec![*height as u64, *width as u64, *channels as u64],
+                    names: serde_json::json!(["height", "width", "channels"]),
+                    fps: Some(self.spec.fps),
+                    info: Some(serde_json::json!({
+                        "video.height": height,
+                        "video.width": width,
+                        "video.codec": codec,
+                        "video.pix_fmt": pix_fmt,
+                        "video.is_depth_map": false,
+                        "video.fps": self.spec.fps,
+                        "video.channels": channels,
+                        "has_audio": false,
+                    })),
                 },
             };
             features.insert(f.name.clone(), info);
@@ -1095,6 +1579,7 @@ impl DatasetWriter {
                     shape: vec![1],
                     names: serde_json::Value::Null,
                     fps: Some(self.spec.fps),
+                    info: None,
                 },
             );
         }
@@ -1114,7 +1599,15 @@ impl DatasetWriter {
             fps: self.spec.fps,
             splits,
             data_path: DEFAULT_DATA_PATH.into(),
-            video_path: None,
+            // `video_path` doubles as lerobot's "this dataset has videos"
+            // marker; only the default template is written, because it is the
+            // layout `register_episode_video` resolves mp4s against.
+            video_path: self
+                .spec
+                .features
+                .iter()
+                .any(|f| f.is_video())
+                .then(|| DEFAULT_VIDEO_PATH.to_string()),
             features,
         }
     }

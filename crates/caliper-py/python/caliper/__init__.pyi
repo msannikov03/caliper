@@ -639,7 +639,15 @@ class RecorderV3:
     ``("observation.images.cam", 96, 96, 3)``. Their frames are passed to
     ``append(..., images=...)`` as PRE-ENCODED PNG bytes (encode Python-side
     with PIL/cv2); each frame is validated by decoding and the bytes are
-    stored verbatim in the native lerobot image layout."""
+    stored verbatim in the native lerobot image layout.
+
+    ``video_features`` declares them as ``dtype: "video"`` instead:
+    ``(name, height, width, channels, codec, pix_fmt)`` tuples, e.g.
+    ``("observation.images.cam", 96, 96, 3, "av1", "yuv420p")``. Those frames
+    never reach ``append()`` — the caller writes the mp4s (see
+    ``caliper_learn.video.VideoRecorder``) and calls
+    ``register_episode_video()`` per episode plus ``set_video_stats()`` before
+    ``close()``."""
 
     def __init__(
         self,
@@ -647,6 +655,7 @@ class RecorderV3:
         out: str,
         fps: int = ...,
         image_features: Optional[Sequence[tuple[str, int, int, int]]] = ...,
+        video_features: Optional[Sequence[tuple[str, int, int, int, str, str]]] = ...,
     ) -> None: ...
 
     def start_episode(self, task: str) -> None: ...
@@ -659,6 +668,35 @@ class RecorderV3:
     ) -> None:
         """Append one frame. Datasets declared with ``image_features`` must
         pass ``images``: every image feature name → that frame's PNG bytes."""
+        ...
+
+    def register_episode_video(
+        self,
+        key: str,
+        chunk_index: int,
+        file_index: int,
+        from_timestamp: float,
+        to_timestamp: float,
+    ) -> None:
+        """Declare where the OPEN episode's frames live in the mp4 layout of
+        the ``dtype: "video"`` feature ``key`` — the four ``videos/{key}/...``
+        columns of ``meta/episodes``. Call after that episode's mp4 is written
+        and before ``finalize_episode()``."""
+        ...
+
+    def set_video_stats(
+        self,
+        key: str,
+        *,
+        min: Sequence[float],
+        max: Sequence[float],
+        mean: Sequence[float],
+        std: Sequence[float],
+        count: Sequence[int],
+    ) -> None:
+        """Whole-dataset per-channel pixel stats (lerobot's [0, 1] scale) for
+        a ``dtype: "video"`` feature, with ``count = [total_frames]``.
+        Required before ``close()``."""
         ...
 
     def finalize_episode(self) -> None: ...

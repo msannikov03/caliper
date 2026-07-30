@@ -1,8 +1,9 @@
 """dtype-"video" storage tests: the encode chain, the per-episode mp4 layout,
-the `attach_video_metadata` post-write bridge, and THE GATE — a dataset this
-module wrote loads through REAL lerobot (`LeRobotDataset`) and hands back
-decoded video frames (CHW float32) matching the originally stored pixels
-within codec tolerance.
+the NATIVE writer path (video features declared on `caliper.RecorderV3`), the
+`attach_video_metadata` repair tool, the equality of the two (the retirement
+proof), and THE GATE — a dataset this module wrote loads through REAL lerobot
+(`LeRobotDataset`) and hands back decoded video frames (CHW float32) matching
+the originally stored pixels within codec tolerance.
 
 Tolerances are MEASURED, not guessed (this mac, pyav 15.1 / svt-av1 crf30
 preset12 / libx264 crf30, torchcodec 0.10 decode): the smooth synthetic
@@ -242,6 +243,61 @@ def test_recorder_exact_pixel_stats(tmp_path):
     assert info["info"]["video.pix_fmt"] == "yuv420p"
 
 
+# ------------------------------------------------- native-writer accessors
+
+
+@needs_encoder
+def test_feature_spec_needs_a_known_shape(tmp_path):
+    """`feature_spec()` describes the dataset feature BEFORE any frame is
+    recorded, so the shape has to come from the constructor — asking without
+    one is an error, not a guess."""
+    r = VideoRecorder(tmp_path, KEY, FPS)
+    with pytest.raises(RuntimeError, match="frame shape unknown"):
+        r.feature_spec()
+    r.append(_frames(1)[0])
+    assert r.feature_spec() == (KEY, H, W, 3, "av1", "yuv420p")
+
+    declared = VideoRecorder(tmp_path / "d", KEY, FPS, height=H, width=W, codec="h264")
+    assert declared.feature_spec() == (KEY, H, W, 3, "h264", "yuv420p")
+    # a declared shape also locks what append() accepts
+    with pytest.raises(ValueError, match="locked shape"):
+        declared.append(np.zeros((H, W * 2, 3), dtype=np.uint8))
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [{"height": H}, {"width": W}, {"height": 0, "width": W}, {"height": H - 1, "width": W}],
+    ids=["h-only", "w-only", "zero", "odd"],
+)
+def test_declared_shape_is_validated(tmp_path, kwargs):
+    with pytest.raises(ValueError):
+        VideoRecorder(tmp_path, KEY, FPS, **kwargs)
+
+
+@needs_encoder
+def test_last_slot_and_flat_stats(tmp_path):
+    r = VideoRecorder(tmp_path, KEY, FPS, chunks_size=2)
+    with pytest.raises(RuntimeError, match="no episodes"):
+        r.last_slot()
+    for value, n in ((51, 4), (204, 6)):
+        for _ in range(n):
+            r.append(np.full((H, W, 3), value, dtype=np.uint8))
+        r.finalize_episode()
+        # the slot names the register_episode_video() keyword arguments
+        assert set(r.last_slot()) == {
+            "chunk_index", "file_index", "from_timestamp", "to_timestamp"
+        }
+    assert r.last_slot() == {
+        "chunk_index": 0, "file_index": 1, "from_timestamp": 0.0, "to_timestamp": 6 / FPS,
+    }
+    flat = r.feature_stats_flat()
+    nested = r.feature_stats()
+    assert flat["count"] == nested["count"] == [10]
+    for k in ("min", "max", "mean", "std"):
+        assert np.asarray(flat[k]).shape == (3,)
+        np.testing.assert_array_equal(flat[k], np.asarray(nested[k]).ravel())
+
+
 # ------------------------------------------------- attach_video_metadata
 
 
@@ -272,6 +328,30 @@ def _video_recorder(root, lengths, key=KEY, seed=20):
             r.append(f)
         r.finalize_episode()
     return r
+
+
+def _native_ds(root, robot, lengths, key=KEY, seed=20, fps=FPS):
+    """The NATIVE path: the camera is a `video_features` entry on
+    `RecorderV3`, each episode's mp4 slot is registered on the recorder, and
+    the pixel stats go in before close — no post-write rewrite anywhere.
+    Records the same joint values and the same frames `_vector_ds` /
+    `_video_recorder` do, so the two paths are comparable."""
+    vrec = VideoRecorder(root, key, fps, height=H, width=W)
+    rec = caliper.RecorderV3(
+        robot, str(root), fps=fps, video_features=[vrec.feature_spec()]
+    )
+    nd = robot.ndof
+    for ep, n in enumerate(lengths):
+        rec.start_episode(f"ep {ep}")
+        for k, frame in enumerate(_frames(n, seed=seed + ep)):
+            q = [0.1 * np.sin(k / 5.0 + ep)] * nd
+            rec.append(q, q, k / fps)
+            vrec.append(frame)
+        vrec.finalize_episode()
+        rec.register_episode_video(key, **vrec.last_slot())
+        rec.finalize_episode()
+    rec.set_video_stats(key, **vrec.feature_stats_flat())
+    return rec.close(), vrec
 
 
 @needs_encoder
@@ -378,19 +458,121 @@ def test_attach_crash_leaves_meta_intact(tmp_path, robot, monkeypatch):
     )
 
 
+# ------------------------------------------ native path vs the repair tool
+
+
+@needs_encoder
+def test_native_and_bridge_write_the_same_metadata(tmp_path, robot):
+    """THE RETIREMENT PROOF: the same recording written natively (video
+    feature on `RecorderV3`) and via the post-write bridge produces byte-equal
+    `meta/episodes` (schema AND every row), the same `info.json` feature entry
+    and `video_path`, and the same `stats.json` entry. Only the mp4 BYTES may
+    differ (multi-threaded encoders), never the metadata."""
+    import json
+
+    import pyarrow.parquet as pq
+
+    lengths = [12, 15]
+    native_root, _ = _native_ds(tmp_path / "native", robot, lengths)
+    bridge_root = _vector_ds(tmp_path / "bridge", robot, lengths)
+    attach_video_metadata(bridge_root, [_video_recorder(bridge_root, lengths)])
+
+    def episodes(root):
+        return pq.read_table(next(iter(pathlib.Path(root).glob("meta/episodes/*/*.parquet"))))
+
+    nat, bri = episodes(native_root), episodes(bridge_root)
+    assert nat.schema.names == bri.schema.names
+    assert nat.schema.types == bri.schema.types
+    assert nat.equals(bri), "native and bridged meta/episodes must be identical"
+
+    def meta(root, name):
+        return json.loads((pathlib.Path(root) / "meta" / name).read_text())
+
+    ninfo, binfo = meta(native_root, "info.json"), meta(bridge_root, "info.json")
+    assert ninfo["features"][KEY] == binfo["features"][KEY]
+    assert ninfo["video_path"] == binfo["video_path"] == DEFAULT_VIDEO_PATH
+    assert ninfo["features"].keys() == binfo["features"].keys()
+    assert meta(native_root, "stats.json")[KEY] == meta(bridge_root, "stats.json")[KEY]
+
+
+def _open_native(root, robot, n_frames=6):
+    """A native recorder + video recorder mid-episode, `n_frames` frames in
+    on both sides (nothing registered yet)."""
+    vrec = VideoRecorder(root, KEY, FPS, height=H, width=W)
+    rec = caliper.RecorderV3(robot, str(root), fps=FPS, video_features=[vrec.feature_spec()])
+    nd = robot.ndof
+    rec.start_episode("ep 0")
+    for k, frame in enumerate(_frames(n_frames)):
+        rec.append([0.0] * nd, [0.0] * nd, k / FPS)
+        vrec.append(frame)
+    return rec, vrec
+
+
+@needs_encoder
+def test_native_writer_requires_registration_before_finalize(tmp_path, robot):
+    """An episode may not close without its video registered — and the refusal
+    keeps the episode OPEN (frames intact), so registering and retrying works.
+    Closing without pixel stats is refused too."""
+    rec, vrec = _open_native(tmp_path / "ds", robot)
+    with pytest.raises(ValueError, match="no registration"):
+        rec.finalize_episode()
+    # the camera key is not a frame payload — its frames are in the mp4
+    with pytest.raises(ValueError, match="video feature"):
+        rec.append([0.0] * robot.ndof, [0.0] * robot.ndof, 6 / FPS, images={KEY: b"png"})
+
+    vrec.finalize_episode()
+    rec.register_episode_video(KEY, **vrec.last_slot())
+    rec.finalize_episode()  # the retry lands: the frames were never lost
+    with pytest.raises(ValueError, match="no pixel stats"):
+        rec.close()
+
+
+@needs_encoder
+def test_native_writer_refuses_a_desynced_span(tmp_path, robot):
+    """A span covering fewer frames than the episode holds is refused at save
+    — the desync the bridge caught by comparing frame counts."""
+    rec, vrec = _open_native(tmp_path / "ds", robot)
+    vrec.finalize_episode()
+    rec.register_episode_video(KEY, **{**vrec.last_slot(), "to_timestamp": 3 / FPS})
+    with pytest.raises(ValueError, match="desync"):
+        rec.finalize_episode()
+
+
+@needs_encoder
+def test_native_writer_requires_the_mp4_on_disk(tmp_path, robot):
+    """A registered episode whose mp4 is missing is refused at close — the
+    check the bridge did before it would touch `meta/`."""
+    rec, vrec = _open_native(tmp_path / "ds", robot)
+    vrec.finalize_episode()
+    rec.register_episode_video(KEY, **vrec.last_slot())
+    rec.finalize_episode()
+    rec.set_video_stats(KEY, **vrec.feature_stats_flat())
+
+    victim = pathlib.Path(tmp_path / "ds") / DEFAULT_VIDEO_PATH.format(
+        video_key=KEY, chunk_index=0, file_index=0
+    )
+    victim.rename(victim.with_suffix(".hidden"))
+    with pytest.raises(ValueError, match="does not exist"):
+        rec.close()
+
+
 # --------------------------------- THE GATE: real lerobot decodes our videos
 
 
-@pytest.fixture(scope="module")
-def video_ds(tmp_path_factory, robot):
-    """Vector RecorderV3 dataset + synthetic per-episode mp4s + attach —
-    collected once, loaded by real lerobot in the gates below."""
+@pytest.fixture(scope="module", params=["native", "bridge"])
+def video_ds(request, tmp_path_factory, robot):
+    """A dtype-"video" dataset holding the same episodes, written both ways —
+    natively (the default path) and through the repair tool — so the lerobot
+    gate below runs over BOTH."""
     if not _OK:
         pytest.skip(f"no video encoder: {_REASON}")
     lengths = [12, 15]
-    root = _vector_ds(tmp_path_factory.mktemp("vds") / "ds", robot, lengths)
-    vrec = _video_recorder(root, lengths, seed=20)
-    attach_video_metadata(root, [vrec])
+    root = tmp_path_factory.mktemp(f"vds_{request.param}") / "ds"
+    if request.param == "native":
+        root, _ = _native_ds(root, robot, lengths, seed=20)
+    else:
+        root = _vector_ds(root, robot, lengths)
+        attach_video_metadata(root, [_video_recorder(root, lengths, seed=20)])
     return root, lengths
 
 

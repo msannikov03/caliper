@@ -1453,6 +1453,10 @@ fn dataset_spec_v3(model: &Model, fps: u32) -> DatasetSpecV3 {
     )
 }
 
+/// One `video_features` entry as python passes it:
+/// `(name, height, width, channels, codec, pix_fmt)`.
+type VideoFeatureArg = (String, usize, usize, usize, String, String);
+
 /// Writes a LeRobotDataset **v3.0** to disk — the native layout of lerobot
 /// >= 0.4, loadable by `LeRobotDataset` directly (no converter). Same episode
 /// lifecycle as the legacy v2.1 `Recorder`.
@@ -1473,18 +1477,33 @@ impl RecorderV3 {
     /// to `append(..., images=...)` as PRE-ENCODED PNG bytes — encode
     /// Python-side (PIL/cv2); the writer validates each frame by decoding and
     /// stores the bytes verbatim in the native lerobot image layout.
+    ///
+    /// `video_features` declares them as lerobot `dtype: "video"` instead:
+    /// `(name, height, width, channels, codec, pix_fmt)` tuples (e.g.
+    /// `("observation.images.cam", 96, 96, 3, "av1", "yuv420p")` —
+    /// `codec` is the CONTAINER canonical name, not the encoder's). Those
+    /// frames never reach `append()`: the caller writes the mp4s (see
+    /// `caliper_learn.video.VideoRecorder`) and calls
+    /// `register_episode_video()` per episode plus `set_video_stats()` before
+    /// `close()`.
     #[new]
-    #[pyo3(signature = (robot, out, fps=30, image_features=None))]
+    #[pyo3(signature = (robot, out, fps=30, image_features=None, video_features=None))]
     fn new(
         robot: &Robot,
         out: &str,
         fps: u32,
         image_features: Option<Vec<(String, usize, usize, usize)>>,
+        video_features: Option<Vec<VideoFeatureArg>>,
     ) -> PyResult<Self> {
         let mut spec = dataset_spec_v3(&robot.inner.model, fps);
         for (name, height, width, channels) in image_features.unwrap_or_default() {
             spec.features
                 .push(FeatureSpec::image(name, height, width, channels));
+        }
+        for (name, height, width, channels, codec, pix_fmt) in video_features.unwrap_or_default() {
+            spec.features.push(FeatureSpec::video(
+                name, height, width, channels, codec, pix_fmt,
+            ));
         }
         let inner = EngineWriterV3::create(out, spec).map_err(ds_err)?;
         Ok(RecorderV3 {
@@ -1536,13 +1555,72 @@ impl RecorderV3 {
             )
         })
     }
+    /// Declare where the OPEN episode's frames live in the mp4 layout of the
+    /// `dtype: "video"` feature `key`: the four `videos/{key}/...` columns of
+    /// `meta/episodes` (lerobot decodes at `from_timestamp + frame_timestamp`
+    /// inside `videos/{key}/chunk-XXX/file-XXX.mp4`).
+    ///
+    /// Call once per video feature per episode, after that episode's mp4 is
+    /// written and before `finalize_episode()`.
+    fn register_episode_video(
+        &mut self,
+        key: &str,
+        chunk_index: u64,
+        file_index: u64,
+        from_timestamp: f64,
+        to_timestamp: f64,
+    ) -> PyResult<()> {
+        if self.task.is_none() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "no open episode; call start_episode(task) before register_episode_video()",
+            ));
+        }
+        self.with_writer(|w| {
+            w.register_episode_video(key, chunk_index, file_index, from_timestamp, to_timestamp)
+        })
+    }
+    /// Whole-dataset pixel stats for the `dtype: "video"` feature `key`, on
+    /// lerobot's [0, 1] scale: per-channel `min`/`max`/`mean`/`std` plus
+    /// `count = [total_frames]`. They land in `meta/stats.json` with the
+    /// `(c, 1, 1)` nesting lerobot's normalization broadcasts against CHW
+    /// tensors. Required before `close()` — the writer decodes no video, so
+    /// nobody else can compute them.
+    #[pyo3(signature = (key, *, min, max, mean, std, count))]
+    fn set_video_stats(
+        &mut self,
+        key: &str,
+        min: Vec<f64>,
+        max: Vec<f64>,
+        mean: Vec<f64>,
+        std: Vec<f64>,
+        count: Vec<u64>,
+    ) -> PyResult<()> {
+        self.with_writer(|w| {
+            w.set_video_stats(
+                key,
+                caliper_dataset::FeatureStats {
+                    min,
+                    max,
+                    mean,
+                    std,
+                    count,
+                },
+            )
+        })
+    }
     fn finalize_episode(&mut self) -> PyResult<()> {
-        let task = self.task.take().ok_or_else(|| {
+        let task = self.task.clone().ok_or_else(|| {
             pyo3::exceptions::PyValueError::new_err(
                 "no open episode; call start_episode(task) before finalize_episode()",
             )
         })?;
-        self.with_writer(|w| w.save_episode(&task))
+        // Only close the episode once the writer accepted it: a refused save
+        // (unregistered video, no frames) leaves the buffered frames in the
+        // writer, so the episode must stay open for the caller to fix and
+        // retry — dropping the task here would strand them.
+        self.with_writer(|w| w.save_episode(&task))?;
+        self.task = None;
+        Ok(())
     }
     /// Finalize the dataset (writes meta/) and return its path. Consumes the recorder.
     fn close(&mut self) -> PyResult<String> {
@@ -2700,7 +2778,7 @@ fn doctor(
 ///
 /// Returns `{root, total_episodes, total_frames, fps, features, findings,
 /// clean}`; each finding is `{code, severity ("error"|"warning"|"info"),
-/// feature, episode, dof, message, fix_hint}` (anchors are None when the
+/// feature, episode, dof, frame, message, fix_hint}` (anchors are None when the
 /// finding is dataset-wide), and `features` maps every float32 vector feature
 /// to its recomputed `{dim, mean, std, min, max, bin_occupancy}`. Findings
 /// are data, never exceptions; a `ValueError` means the dataset itself could
@@ -2734,6 +2812,8 @@ fn data_doctor(py: Python<'_>, root: &str) -> PyResult<Py<PyDict>> {
         fd.set_item("feature", f.feature.as_deref())?;
         fd.set_item("episode", f.episode)?;
         fd.set_item("dof", f.dof)?;
+        // frame inside `episode` when the check localizes one (D006/D010/D011)
+        fd.set_item("frame", f.frame)?;
         fd.set_item("message", &f.message)?;
         fd.set_item("fix_hint", &f.fix_hint)?;
         findings.append(fd)?;

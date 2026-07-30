@@ -50,7 +50,7 @@ mod writer;
 
 pub use analyze::{AnalyzeOptions, DataReport, FeatureSummary, Finding, Severity, analyze};
 pub use error::Error;
-pub use meta::{FeatureInfo, Info, format_chunk_file_path};
+pub use meta::{DEFAULT_VIDEO_PATH, FeatureInfo, Info, format_chunk_file_path, format_video_path};
 pub use reader::{DatasetReader, EpisodeData, EpisodeMeta};
 pub use stats::{FeatureStats, aggregate_stats};
 pub use writer::{DatasetSpec, DatasetWriter, FeatureKind, FeatureSpec};

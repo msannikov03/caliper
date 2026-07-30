@@ -7,7 +7,7 @@ build-backend = "maturin"
 # 2026-07-09), so the wheel ships as `caliper-robotics` — the import name
 # stays `caliper` (module-name below is what lands in site-packages).
 name = "caliper-robotics"
-version = "0.1.0"
+version = "0.2.0"
 description = "A modern, open robotics engine — Python bindings"
 # Wheel METADATA long description; read at build time from the repo root.
 readme = "../../README.md"

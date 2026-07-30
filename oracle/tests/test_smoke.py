@@ -13,8 +13,11 @@ CLI = ROOT / "target" / "debug" / "caliper"
 
 
 def test_version():
-    assert caliper.version() == "0.1.0"
-    assert caliper.__version__ == "0.1.0"
+    # The engine's own version() (rust, compiled in) and the wheel metadata
+    # (__version__, from pyproject) are independent sources — they must agree.
+    # The tag-vs-Cargo.toml-vs-pyproject consistency gate lives in release.yml.
+    assert caliper.version() == caliper.__version__
+    assert caliper.version().count(".") == 2
 
 
 def test_load():

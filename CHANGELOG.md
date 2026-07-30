@@ -11,6 +11,22 @@ not releases); from `0.1.0` on, every release gets a proper entry.
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.2.0] — 2026-07-30
+
+The human-demonstration-loop release: Studio's Simulate mode grew a live
+stepped sim you can drive by hand (sliders, IK gizmo, keyboard, gamepad),
+grasp with (an honest weld heuristic), and record from — straight into
+native LeRobotDataset v3.0 datasets that load in real lerobot 0.6.0. One
+`*.caliper-task.json` describes a manipulation task for every face, with
+success predicates implemented twice (Rust + Python) and pinned to parity.
+Data mode replays episodes on the 3D robot and renders `caliper-learn`
+verdicts. Plus: a convex-hull orientation bug that was silently degrading
+48% of real robot collision meshes is fixed, mesh-robot loads are 3–6×
+faster, video metadata is native in the Rust writer, and CI watches the
+newest lerobot monthly.
+
 ### Added
 - Native **LeRobotDataset v3.0** writer + reader (`caliper-dataset`), exposed
   on all faces (`RecorderV3`/`DatasetReaderV3`, `caliper record`/`replay` with

@@ -12,6 +12,11 @@ through three faces that share the exact same code:
 - **Python** — `import caliper` (built with [maturin](https://www.maturin.rs/)), scriptable like MATLAB/NumPy
 - **Studio** — *Caliper Studio*, a Tauri + React desktop app with a 3D scene and a Simulink-style dataflow graph editor
 
+**⬇ Download**: [Caliper Studio 0.2.0 for macOS (Apple Silicon)](https://github.com/msannikov03/caliper/releases/tag/v0.2.0)
+— an 11 MB signed & **notarized** dmg with the MuJoCo contact sim inside;
+opens with no Gatekeeper warning. Python wheels are attached to the same
+release; everything also builds from source (`cargo build`, `maturin develop`).
+
 **Start here → [Zero to moving in 10 minutes](docs/book/src/quickstart.md)** —
 one guided path through the whole loop on a real SO-101 description. Full
 documentation: **[msannikov03.github.io/caliper](https://msannikov03.github.io/caliper/)**

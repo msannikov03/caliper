@@ -28,7 +28,7 @@ members = [
 [workspace.package]
 edition = "2024"
 rust-version = "1.89"
-version = "0.2.0"
+version = "0.2.1"
 # Apache-2.0 covers the software. The hardware design files are CERN-OHL-W and the
 # documentation is CC-BY — see the root LICENSE-* files (those are repo-level, not
 # crate license fields).
@@ -50,22 +50,22 @@ approx = "0.5"
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 pyo3 = { version = "0.29", features = ["abi3-py310"] }
-caliper-spatial    = { path = "crates/caliper-spatial", version = "0.2.0" }
-caliper-model      = { path = "crates/caliper-model", version = "0.2.0" }
-caliper-kinematics = { path = "crates/caliper-kinematics", version = "0.2.0" }
-caliper-dynamics   = { path = "crates/caliper-dynamics", version = "0.2.0" }
-caliper-ik         = { path = "crates/caliper-ik", version = "0.2.0" }
-caliper-motion     = { path = "crates/caliper-motion", version = "0.2.0" }
-caliper-hal        = { path = "crates/caliper-hal", version = "0.2.0" }
-caliper-dataset    = { path = "crates/caliper-dataset", version = "0.2.0" }
-caliper-collision  = { path = "crates/caliper-collision", version = "0.2.0" }
-caliper-planning   = { path = "crates/caliper-planning", version = "0.2.0" }
-caliper-trajopt    = { path = "crates/caliper-trajopt", version = "0.2.0" }
-caliper-graph      = { path = "crates/caliper-graph", version = "0.2.0" }
-caliper-calib      = { path = "crates/caliper-calib", version = "0.2.0" }
-caliper-doctor     = { path = "crates/caliper-doctor", version = "0.2.0" }
-caliper-sim-mujoco = { path = "crates/caliper-sim-mujoco", version = "0.2.0" }
-caliper            = { path = "crates/caliper", version = "0.2.0" }
+caliper-spatial    = { path = "crates/caliper-spatial", version = "0.2.1" }
+caliper-model      = { path = "crates/caliper-model", version = "0.2.1" }
+caliper-kinematics = { path = "crates/caliper-kinematics", version = "0.2.1" }
+caliper-dynamics   = { path = "crates/caliper-dynamics", version = "0.2.1" }
+caliper-ik         = { path = "crates/caliper-ik", version = "0.2.1" }
+caliper-motion     = { path = "crates/caliper-motion", version = "0.2.1" }
+caliper-hal        = { path = "crates/caliper-hal", version = "0.2.1" }
+caliper-dataset    = { path = "crates/caliper-dataset", version = "0.2.1" }
+caliper-collision  = { path = "crates/caliper-collision", version = "0.2.1" }
+caliper-planning   = { path = "crates/caliper-planning", version = "0.2.1" }
+caliper-trajopt    = { path = "crates/caliper-trajopt", version = "0.2.1" }
+caliper-graph      = { path = "crates/caliper-graph", version = "0.2.1" }
+caliper-calib      = { path = "crates/caliper-calib", version = "0.2.1" }
+caliper-doctor     = { path = "crates/caliper-doctor", version = "0.2.1" }
+caliper-sim-mujoco = { path = "crates/caliper-sim-mujoco", version = "0.2.1" }
+caliper            = { path = "crates/caliper", version = "0.2.1" }
 
 [profile.release]
 lto = "thin"

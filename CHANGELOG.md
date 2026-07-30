@@ -11,7 +11,17 @@ not releases); from `0.1.0` on, every release gets a proper entry.
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.2.1] — 2026-07-30
+
 ### Added
+- **Auto-update**: Studio checks the signed `latest.json` on the newest
+  GitHub release shortly after launch (minisign signature verified against
+  the public key baked into the app before anything is trusted) and shows an
+  `update vX ⟳` chip in the toolbar; installing is strictly click-to-consent
+  and relaunches in place. Offline or unreachable-endpoint checks degrade to
+  a log line, never an error.
 - **Policy-in-the-loop bridge**: Studio's live session can be driven by a
   trained policy from a python env you point it at ("connect policy…" in the
   Live block). Studio spawns `caliper-learn drive CKPT --urdf …` and speaks

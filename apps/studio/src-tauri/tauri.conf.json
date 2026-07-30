@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Caliper Studio",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "identifier": "com.sannikov.studio",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -30,7 +30,16 @@
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "createUpdaterArtifacts": true
   },
-  "mainBinaryName": "caliper-studio"
+  "mainBinaryName": "caliper-studio",
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDE0NUZCMzNFQUFGOUQ1QTYKUldTbTFmbXFQck5mRkhOM3k5ZUJOTy9KOXViME1MVkpSRjZZT01mSUN5bk5Rc1NKbjJ4QUZiWE0K",
+      "endpoints": [
+        "https://github.com/msannikov03/caliper/releases/latest/download/latest.json"
+      ]
+    }
+  }
 }

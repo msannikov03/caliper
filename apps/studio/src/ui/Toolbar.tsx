@@ -1,6 +1,7 @@
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { useStore } from "../store";
+import { installPendingUpdate, type UpdateOffer } from "../update";
 import { baseName } from "../commands";
 import "./panels.css";
 
@@ -31,7 +32,16 @@ export async function openUrdf(): Promise<void> {
   await selectRobot(picked, true);
 }
 
-export function Toolbar({ version, onPalette }: { version: string; onPalette: () => void }) {
+export function Toolbar({
+  version,
+  update,
+  onPalette,
+}: {
+  version: string;
+  update: UpdateOffer | null;
+  onPalette: () => void;
+}) {
+  const [installing, setInstalling] = useState(false);
   const robot = useStore((s) => s.robot);
   const loading = useStore((s) => s.loading);
   const recentUrdfs = useStore((s) => s.recentUrdfs);
@@ -114,6 +124,22 @@ export function Toolbar({ version, onPalette }: { version: string; onPalette: ()
       <span className="engine">
         {robot ? `· ${robot.name} · ` : ""}engine v{version}
       </span>
+      {update && (
+        <button
+          className="btn accent update-chip"
+          disabled={installing}
+          title={update.notes ?? `update to v${update.version} and relaunch`}
+          onClick={() => {
+            setInstalling(true);
+            installPendingUpdate().catch((e) => {
+              setInstalling(false);
+              useStore.setState({ error: `update failed: ${String(e)}` });
+            });
+          }}
+        >
+          {installing ? "updating…" : `update v${update.version} ⟳`}
+        </button>
+      )}
       <button className="kbd-chip" data-tour="palette" title="Command palette (⌘K)" onClick={onPalette}>
         ⌘K
       </button>

@@ -3531,6 +3531,11 @@ pub fn run() {
         // behavior; no JS involvement — the capability permission only exists
         // so the webview COULD trigger a save, which we don't do).
         .plugin(tauri_plugin_window_state::Builder::default().build())
+        // Auto-update: checks the signed latest.json on the GitHub release
+        // (pubkey + endpoint in tauri.conf.json); the FE surfaces "update
+        // available" and installs on the user's click. process = relaunch.
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .invoke_handler(tauri::generate_handler![
             engine_version,
             fixtures,

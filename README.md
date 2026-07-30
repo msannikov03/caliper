@@ -12,7 +12,7 @@ through three faces that share the exact same code:
 - **Python** — `import caliper` (built with [maturin](https://www.maturin.rs/)), scriptable like MATLAB/NumPy
 - **Studio** — *Caliper Studio*, a Tauri + React desktop app with a 3D scene and a Simulink-style dataflow graph editor
 
-**⬇ Download**: [Caliper Studio 0.2.0 for macOS (Apple Silicon)](https://github.com/msannikov03/caliper/releases/tag/v0.2.0)
+**⬇ Download**: [Caliper Studio for macOS (Apple Silicon)](https://github.com/msannikov03/caliper/releases/latest)
 — an 11 MB signed & **notarized** dmg with the MuJoCo contact sim inside;
 opens with no Gatekeeper warning. Python wheels are attached to the same
 release; everything also builds from source (`cargo build`, `maturin develop`).
@@ -71,7 +71,7 @@ message, and a fix hint. See
 time, RAM, record overhead — every figure (and every still-`TBD` cell) lives
 in **[Lightweight, measured](docs/book/src/reference/lightweight.md)**,
 produced by `scripts/measure_lightweight.sh` with machine + git-rev provenance
-stamped on. Current headline: the Studio `.dmg` is **10.4 MB** with the MuJoCo
+stamped on. Current headline: the Studio `.dmg` is **11 MB** with the MuJoCo
 contact engine bundled.
 
 The engine math itself is cross-validated against
@@ -83,8 +83,9 @@ correctness/safety audit. See
 trust map.
 
 ¹ **The honest footnotes.** The packaged app is macOS (Apple Silicon) today;
-Linux/Windows builds are unproven. The `.dmg` is signed but **not yet
-notarized** — first launch needs right-click → Open. "Real-robot control"
+Linux/Windows builds are unproven. The `.dmg` is signed **and notarized**
+(opens with no Gatekeeper warning) and updates itself in place from the
+signed release manifest — install once. "Real-robot control"
 means the control loop, safety monitor, teleop and recording stack run against
 *simulated* backends; the CAN/Dynamixel hardware codecs are feature-gated
 skeletons that have never driven a physical arm. And "under a minute" is a

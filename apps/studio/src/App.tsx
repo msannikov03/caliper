@@ -20,6 +20,7 @@ import { SimulatePanel } from "./ui/SimulatePanel";
 import { GraphEditor } from "./graph/GraphEditor";
 import { DataMode } from "./data/DataMode";
 import { useStore } from "./store";
+import { checkForUpdate, type UpdateOffer } from "./update";
 import "./App.css";
 
 function ModeTabs() {
@@ -85,11 +86,16 @@ function SceneChrome() {
 export default function App() {
   const [version, setVersion] = useState("…");
   const [paletteOpen, setPaletteOpen] = useState(false);
+  const [update, setUpdate] = useState<UpdateOffer | null>(null);
   const mode = useStore((s) => s.mode);
   useEffect(() => {
     invoke<string>("engine_version")
       .then(setVersion)
       .catch(() => setVersion("offline"));
+    // One silent update check, shortly after launch so it never competes
+    // with first paint; the chip only appears when there is something real.
+    const t = setTimeout(() => void checkForUpdate().then(setUpdate), 4000);
+    return () => clearTimeout(t);
   }, []);
 
   // Global keymap (ONE window listener): ⌘K palette · ⌘O open URDF · ⌘1…⌘5
@@ -176,7 +182,7 @@ export default function App() {
 
   return (
     <div className="app">
-      <Toolbar version={version} onPalette={() => setPaletteOpen(true)} />
+      <Toolbar version={version} update={update} onPalette={() => setPaletteOpen(true)} />
       {/* segmented mode switch floats centered over the command bar */}
       <ModeTabs key="modetabs" />
       {/*

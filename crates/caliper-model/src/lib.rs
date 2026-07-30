@@ -397,6 +397,11 @@ impl RobotTree {
         // directory. One hull cache per load: repeated identical meshes (real
         // robots reuse one servo STL across many links) are hulled once.
         let mut hulls = HullCache::default();
+        // Convex hulling dominates load time on mesh-heavy real robots (so101:
+        // ~13 of ~17 ms release, ~2.6 of ~2.7 s debug), and each mesh is an
+        // independent pure computation — so fill the cache in parallel FIRST and
+        // let the serial link walk below read hits (see `prime_hull_cache`).
+        prime_hull_cache(&u.links, base_dir, &mut hulls);
         let mut t = RobotTree {
             name: u.name.clone(),
             ..Default::default()
@@ -710,15 +715,98 @@ fn load_mesh_hull(
     base_dir: Option<&Path>,
     cache: &mut HullCache,
 ) -> Option<Vec<Point3<f64>>> {
-    let scale_bits = scale.map(|s| s.0).unwrap_or([1.0; 3]).map(f64::to_bits);
-    let key = (filename.to_string(), scale_bits);
+    let scale_xyz = scale.map(|s| s.0).unwrap_or([1.0; 3]);
+    let key = (filename.to_string(), scale_xyz.map(f64::to_bits));
     if let Some(hit) = cache.map.get(&key) {
         return hit.clone();
     }
     cache.misses += 1;
-    let hull = load_mesh_hull_uncached(filename, scale, base_dir);
+    let hull = load_mesh_hull_uncached(filename, scale_xyz, base_dir);
     cache.map.insert(key, hull.clone());
     hull
+}
+
+/// Compute every DISTINCT collision-mesh hull of `links` up front, on several
+/// threads, and seed `cache` with the results so the serial link walk in
+/// [`RobotTree::from_urdf`] only takes cache hits.
+///
+/// THREADING (the only threads this crate spawns): [`load_mesh_hull_uncached`] is
+/// pure — resolve path, read the file, parse the STL, hull the cloud — with no
+/// shared mutable state, so the per-mesh work is embarrassingly parallel. Output
+/// is bit-identical to the serial path and INDEPENDENT of thread count or
+/// completion order: each mesh is hulled by the same function on its own inputs,
+/// jobs are keyed and re-assembled in first-encounter order, and the model itself
+/// is still assembled serially by link index afterwards. Scoped threads borrow
+/// `links`/`base_dir` directly, so nothing is cloned and no thread outlives this
+/// call. Fewer than two distinct meshes → no threads at all (the serial path is
+/// already optimal); a worker panic leaves the cache untouched so the serial walk
+/// simply recomputes.
+fn prime_hull_cache(links: &[urdf_rs::Link], base_dir: Option<&Path>, cache: &mut HullCache) {
+    // One job per distinct (raw filename, scale) — the SAME key `load_mesh_hull`
+    // uses — in first-encounter order.
+    let mut jobs: Vec<(HullKey, &str, [f64; 3])> = Vec::new();
+    for l in links {
+        for c in &l.collision {
+            if let urdf_rs::Geometry::Mesh { filename, scale } = &c.geometry {
+                let scale_xyz = scale.as_ref().map(|s| s.0).unwrap_or([1.0; 3]);
+                let key = (filename.clone(), scale_xyz.map(f64::to_bits));
+                if !jobs.iter().any(|(k, _, _)| *k == key) {
+                    jobs.push((key, filename.as_str(), scale_xyz));
+                }
+            }
+        }
+    }
+    if jobs.len() < 2 {
+        return;
+    }
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(jobs.len());
+    if threads < 2 {
+        return;
+    }
+    // Each worker pulls the next job index off a shared cursor rather than taking a
+    // fixed slice: per-mesh hull cost spans an order of magnitude (a 4k-vertex
+    // bracket vs a 160k-vertex wrist), so static chunks would leave threads idle
+    // behind one heavy mesh. Results carry their job index and are sorted back into
+    // job order, so the outcome does NOT depend on who finished first.
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let mut done: Vec<(usize, HullEntry)> = Vec::with_capacity(jobs.len());
+    let complete = std::thread::scope(|s| {
+        let workers: Vec<_> = (0..threads)
+            .map(|_| {
+                s.spawn(|| {
+                    let mut mine: Vec<(usize, HullEntry)> = Vec::new();
+                    loop {
+                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some((_, filename, scale_xyz)) = jobs.get(i) else {
+                            return mine;
+                        };
+                        mine.push((i, load_mesh_hull_uncached(filename, *scale_xyz, base_dir)));
+                    }
+                })
+            })
+            .collect();
+        for w in workers {
+            match w.join() {
+                Ok(mine) => done.extend(mine),
+                // A worker panicked (a bug, not an input error): the partial set can
+                // no longer be trusted to cover every job, so seed nothing.
+                Err(_) => return false,
+            }
+        }
+        true
+    });
+    if !complete {
+        return; // the serial walk below recomputes everything, correctly
+    }
+    debug_assert_eq!(done.len(), jobs.len(), "every job hulled exactly once");
+    done.sort_unstable_by_key(|(i, _)| *i);
+    for ((key, _, _), (_, hull)) in jobs.into_iter().zip(done) {
+        cache.misses += 1;
+        cache.map.insert(key, hull);
+    }
 }
 
 /// The uncached body of [`load_mesh_hull`]. Resolution goes through
@@ -727,7 +815,7 @@ fn load_mesh_hull(
 /// `CALIPER_PACKAGE_PATH`) all work.
 fn load_mesh_hull_uncached(
     filename: &str,
-    scale: Option<&urdf_rs::Vec3>,
+    scale: [f64; 3],
     base_dir: Option<&Path>,
 ) -> Option<Vec<Point3<f64>>> {
     let path = resolve_mesh_path(filename, base_dir)?;
@@ -742,8 +830,8 @@ fn load_mesh_hull_uncached(
     }
     let bytes = std::fs::read(&path).ok()?;
     let mut verts = stl::parse_stl(&bytes)?;
-    if let Some(s) = scale {
-        let [sx, sy, sz] = s.0;
+    if scale != [1.0; 3] {
+        let [sx, sy, sz] = scale;
         for v in &mut verts {
             v.coords.component_mul_assign(&Vector3::new(sx, sy, sz));
         }
@@ -1688,6 +1776,53 @@ mod tests {
             }
             other => panic!("expected ConvexHull, got {other:?}"),
         }
+    }
+
+    /// The parallel hull prepass ([`prime_hull_cache`]) must be invisible: two
+    /// loads of the same URDF agree bit-for-bit, and both agree with hulls
+    /// computed one mesh at a time on a single thread.
+    #[test]
+    fn primed_hulls_are_deterministic_and_match_the_serial_path() {
+        // Two DISTINCT meshes (the prepass no-ops below two), plus a repeat and a
+        // scaled reuse, so every cache-key case goes through the threaded path.
+        let cube = fixture("unit_cube.stl");
+        let hand = fixture("visual_hand.stl");
+        let urdf = format!(
+            r#"<robot name="r">
+                 <link name="base">
+                   <collision><geometry><mesh filename="{cube}"/></geometry></collision>
+                   <collision><geometry><mesh filename="{hand}"/></geometry></collision>
+                 </link>
+                 <link name="l1">
+                   <collision><geometry><mesh filename="{cube}"/></geometry></collision>
+                   <collision><geometry><mesh filename="{cube}" scale="3 2 1"/></geometry></collision>
+                 </link>
+                 <joint name="f1" type="fixed"><parent link="base"/><child link="l1"/></joint>
+               </robot>"#
+        );
+        let a = compile_str("hull_par_a", &urdf).unwrap();
+        let b = compile_str("hull_par_b", &urdf).unwrap();
+        assert_eq!(a.collision.len(), 4, "every collider survives");
+        let shapes = |m: &Model| -> Vec<CollisionShape> {
+            m.collision.iter().map(|g| g.shape.clone()).collect()
+        };
+        assert_eq!(shapes(&a), shapes(&b), "two loads must be bit-identical");
+
+        // Same meshes, hulled serially through the uncached path.
+        let u = urdf_rs::read_from_string(&urdf).unwrap();
+        let mut serial = HullCache::default();
+        let expect: Vec<CollisionShape> = u
+            .links
+            .iter()
+            .flat_map(|l| parse_collisions(l, None, &mut serial).0)
+            .map(|(_, s)| s)
+            .collect();
+        assert_eq!(serial.misses, 3, "3 distinct (filename, scale) keys");
+        assert_eq!(
+            shapes(&a),
+            expect,
+            "parallel-primed hulls must equal the serial ones exactly"
+        );
     }
 
     #[test]

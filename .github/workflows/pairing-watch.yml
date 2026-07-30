@@ -1,0 +1,49 @@
+name: pairing-watch
+# Monthly canary for the lerobot pairing: build the current wheel, install the
+# NEWEST lerobot from PyPI (unpinned — that is the point), and run the oracle's
+# lerobot round-trip gates. A new lerobot release that breaks the v3.0 pairing
+# or moves the v2.1 converter again shows up here as a red run within a month,
+# not as a user bug report. Skips are failures: a gate that silently skipped
+# (lerobot import shape changed, converter under neither known path) is a dead
+# canary, so the job asserts zero skipped tests.
+on:
+  schedule:
+    - cron: "17 6 3 * *" # 06:17 UTC on the 3rd — off the top-of-month CI rush
+  workflow_dispatch:
+
+jobs:
+  lerobot-roundtrip:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12" # lerobot >= 0.5 requires it
+      - name: Install ffmpeg (video round-trip gate must run, not skip)
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - name: Build and install the caliper wheel
+        run: |
+          pip install maturin
+          maturin build --release -m crates/caliper-py/Cargo.toml -o dist
+          pip install dist/*.whl
+      - name: Install the newest lerobot (deliberately unpinned)
+        run: |
+          pip install "lerobot[dataset]" pytest numpy
+          python -c "import lerobot; print('lerobot', lerobot.__version__)" | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Run the lerobot pairing gates
+        run: |
+          python -m pytest oracle -k "lerobot" -q --junit-xml=pairing.xml
+      - name: A skipped gate is a dead canary — fail on any skip
+        run: |
+          python - <<'EOF'
+          import sys
+          import xml.etree.ElementTree as ET
+          suite = ET.parse("pairing.xml").getroot().find("testsuite")
+          tests, skipped = int(suite.get("tests")), int(suite.get("skipped"))
+          print(f"pairing gates: {tests} ran, {skipped} skipped")
+          if tests == 0 or skipped > 0:
+              sys.exit("pairing watch is not actually watching — investigate")
+          EOF

@@ -53,6 +53,23 @@ jobs:
       - run: uv run maturin develop -m crates/caliper-py/Cargo.toml
       - run: uv run python -m pytest oracle -v
 
+  # Linux runtime verification: everything above runs on macOS (the primary
+  # dev target); this job proves the Rust workspace AND the built wheel + core
+  # oracle behave on a plain ubuntu runner too. Optional stacks (mujoco,
+  # lerobot, pinocchio) skip honestly here — their gates run in the macOS
+  # python job and the monthly pairing-watch.
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --exclude studio
+      - uses: astral-sh/setup-uv@v5
+      - run: uv venv && uv pip install maturin pytest numpy scipy pyarrow
+      - run: uv run maturin develop -m crates/caliper-py/Cargo.toml
+      - run: uv run python -m pytest oracle -q
+
   learn:
     runs-on: macos-14
     steps:

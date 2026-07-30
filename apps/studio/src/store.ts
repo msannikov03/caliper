@@ -28,13 +28,16 @@ import { taskInfoFromDto, taskLiveStartFields } from "./sim/task";
 import type { TaskInfo, TaskSpecDto } from "./sim/task";
 import {
   classifyLiveState,
+  classifyPolicyEvent,
   liveEndedPatch,
   liveFlushFate,
   liveInfoFromStarted,
+  livePolicyFromStarted,
   liveRecAfterStop,
   liveRecFromStarted,
   liveRecPatch,
   liveStatePatch,
+  policyFormError,
   reconcileGripper,
 } from "./sim/live";
 import type {
@@ -42,6 +45,10 @@ import type {
   GripperState,
   LiveEndedEvent,
   LiveInfo,
+  LivePolicyEvent,
+  LivePolicyInfo,
+  LivePolicyStartedDto,
+  LivePolicyStartReq,
   LiveRecInfo,
   LiveRecordFinishedDto,
   LiveRecordStartedDto,
@@ -436,6 +443,31 @@ export interface StudioState {
    *  this NEVER writes `q`/`frames` — the stream owns the pose. */
   driveTipLive: (targetColMajor: Mat4) => Promise<void>;
 
+  // policy in the loop (E1) — a trained policy, loaded in the USER'S python
+  // environment, drives the RUNNING session. It writes the same PD hold target
+  // every human input writes, so nothing else about the session changes: a
+  // nudge still lands, pause still freezes it, a take still records (a policy
+  // rollout IS a dataset worth having).
+  /** the policy attached to the session, null when the human is driving alone */
+  livePolicy: LivePolicyInfo | null;
+  /** last-used connect form, remembered across sessions (localStorage) */
+  policyPython: string;
+  policyCkpt: string;
+  /** "" = let the backend choose the torch device */
+  policyDevice: string;
+  /** Hydrate the three fields above from localStorage, once per process. The
+   *  panel calls this on mount — the read is deliberately NOT done at store
+   *  creation, exactly like `loadRecent`: module-init storage access is the
+   *  one thing a headless (or storage-less) host cannot be relied on for. */
+  loadPolicyForm: () => void;
+  /** Load a policy into the running session and hand it the hold target. The
+   *  slice goes `loading` synchronously (the handshake imports torch and the
+   *  weights — up to a minute) and reaches `driving` from whichever of the
+   *  reply and the "live://policy" event lands first. */
+  connectPolicy: (python: string, ckpt: string, device?: string) => Promise<void>;
+  /** Take the policy off the session (idempotent; the human keeps driving). */
+  stopPolicy: () => Promise<void>;
+
   // teleop recording (A3) — a live session's frames stream into a LeRobot
   // v3.0 dataset. The dataset outlives each take: takes append episodes to it
   // until `recordFinish` closes it (or the session ends and the backend does).
@@ -599,6 +631,10 @@ export const useStore = create<StudioState>((set, get) => ({
   liveTarget: [],
   liveJoint: 0,
   liveDriving: false,
+  livePolicy: null,
+  policyPython: "",
+  policyCkpt: "",
+  policyDevice: "",
   liveRec: null,
   liveRecTask: "teleop",
   liveRecFps: DEFAULT_REC_FPS,
@@ -695,8 +731,11 @@ export const useStore = create<StudioState>((set, get) => ({
 
   async loadRobot(path) {
     // a live session belongs to the model it was started on (its ndof, its
-    // props): a new robot ends it, exactly like leaving simulate mode does
-    if (get().live) void get().stopLive();
+    // props): a new robot ends it, exactly like leaving simulate mode does —
+    // and it ends HERE, not whenever the backend's "live://ended" gets back,
+    // or the drive loop would spend those frames pairing the old session with
+    // the new robot
+    endLiveNow(get, set);
     // urdfPath is set up-front so Reload can re-attempt a failed load; any
     // doctor verdict describes a previous file, so it clears with the error
     set({
@@ -735,8 +774,8 @@ export const useStore = create<StudioState>((set, get) => ({
       file = picked;
     }
     // a live session belongs to the robot + scene it started on, exactly like a
-    // plain robot load
-    if (get().live) void get().stopLive();
+    // plain robot load — and ends just as synchronously
+    endLiveNow(get, set);
     set({ loading: true, error: null });
     try {
       const dto = await invoke<TaskDto>("task_open", { path: file });
@@ -993,8 +1032,9 @@ export const useStore = create<StudioState>((set, get) => ({
   // ---- simulation (Phase 4) ----
   setMode(m) {
     stopClock();
-    // a live session is simulate-mode-only: leaving the mode ends it
-    if (m !== "simulate" && get().live) void get().stopLive();
+    // a live session is simulate-mode-only: leaving the mode ends it, and the
+    // slice goes with it now rather than on the backend's reply
+    if (m !== "simulate") endLiveNow(get, set);
     set({ mode: m, traj: null, simTraj: null, playing: false, playhead: 0 });
     void get().refreshFrames();
   },
@@ -1078,7 +1118,10 @@ export const useStore = create<StudioState>((set, get) => ({
   // ---- live sim session (streamed, not baked) ----
   async startLive() {
     const { q, robot, simProps, simEngine, simEngines, live, task } = get();
-    if (!robot || live) return; // one session at a time (the backend agrees)
+    // one session at a time (the backend agrees) — and `live` only lands when
+    // the reply does, so a second press inside that window is caught by the
+    // in-flight counter instead
+    if (!robot || live || liveStartsInFlight > 0) return;
     if (!robot.hasInertia) {
       set({ error: "this robot has no inertial data" });
       return;
@@ -1105,6 +1148,13 @@ export const useStore = create<StudioState>((set, get) => ({
         ...taskLiveStartFields(task),
       };
       const dto = await invoke<LiveStartedDto>("live_start", { req });
+      // the stream was torn down while the start was out (a new robot, a new
+      // task, a mode change): this session was never wanted, and adopting it
+      // now would leave a physics thread running with nothing listening to it
+      if (!liveSubscribed) {
+        void invoke("live_stop").catch(() => {});
+        return;
+      }
       // the session holds q0 until a human drives it — seed the mirror from the
       // pose we started at, so the first jog is a delta off THAT, not off zero
       liveTargetMirror = q.slice();
@@ -1133,10 +1183,10 @@ export const useStore = create<StudioState>((set, get) => ({
       await invoke("live_stop");
       // teardown rides the "live://ended" event the backend emits in reply
     } catch (e) {
-      // the session is unreachable — tear down here so the UI can't wedge
+      // the session is unreachable — tear down here so the UI can't wedge (the
+      // same teardown the "live://ended" it will never send would have run)
+      teardownLive("stopped", get, set);
       set({ error: String(e) });
-      stopLiveStream();
-      set({ live: null, livePropPoses: [], liveTarget: [], liveDriving: false });
     }
   },
   async pauseLive(paused) {
@@ -1236,7 +1286,10 @@ export const useStore = create<StudioState>((set, get) => ({
       const res = await invoke<IkSolution>("solve_ik_governed", {
         req: { target: targetColMajor, seed, frame: frameName },
       });
-      if (!get().live) return; // the session ended under us — nothing to drive
+      // the solve outlived its session: a session that ended under us has
+      // nothing to drive, and a session that was REPLACED under us is a
+      // different robot standing in a different place (mirrors toggleGripper)
+      if (get().live?.sessionId !== live.sessionId) return;
       // NOTE: no q/frames write. The stream owns the pose, so an IK reply can
       // never fight it; the solution is a new hold target and nothing else.
       livePending = clampQ(res.q, robot.limits);
@@ -1248,7 +1301,79 @@ export const useStore = create<StudioState>((set, get) => ({
       liveIkBusy = false;
       const queued = liveIkPending;
       liveIkPending = null;
-      if (queued && get().live) void get().driveTipLive(queued);
+      // the queued pose was aimed at THIS session too
+      if (queued && get().live?.sessionId === live.sessionId) void get().driveTipLive(queued);
+    }
+  },
+
+  // ---- policy in the loop (E1) ----
+  loadPolicyForm() {
+    if (policyFormHydrated) return; // never over-type a form already in use
+    policyFormHydrated = true;
+    set(readPolicyForm());
+  },
+  async connectPolicy(python, ckpt, device) {
+    const { live, livePolicy } = get();
+    // a policy drives a session; there is nothing to attach it to otherwise,
+    // and one at a time (the backend agrees)
+    if (!live || livePolicy) return;
+    const py = python.trim();
+    const ck = ckpt.trim();
+    const bad = policyFormError(py, ck);
+    if (bad) {
+      set({ error: bad });
+      return;
+    }
+    const dev = (device ?? "").trim();
+    // latest-wins across the whole (long) handshake: a stop, a terminal event
+    // or a second attempt bumps this, and a reply for a superseded attempt is
+    // dropped instead of resurrecting a slice something else already cleared
+    const attempt = ++policyAttempt;
+    // synchronous, so the button shows progress on the very next paint — the
+    // invoke below can be out for the better part of a minute
+    set({
+      livePolicy: { state: "loading", python: py, ckpt: ck, device: dev || undefined },
+      policyPython: py,
+      policyCkpt: ck,
+      policyDevice: dev,
+      error: null,
+    });
+    persistPolicyForm(py, ck, dev);
+    try {
+      // subscribe BEFORE the invoke: the "driving" event fires on the same
+      // handshake the reply comes from and can beat it through the event loop
+      await subscribePolicy(get, set);
+      const req: LivePolicyStartReq = { python: py, ckpt: ck };
+      if (dev) req.device = dev;
+      const dto = await invoke<LivePolicyStartedDto>("live_policy_start", { req });
+      const cur = get().livePolicy;
+      // stopped, failed on the stream, or the session ended under us: the
+      // child is already down (session end takes it with it), so adopting
+      // this reply would paint a policy that is not running
+      if (policyAttempt !== attempt || !cur) return;
+      set({ livePolicy: livePolicyFromStarted(cur, dto) });
+    } catch (e) {
+      // the backend's Err carries the validation reason or the handshake
+      // failure WITH the child's stderr tail — that tail is the useful half,
+      // so it goes to the banner whole
+      if (policyAttempt === attempt) {
+        policyAttempt += 1;
+        set({ livePolicy: null });
+      }
+      set({ error: String(e) });
+    }
+  },
+  async stopPolicy() {
+    if (!get().livePolicy) return;
+    // abandon any handshake still in flight and clear NOW: live_policy_stop is
+    // idempotent, so there is nothing to wait for, and a connect that is still
+    // importing torch must not come back driving after the human said stop
+    policyAttempt += 1;
+    set({ livePolicy: null });
+    try {
+      await invoke("live_policy_stop");
+    } catch (e) {
+      set({ error: String(e) });
     }
   },
 
@@ -1671,6 +1796,11 @@ export const useStore = create<StudioState>((set, get) => ({
         path: ds.path,
         episode,
       });
+      // stale-guard, exactly like runDataDoctor's: any adopt (open/refresh/
+      // edit) swapped the summary out from under the bake, and this clip was
+      // baked from bytes that may not live at `episode` any more — drop it
+      // silently, the user asked for a dataset that is no longer open
+      if (get().dataset !== ds) return;
       // adopted exactly like every other rollout — one playback path
       stopClock();
       set({
@@ -2159,6 +2289,43 @@ async function pruneMissingRecents(
   }
 }
 
+// ---- policy connect form persistence (localStorage) ----
+// Deliberately its OWN key rather than a field of the session below: a python
+// environment and a checkpoint outlive the robot, the mode and the pose that
+// session describes, and re-typing two absolute paths per app start is exactly
+// the friction this feature exists to remove.
+const POLICY_KEY = "caliper.policyForm";
+
+/** the form has been read back once; a remount must not retype it */
+let policyFormHydrated = false;
+
+/** The remembered connect form, or empty strings when there is nothing stored
+ *  (or storage is unavailable — the form simply starts blank then). */
+function readPolicyForm(): { policyPython: string; policyCkpt: string; policyDevice: string } {
+  const blank = { policyPython: "", policyCkpt: "", policyDevice: "" };
+  try {
+    const raw: unknown = JSON.parse(localStorage.getItem(POLICY_KEY) ?? "null");
+    if (typeof raw !== "object" || raw === null) return blank;
+    const o = raw as Record<string, unknown>;
+    const str = (v: unknown) => (typeof v === "string" ? v : "");
+    return {
+      policyPython: str(o.python),
+      policyCkpt: str(o.ckpt),
+      policyDevice: str(o.device),
+    };
+  } catch {
+    return blank;
+  }
+}
+
+function persistPolicyForm(python: string, ckpt: string, device: string): void {
+  try {
+    localStorage.setItem(POLICY_KEY, JSON.stringify({ python, ckpt, device }));
+  } catch {
+    // storage unavailable (private mode / quota) — the form stays in-memory.
+  }
+}
+
 // ---- session persistence (localStorage) ----
 const SESSION_KEY = "caliper.session";
 
@@ -2313,6 +2480,16 @@ let liveStartsInFlight = 0;
 let liveRecArmed = false;
 /** a live_record_stop is out: the take is ending because WE asked it to */
 let liveRecStopping = false;
+/** unlisten handle for "live://policy" (empty = not subscribed). Separate from
+ *  `liveUnlisten` so a build/backend that never emits the channel cannot make
+ *  `subscribeLive` — and with it every live session — fail; it dies with the
+ *  live stream all the same (`stopLiveStream` drops it). */
+let policyUnlisten: UnlistenFn[] = [];
+/** set synchronously so a second subscribePolicy can't race the await */
+let policySubscribed = false;
+/** connect attempts, newest wins: a reply whose attempt was superseded (a
+ *  stop, a terminal event, another connect) is dropped rather than adopted */
+let policyAttempt = 0;
 
 async function subscribeLive(
   get: () => StudioState,
@@ -2321,14 +2498,66 @@ async function subscribeLive(
   if (liveSubscribed) return;
   liveSubscribed = true;
   try {
-    liveUnlisten = await Promise.all([
-      listen<LiveStateEvent>("live://state", (e) => onLiveState(e.payload, get, set)),
-      listen<LiveEndedEvent>("live://ended", (e) => onLiveEnded(e.payload, get, set)),
-    ]);
+    // one at a time, each handle banked the moment it resolves: registering
+    // both in parallel would strand the first listener when the second throws
+    // (nothing would hold its unlisten, and the channel would stay live for
+    // the rest of the process)
+    liveUnlisten.push(
+      await listen<LiveStateEvent>("live://state", (e) => onLiveState(e.payload, get, set)),
+    );
+    liveUnlisten.push(
+      await listen<LiveEndedEvent>("live://ended", (e) => onLiveEnded(e.payload, get, set)),
+    );
   } catch (e) {
-    liveSubscribed = false;
+    stopLiveStream(); // unlistens whatever DID register, and clears the guard
     throw e;
   }
+}
+
+/** Register the policy channel (idempotent). Its handle rides `policyUnlisten`
+ *  and `stopLiveStream` drops it, so the subscription lives exactly as long as
+ *  the session the policy is attached to. */
+async function subscribePolicy(
+  get: () => StudioState,
+  set: (p: Partial<StudioState>) => void,
+): Promise<void> {
+  if (policySubscribed) return;
+  policySubscribed = true;
+  try {
+    policyUnlisten.push(
+      await listen<LivePolicyEvent>("live://policy", (e) => onLivePolicy(e.payload, get, set)),
+    );
+  } catch (e) {
+    stopPolicyStream();
+    throw e;
+  }
+}
+
+/** "live://policy": the handshake landing, and the ONE terminal event that
+ *  ends a drive. A terminal event is the only notice a policy died on its own
+ *  (a crashed child, a checkpoint the runner choked on halfway), so it — not a
+ *  command — is what clears the slice. */
+function onLivePolicy(
+  ev: LivePolicyEvent,
+  get: () => StudioState,
+  set: (p: Partial<StudioState>) => void,
+): void {
+  if (classifyPolicyEvent(get().live, ev.sessionId) === "drop") return;
+  const cur = get().livePolicy;
+  if (ev.state === "driving") {
+    // a stop raced the handshake, or the reply already painted it
+    if (!cur || cur.state === "driving") return;
+    set({ livePolicy: { ...cur, state: "driving", policyType: ev.detail ?? cur.policyType } });
+    return;
+  }
+  // terminal either way: the child is gone, and a reply still in flight for
+  // this attempt describes a policy that is no longer running
+  policyAttempt += 1;
+  const patch: Partial<StudioState> = { livePolicy: null };
+  // "stopped" is what a stopPolicy (or a session end) looks like from here —
+  // quiet by design. "error" is not: its detail carries the child's stderr.
+  if (ev.state === "error") patch.error = `policy stopped — ${ev.detail ?? "no detail"}`;
+  set(patch);
 }
 
 function onLiveState(
@@ -2349,14 +2578,31 @@ function onLiveEnded(
   const cur = get().live;
   // an end for a session we already replaced (or never had) says nothing about
   // the one running now — the "superseded" end of a restarted session arrives
-  // exactly this way
+  // exactly this way, and so does the end of a session `endLiveNow` already
+  // tore down (cur is null then, with no start in flight)
   if (cur ? ev.sessionId < cur.sessionId : liveStartsInFlight === 0) return;
+  teardownLive(ev.reason, get, set);
+}
+
+/** THE live-session teardown: stream off, slice cleared, the dataset the take
+ *  wrote left reachable. Every way a session can end lands here — the
+ *  "live://ended" event above, a `live_stop` that could not be delivered, and
+ *  the synchronous end `endLiveNow` forces — so there is one description of
+ *  what "no session" means rather than three that drift apart. */
+function teardownLive(
+  reason: string,
+  get: () => StudioState,
+  set: (p: Partial<StudioState>) => void,
+): void {
   const rec = get().liveRec;
   stopLiveStream();
   set({
-    ...liveEndedPatch(ev.reason),
+    ...liveEndedPatch(reason),
     liveTarget: [],
     liveDriving: false,
+    // a policy is attached to ONE session and the backend takes its child down
+    // with it, so there is nothing left to stop and nothing left to show
+    livePolicy: null,
     // the backend finalizes an open dataset when the session ends, so what it
     // wrote is a real dataset — keep the path reachable instead of dropping it
     liveRec: null,
@@ -2364,6 +2610,22 @@ function onLiveEnded(
     liveRecDone:
       rec && rec.episodesSaved > 0 ? { root: rec.root, episodes: rec.episodesSaved } : null,
   });
+}
+
+/** End the session NOW, because the thing it belongs to is going away: a new
+ *  robot, a new task, a mode that is not simulate. `live_stop` still goes out,
+ *  but the slice cannot wait for its "live://ended" reply — every frame in
+ *  between is one the drive loop spends pairing the OLD session (its ndof, its
+ *  props) with the NEW robot. The late event is a no-op by construction: the
+ *  listeners are already gone, and onLiveEnded's stale filter drops it even if
+ *  a fresh subscribe has brought them back. */
+function endLiveNow(get: () => StudioState, set: (p: Partial<StudioState>) => void): void {
+  if (!get().live && !liveSubscribed) return;
+  teardownLive("stopped", get, set);
+  // fire-and-forget, and deliberately quiet: this end is a side effect of the
+  // load/mode change the human actually asked for, and the caller's own set()
+  // is about to repaint the banner anyway
+  void invoke("live_stop").catch(() => {});
 }
 
 function scheduleLiveFlush(get: () => StudioState, set: (p: Partial<StudioState>) => void) {
@@ -2396,8 +2658,15 @@ function flushLive(get: () => StudioState, set: (p: Partial<StudioState>) => voi
       if (grip.state !== p.live.gripperState) p.live = { ...p.live, gripperState: grip.state };
       patch = { ...p, _reqId: get()._reqId + 1 };
       // the backend's own view of the hold target is authoritative only while
-      // we have none of our own (session start, and after a reset)
-      if (!liveTargetMirror || liveTargetMirror.length !== ev!.target.length) {
+      // we have none of our own (session start, and after a reset) — and while
+      // a POLICY is writing it, which is every frame: without the re-seed the
+      // mirror would still hold the pose the human left, and the first nudge
+      // after connecting would yank every other joint back to it
+      if (
+        get().livePolicy?.state === "driving" ||
+        !liveTargetMirror ||
+        liveTargetMirror.length !== ev!.target.length
+      ) {
         liveTargetMirror = ev!.target.slice();
         patch.liveTarget = liveTargetMirror;
       } else {
@@ -2558,7 +2827,16 @@ function driveLive(
   // held keys and sticks — go quiet instead of piling up motion behind the pause
   let target = livePending;
   livePending = null;
-  if (!live.paused) {
+  // A policy owns the hold target while it drives. The CONTINUOUS inputs are
+  // the ones that would fight it: a held jog key and a pushed stick re-assert a
+  // target every frame, sixty times a second against the policy's own action
+  // rate, and the arm would just judder between the two. They go quiet for as
+  // long as it drives. The ONE-SHOT paths deliberately do not — a slider
+  // commit, a gizmo drag, the gripper button and the pad's pause/reset/grip
+  // buttons are each a single act the human meant, and the policy's next action
+  // simply overwrites it (which is what "the human can still nudge" means).
+  const policyDriving = st.livePolicy?.state === "driving";
+  if (!live.paused && !policyDriving) {
     const base = target ?? liveTargetMirror;
     // keyboard jog moves ONE selected joint per frame
     const dir = jogDirection(livePressed);
@@ -2675,7 +2953,17 @@ function stopLiveStream(): void {
   liveSubscribed = false;
   liveRecArmed = false;
   liveRecStopping = false;
+  stopPolicyStream();
   resetLiveDrive();
+}
+
+/** Drop the policy channel and abandon any handshake still in flight. Called
+ *  only from `stopLiveStream`: the policy's lifetime IS the session's. */
+function stopPolicyStream(): void {
+  for (const un of policyUnlisten) un();
+  policyUnlisten = [];
+  policySubscribed = false;
+  policyAttempt += 1;
 }
 
 /** Apply the stashed state event NOW instead of on the next frame (test helper

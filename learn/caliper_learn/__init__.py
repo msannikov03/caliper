@@ -13,6 +13,12 @@ SAFETENSORS ONLY, in-process, no pickle, no network service — and drive them
 through Caliper's safety-monitored ControlLoop. `hub` lazily imports lerobot only
 when a Hub checkpoint is actually loaded; the core sidecar stays lerobot-free.
 
+POLICY-IN-THE-LOOP (`bridge`): `caliper-learn drive CKPT --urdf URDF` serves a
+loaded checkpoint over a line-oriented JSON protocol on stdin/stdout, so
+Studio's live contact sim can be driven by it tick by tick (state-based
+observations only — live Studio has no camera stream). Stdout is the wire:
+the loop redirects every stray print to stderr.
+
 W2 DIAGNOSTICS: `eval` (seeded closed-loop harness + checkpoint `sweep`),
 `profile` (deploy-loop latency, honest achievable Hz), `debugger`
 (P001..P008 — "is it a vision problem or a control problem"), `autopsy`
@@ -55,6 +61,7 @@ except Exception:  # graceful fallback: plain-checkout import, not pip-installed
     __version__ = "0.1.0"
 
 from .autopsy import AutopsyReport, autopsy
+from .bridge import BridgeError, drive_loop, drive_main, load_drive_policy
 from .collect import collect_demos
 from .collect_sim import collect_camera_dataset
 from .coverage_gen import CoverageReport, generate_coverage
@@ -158,6 +165,11 @@ __all__ = [
     "LoadedPolicy",
     "CheckpointSecurityError",
     "run_policy",
+    # policy-in-the-loop bridge (Studio's live sim <-> a checkpoint)
+    "drive_loop",
+    "drive_main",
+    "load_drive_policy",
+    "BridgeError",
     # eval harness
     "EvalTask",
     "EvalConfig",

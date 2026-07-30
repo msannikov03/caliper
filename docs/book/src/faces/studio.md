@@ -85,6 +85,13 @@ Alongside the baked rollouts, Simulate mode runs a **live stepped session**:
   named explicitly) get a gripper open/close control (button, `G`, or gamepad
   X); closing on a touching prop welds it to the gripper — the standard sim
   teleop heuristic, labeled as such — and a `HELD` badge names what's carried.
+- **Connect a policy** — point Studio at a python env and a trained
+  checkpoint and the policy drives the live session in-app (obs out, actions
+  in over a pure-JSON stdio bridge; the sim never blocks on inference). You
+  can still nudge with any input mid-drive, Space pauses policy and sim
+  together, and recording while the policy drives yields policy-rollout
+  episodes. State-based policies only — camera checkpoints are refused by
+  name.
 - **Record teleop episodes** — while live, pick a dataset folder, set a task
   label and fps (default 50), and record takes straight into a native
   LeRobotDataset v3.0: stop-and-save or discard per take, episode counter,

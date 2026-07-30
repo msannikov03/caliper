@@ -38,11 +38,16 @@ use std::sync::{Arc, Mutex};
 use tauri::Manager;
 
 mod live;
+mod policy;
 
 /// Loaded robot, shared across commands. `None` until `robot_info` succeeds.
 #[derive(Default)]
 struct AppState {
     model: Mutex<Option<Model>>,
+    /// Path the cached model was loaded FROM, kept alongside it because some
+    /// consumers need the file itself, not the parsed model — a policy child
+    /// (see [`policy`]) loads the same URDF in its own process.
+    robot_path: Mutex<Option<String>>,
     poses: Mutex<PoseLibrary>,
     /// Canonicalized absolute paths of the loaded robot's resolved visual
     /// meshes. `read_mesh` serves ONLY these — the webview can never read an
@@ -565,6 +570,12 @@ fn load_robot_into_state(path: &str, state: &AppState) -> Result<RobotInfo, Stri
         .mesh_allowlist
         .lock()
         .map_err(|_| "state lock poisoned")? = allowlist;
+    // Absolute where possible: whatever we hand another process must not depend
+    // on ITS working directory.
+    let abs = std::fs::canonicalize(p)
+        .map(|c| c.display().to_string())
+        .unwrap_or_else(|_| path.to_string());
+    *state.robot_path.lock().map_err(|_| "state lock poisoned")? = Some(abs);
     *state.model.lock().map_err(|_| "state lock poisoned")? = Some(model);
     Ok(info)
 }
@@ -3575,7 +3586,10 @@ pub fn run() {
             live::live_record_start,
             live::live_record_stop,
             live::live_record_finish,
-            live::live_record_status
+            live::live_record_status,
+            policy::live_policy_start,
+            policy::live_policy_stop,
+            policy::live_policy_status
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

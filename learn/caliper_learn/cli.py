@@ -14,6 +14,10 @@ Subcommands (each takes `--json` for machine output; human text otherwise):
 - `caliper-learn coverage ROOT OUT (--urdf PATH | --task FILE)`
       the doctor→generator loop: replay ROOT + targeted planner episodes
       into OUT, report the before/after bin-occupancy delta (D007).
+- `caliper-learn drive CKPT (--urdf PATH | --task FILE)`
+      policy-in-the-loop: serve the checkpoint over the stdio JSONL bridge so
+      Studio's live sim can be driven by it (see `bridge`). NOT a human
+      subcommand — stdout is the protocol wire; Studio spawns it.
 
 THE TWO TASK FORMS. `--urdf/--frame/--target` is the built-in REACH task:
 success = the arm's tip got within `--tol` of a point. `--task FILE` is a
@@ -234,6 +238,24 @@ def _cmd_coverage(args) -> int:
     return 1 if rep.error_findings_after else 0
 
 
+def _cmd_drive(args) -> int:
+    from .bridge import drive_main
+
+    if bool(args.urdf) == bool(args.task):
+        raise SystemExit(
+            "drive needs exactly one robot source: --urdf PATH, or --task FILE "
+            "(a *.caliper-task.json, whose robot is used — observations stay "
+            "state-based, so its scene and success criterion play no part here)"
+        )
+    if args.task:
+        from .task import load_task
+
+        urdf = str(load_task(args.task).robot_path)
+    else:
+        urdf = args.urdf
+    return drive_main(args.policy_dir, urdf, device=args.device)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="caliper-learn",
@@ -290,6 +312,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--bins", type=int, default=20, help="histogram bins per dof for targeting")
     p.add_argument("--json", action="store_true")
     p.set_defaults(fn=_cmd_coverage)
+
+    p = sub.add_parser(
+        "drive",
+        help="serve a checkpoint over the stdio JSONL bridge (Studio spawns this)",
+    )
+    p.add_argument("policy_dir", help="lerobot Hub checkpoint directory")
+    p.add_argument("--urdf", default=None, help="the robot the sim is running")
+    p.add_argument(
+        "--task",
+        default=None,
+        help="a *.caliper-task.json to take the robot from (instead of --urdf)",
+    )
+    p.add_argument("--device", default="cpu", help="inference device (default: cpu)")
+    p.set_defaults(fn=_cmd_drive)
 
     return parser
 

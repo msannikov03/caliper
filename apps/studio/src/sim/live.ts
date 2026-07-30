@@ -369,6 +369,118 @@ export function liveStatePatch(
   };
 }
 
+// ---- policy in the loop (E1) ----
+// A trained policy running in the USER'S python environment drives the RUNNING
+// session: the child observes at `hz` and writes the SAME PD hold target every
+// human input writes, so nothing about the session changes shape while it
+// drives — a nudge still lands, a pause still freezes, a take still records.
+
+/** Camel-case mirror of `LivePolicyStartReq` — what `live_policy_start` asks
+ *  with. `python` is a binary path OR a venv directory (the backend resolves
+ *  it); `ckpt` is the trained-policy directory. */
+export interface LivePolicyStartReq {
+  python: string;
+  ckpt: string;
+  /** torch device the child loads onto; omitted = the backend picks */
+  device?: string;
+  /** observation rate (Hz); omitted = 20 */
+  hz?: number;
+}
+
+/** Camel-case mirror of the `live_policy_start` reply — what the handshake
+ *  learned about the policy that is now driving. */
+export interface LivePolicyStartedDto {
+  ndof: number;
+  /** actions the policy emits per inference — its RE-PLAN period. Display
+   *  metadata only: the child paces itself, nothing here schedules on it. */
+  chunk: number;
+  policyType: string;
+  device: string;
+}
+
+/** Camel-case mirror of `LivePolicyEvent` ("live://policy"). Exactly one
+ *  TERMINAL event ("stopped" or "error") arrives per drive; "driving" fires
+ *  once after the handshake, carrying the policy type as its detail. */
+export interface LivePolicyEvent {
+  sessionId: number;
+  state: "driving" | "stopped" | "error";
+  /** policy type on "driving", the failure on "error" (a backend failure
+   *  detail carries the child's stderr tail verbatim), else null */
+  detail: string | null;
+}
+
+/** The store's policy slice, or null when no policy is attached to the
+ *  session. `loading` covers the whole handshake — a cold torch import plus
+ *  weights can take the better part of a minute, and the panel says so. */
+export interface LivePolicyInfo {
+  state: "loading" | "driving";
+  /** what the handshake reported; absent until it lands */
+  policyType?: string;
+  device?: string;
+  chunk?: number;
+  /** what the human asked with, kept so the badge can name the checkpoint */
+  python: string;
+  ckpt: string;
+}
+
+/** Why a connect attempt is not worth making, or null when it is. The backend
+ *  validates too — this only keeps an obviously empty form off the wire. */
+export function policyFormError(python: string, ckpt: string): string | null {
+  if (!python.trim()) return "a policy needs a python environment (binary or venv directory)";
+  if (!ckpt.trim()) return "a policy needs a trained-checkpoint directory";
+  return null;
+}
+
+/** The slice after a `live_policy_start` reply lands on the loading one. The
+ *  "driving" EVENT may have beaten the reply here (it fires on the same
+ *  handshake), so this fills the reply's fields in rather than replacing the
+ *  slice wholesale. */
+export function livePolicyFromStarted(
+  prev: LivePolicyInfo,
+  dto: LivePolicyStartedDto,
+): LivePolicyInfo {
+  return {
+    ...prev,
+    state: "driving",
+    policyType: dto.policyType,
+    device: dto.device,
+    chunk: dto.chunk,
+  };
+}
+
+/** What the "live://policy" handler does with an incoming event. A policy
+ *  belongs to ONE session, so an event naming any other session describes a
+ *  drive that is already over — the same stale filter the state channel uses,
+ *  except there is no in-flight window to stash for (a policy can only be
+ *  connected to a session that is already adopted). */
+export type LivePolicyFate = "apply" | "drop";
+export function classifyPolicyEvent(cur: LiveInfo | null, evSessionId: number): LivePolicyFate {
+  return cur && cur.sessionId === evSessionId ? "apply" : "drop";
+}
+
+/** What the panel says about the policy on the session right now. */
+export interface PolicyBadge {
+  label: string;
+  title: string;
+}
+
+export function policyBadge(p: LivePolicyInfo): PolicyBadge {
+  if (p.state === "loading") {
+    return {
+      label: "loading policy…",
+      title: `starting ${p.ckpt} in ${p.python} — a cold torch import can take a minute`,
+    };
+  }
+  const type = p.policyType ?? "policy";
+  const dev = p.device ?? "?";
+  return {
+    label: `policy: ${type} @ ${dev}`,
+    title:
+      `${p.ckpt} — ${p.chunk ? `${p.chunk} actions per inference, ` : ""}` +
+      "driving the same hold target your inputs write",
+  };
+}
+
 /** Store patch for "live://ended": the session is gone either way; only a
  *  reason beyond the two benign ends ("stopped", "superseded") surfaces in
  *  the error banner. */

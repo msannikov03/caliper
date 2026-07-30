@@ -199,7 +199,7 @@ fn verify(all: &[Point3<f64>], hull: &[Point3<f64>]) -> bool {
 
 /// Build the face planes of the convex hull of `pts` via an incremental
 /// (quickhull-style) sweep. `None` on a degenerate (collinear/coplanar) cloud.
-/// Face normals are oriented outward by the cloud centroid, so winding is never
+/// Face normals are oriented outward by the SEED-TETRA centroid (interior to every stage of the growing hull — the whole-cloud centroid is not), so winding is never
 /// relied upon.
 fn build_faces(pts: &[Point3<f64>]) -> Option<Vec<Face>> {
     let n = pts.len();

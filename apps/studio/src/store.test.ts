@@ -16,7 +16,9 @@
 //  - deleteGraphSelection: node removal takes its edges; edge-only removal
 //  - exportGraph / importGraph: save_graph_file/load_graph_file seam + banner
 //  - live session: start/adopt/flush, ended-with-error, stale-event guard,
-//    mode switch tears the session down
+//    mode switch tears the session down (synchronously, before the backend's
+//    own end gets back), one start per double press, a solve that outlived its
+//    session, a partly-registered subscription unlistening what it did get
 //  - teleop recording: dataset picked once and continued, save/discard/empty
 //    takes, a take dying on the stream alone, finish → open in Data
 //  - openVerdict: a real eval report lands in the slice; every failure mode
@@ -54,6 +56,7 @@ vi.mock("@xyflow/react", () => ({
 }));
 
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import {
   useStore,
@@ -86,6 +89,7 @@ import type { CNode, CEdge, Diagnostics, GraphRunResult } from "./graph/types";
 import evalFixture from "./verdicts/fixtures/eval.json";
 
 const mockInvoke = vi.mocked(invoke);
+const mockListen = vi.mocked(listen);
 const mockSaveDialog = vi.mocked(save);
 const mockOpenDialog = vi.mocked(open);
 
@@ -202,6 +206,10 @@ const STORE_RESET = {
   liveRecFps: 50,
   liveRecHint: null,
   liveRecDone: null,
+  livePolicy: null,
+  policyPython: "",
+  policyCkpt: "",
+  policyDevice: "",
   dataset: null,
   datasetError: null,
   datasetEpisode: null,
@@ -1127,6 +1135,94 @@ describe("live session — store wiring", () => {
     expect(s.error).toBe("backend gone");
   });
 
+  it("takes exactly one start from a double press, before any reply lands", async () => {
+    // `live` is what the guard reads, and it only lands with the reply — the
+    // window in between is a button press wide
+    let release: (d: LiveStartedDto) => void = () => {};
+    const reply = new Promise<LiveStartedDto>((r) => (release = r));
+    mockInvoke.mockImplementation(async (cmd: string) =>
+      cmd === "live_start" ? reply : undefined,
+    );
+
+    const first = useStore.getState().startLive();
+    const second = useStore.getState().startLive();
+    release(mockStarted());
+    await Promise.all([first, second]);
+
+    expect(mockInvoke.mock.calls.filter((c) => c[0] === "live_start")).toHaveLength(1);
+    expect(useStore.getState().live).toMatchObject({ sessionId: 1 });
+  });
+
+  it("ends the session the moment a new robot loads, not when the backend replies", async () => {
+    backend(mockStarted({ sessionId: 1 }));
+    await useStore.getState().startLive();
+    // the end the backend will emit in reply — held onto, because the teardown
+    // takes the listeners with it
+    const ended = liveHandlers["live://ended"];
+    mockInvoke.mockImplementation(async (cmd: string) =>
+      cmd === "robot_info" ? MOCK_ROBOT : undefined,
+    );
+
+    const loading = useStore.getState().loadRobot("/fx/other.urdf");
+
+    // synchronously gone: every frame the old session outlives this call is a
+    // frame the drive loop spends aiming it at the NEW robot
+    expect(useStore.getState().live).toBeNull();
+    expect(mockInvoke).toHaveBeenCalledWith("live_stop");
+    _flushLive();
+    expect(targetCalls()).toHaveLength(0);
+    await loading;
+
+    // and the real end, when it finally arrives, has nothing left to say
+    ended({ payload: { sessionId: 1, reason: "stopped" } });
+    const s = useStore.getState();
+    expect(s.live).toBeNull();
+    expect(s.error).toBeNull();
+    expect(s.robot).toBe(MOCK_ROBOT);
+  });
+
+  it("does not adopt a session the mode left behind while its start was out", async () => {
+    let release: (d: LiveStartedDto) => void = () => {};
+    const reply = new Promise<LiveStartedDto>((r) => (release = r));
+    mockInvoke.mockImplementation(async (cmd: string) =>
+      cmd === "live_start" ? reply : undefined,
+    );
+
+    const starting = useStore.getState().startLive();
+    useStore.getState().setMode("jog"); // the stream goes with the mode
+    release(mockStarted());
+    await starting;
+
+    // adopting it here would leave a physics thread running with nothing
+    // listening to it — the session is told to stop instead
+    expect(useStore.getState().live).toBeNull();
+    expect(mockInvoke.mock.calls.filter((c) => c[0] === "live_stop").length).toBeGreaterThan(0);
+  });
+
+  it("unlistens the channel that DID register when the other listen fails", async () => {
+    const unlisten = vi.fn();
+    mockListen
+      .mockImplementationOnce(async () => unlisten)
+      .mockImplementationOnce(async () => {
+        throw "no such event channel";
+      });
+
+    await useStore.getState().startLive();
+
+    // registered in parallel, the state channel would have had nobody holding
+    // its unlisten — and would stay live for the rest of the process
+    expect(unlisten).toHaveBeenCalledTimes(1);
+    const s = useStore.getState();
+    expect(s.live).toBeNull();
+    expect(s.error).toBe("no such event channel");
+    expect(mockInvoke).not.toHaveBeenCalledWith("live_start", expect.anything());
+
+    // the guard flag went back with it, so the next attempt still subscribes
+    backend(mockStarted());
+    await useStore.getState().startLive();
+    expect(useStore.getState().live).toMatchObject({ sessionId: 1 });
+  });
+
   // ---- the input layer: every source folds into ONE target per frame ----
 
   /** Every live_set_target the store has sent, oldest first. */
@@ -1320,6 +1416,35 @@ describe("live session — store wiring", () => {
     _flushLive();
     const sent = targetCalls();
     expect(sent[sent.length - 1]).toEqual([2, 2]);
+  });
+
+  it("drops a tip solve that outlived the session it was asked for", async () => {
+    backend(mockStarted({ sessionId: 1 }));
+    await useStore.getState().startLive();
+    let release: (s: unknown) => void = () => {};
+    mockInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "solve_ik_governed") return new Promise((r) => (release = r));
+      if (cmd === "live_start") return mockStarted({ sessionId: 2 });
+      return undefined;
+    });
+    const pose = new Array<number>(16).fill(0);
+    pose[0] = pose[5] = pose[10] = pose[15] = 1;
+    pose[12] = 0.5;
+
+    void useStore.getState().driveTipLive(pose);
+    // session 1 ends and 2 takes its place while that solve is still out
+    emit("live://ended", { sessionId: 1, reason: "stopped" });
+    await useStore.getState().startLive();
+    mockInvoke.mockClear();
+
+    release({ success: true, q: [0.9, -0.9], residual: 0 });
+    await settle();
+    _flushLive();
+
+    // a configuration solved for a robot standing somewhere else is not the
+    // new session's hold target — it is nothing at all
+    expect(targetCalls()).toHaveLength(0);
+    expect(useStore.getState().liveTarget).toEqual([0, 0]);
   });
 
   it("banners a live_set_target rejection once, not once per frame", async () => {
@@ -1854,6 +1979,320 @@ describe("live session — store wiring", () => {
       expect(s.liveRecHint).toMatch(/discarded/);
     });
   });
+
+  // ---- policy in the loop (E1): a trained policy drives the RUNNING session,
+  // writing the same hold target every human input writes ----
+
+  describe("policy in the loop", () => {
+    const STARTED_POLICY = { ndof: 2, chunk: 20, policyType: "act", device: "mps" };
+
+    /** live_start + a handshake that succeeds; everything else resolves empty. */
+    function policyBackend(dto: unknown = STARTED_POLICY) {
+      mockInvoke.mockImplementation(async (cmd: string) => {
+        if (cmd === "live_start") return mockStarted();
+        if (cmd === "live_policy_start") return dto;
+        return undefined;
+      });
+    }
+
+    /** live_start + a handshake this test releases by hand — the real one is
+     *  out for the better part of a minute, and everything interesting about
+     *  this feature happens inside that window. */
+    function slowHandshake(): { release: (dto: unknown) => void } {
+      let release!: (dto: unknown) => void;
+      mockInvoke.mockImplementation(async (cmd: string) => {
+        if (cmd === "live_start") return mockStarted();
+        if (cmd === "live_policy_start") return new Promise((r) => (release = r));
+        return undefined;
+      });
+      return { release: (dto) => release(dto) };
+    }
+
+    /** A session with a policy already driving it. */
+    async function driving() {
+      policyBackend();
+      await useStore.getState().startLive();
+      await useStore.getState().connectPolicy("/venv", "/ckpt/act");
+    }
+
+    it("goes loading → driving, adopting what the handshake reported", async () => {
+      policyBackend();
+      await useStore.getState().startLive();
+
+      const p = useStore.getState().connectPolicy("/venv", "/ckpt/act", "mps");
+      // the button has to show progress on the NEXT paint, not on the reply
+      expect(useStore.getState().livePolicy).toEqual({
+        state: "loading",
+        python: "/venv",
+        ckpt: "/ckpt/act",
+        device: "mps",
+      });
+      await p;
+
+      expect(mockInvoke).toHaveBeenCalledWith("live_policy_start", {
+        req: { python: "/venv", ckpt: "/ckpt/act", device: "mps" },
+      });
+      expect(useStore.getState().livePolicy).toMatchObject({
+        state: "driving",
+        policyType: "act",
+        device: "mps",
+        chunk: 20,
+      });
+    });
+
+    it("leaves the device to the backend when the form names none", async () => {
+      policyBackend();
+      await useStore.getState().startLive();
+
+      await useStore.getState().connectPolicy("/venv", "/ckpt", "");
+
+      expect(mockInvoke).toHaveBeenCalledWith("live_policy_start", {
+        req: { python: "/venv", ckpt: "/ckpt" },
+      });
+    });
+
+    it("remembers the last connect — trimmed — for the next one", async () => {
+      policyBackend();
+      await useStore.getState().startLive();
+
+      await useStore.getState().connectPolicy(" /venv ", " /ckpt/act ", "cpu");
+
+      const s = useStore.getState();
+      expect(s.policyPython).toBe("/venv");
+      expect(s.policyCkpt).toBe("/ckpt/act");
+      expect(s.policyDevice).toBe("cpu");
+    });
+
+    it("reaches driving from the EVENT when it beats the reply through the loop", async () => {
+      const { release } = slowHandshake();
+      await useStore.getState().startLive();
+      const p = useStore.getState().connectPolicy("/venv", "/ckpt");
+      await settle(); // the channel is registered inside connectPolicy
+
+      emit("live://policy", { sessionId: 1, state: "driving", detail: "diffusion" });
+      expect(useStore.getState().livePolicy).toMatchObject({
+        state: "driving",
+        policyType: "diffusion",
+      });
+
+      // …and the reply still fills in what only it knows
+      release({ ndof: 2, chunk: 8, policyType: "diffusion", device: "cpu" });
+      await p;
+      expect(useStore.getState().livePolicy).toMatchObject({ device: "cpu", chunk: 8 });
+    });
+
+    it("surfaces a failed handshake WITH the child's stderr, and attaches nothing", async () => {
+      const stderr = "policy handshake failed\n--- policy stderr ---\nModuleNotFoundError: lerobot";
+      mockInvoke.mockImplementation(async (cmd: string) => {
+        if (cmd === "live_start") return mockStarted();
+        if (cmd === "live_policy_start") throw stderr;
+        return undefined;
+      });
+      await useStore.getState().startLive();
+
+      await useStore.getState().connectPolicy("/venv", "/ckpt");
+
+      const s = useStore.getState();
+      expect(s.livePolicy).toBeNull();
+      // the tail IS the useful half — it goes to the banner whole
+      expect(s.error).toBe(stderr);
+      expect(s.live).not.toBeNull(); // a policy that would not load is not a dead session
+    });
+
+    it("refuses an empty form without reaching the backend", async () => {
+      policyBackend();
+      await useStore.getState().startLive();
+      mockInvoke.mockClear();
+
+      await useStore.getState().connectPolicy("  ", "/ckpt");
+
+      expect(mockInvoke).not.toHaveBeenCalledWith("live_policy_start", expect.anything());
+      expect(useStore.getState().livePolicy).toBeNull();
+      expect(useStore.getState().error).toMatch(/python environment/);
+    });
+
+    it("has nothing to attach a policy to without a session", async () => {
+      await useStore.getState().connectPolicy("/venv", "/ckpt");
+
+      expect(mockInvoke).not.toHaveBeenCalled();
+      expect(useStore.getState().livePolicy).toBeNull();
+    });
+
+    it("takes one connect at a time, even mid-handshake", async () => {
+      slowHandshake();
+      await useStore.getState().startLive();
+      void useStore.getState().connectPolicy("/venv", "/ckpt");
+      await settle();
+
+      void useStore.getState().connectPolicy("/other", "/ckpt2");
+      await settle();
+
+      const starts = mockInvoke.mock.calls.filter((c) => c[0] === "live_policy_start");
+      expect(starts).toHaveLength(1);
+      expect(useStore.getState().livePolicy).toMatchObject({ python: "/venv" });
+    });
+
+    it("clears the policy on an error event and banners the detail whole", async () => {
+      await driving();
+      const detail = "child exited\n--- policy stderr ---\nRuntimeError: shape [1,7] vs [1,6]";
+
+      emit("live://policy", { sessionId: 1, state: "error", detail });
+
+      const s = useStore.getState();
+      expect(s.livePolicy).toBeNull();
+      expect(s.error).toContain(detail);
+      expect(s.live).not.toBeNull(); // the session keeps running; the human drives it
+    });
+
+    it("clears the policy QUIETLY on a stopped event", async () => {
+      await driving();
+
+      emit("live://policy", { sessionId: 1, state: "stopped", detail: null });
+
+      const s = useStore.getState();
+      expect(s.livePolicy).toBeNull();
+      expect(s.error).toBeNull();
+    });
+
+    it("ignores a policy event from a session we have already moved past", async () => {
+      await driving();
+
+      emit("live://policy", { sessionId: 0, state: "error", detail: "an older drive dying" });
+
+      const s = useStore.getState();
+      expect(s.livePolicy).toMatchObject({ state: "driving" });
+      expect(s.error).toBeNull();
+    });
+
+    it("hands the arm back on stop; the late stopped event changes nothing", async () => {
+      await driving();
+
+      await useStore.getState().stopPolicy();
+
+      expect(mockInvoke).toHaveBeenCalledWith("live_policy_stop");
+      expect(useStore.getState().livePolicy).toBeNull();
+
+      emit("live://policy", { sessionId: 1, state: "stopped", detail: null });
+      expect(useStore.getState().livePolicy).toBeNull();
+      expect(useStore.getState().error).toBeNull();
+    });
+
+    it("does not resurrect a policy whose handshake lands after a stop", async () => {
+      const { release } = slowHandshake();
+      await useStore.getState().startLive();
+      const p = useStore.getState().connectPolicy("/venv", "/ckpt");
+      await settle();
+
+      await useStore.getState().stopPolicy();
+      release(STARTED_POLICY);
+      await p;
+
+      expect(useStore.getState().livePolicy).toBeNull();
+    });
+
+    it("loses the policy with the session that owned it (backend end)", async () => {
+      await driving();
+
+      emit("live://ended", { sessionId: 1, reason: "stopped" });
+
+      expect(useStore.getState().live).toBeNull();
+      expect(useStore.getState().livePolicy).toBeNull();
+    });
+
+    it("loses the policy the moment the mode leaves simulate", async () => {
+      await driving();
+
+      useStore.getState().setMode("jog");
+
+      expect(useStore.getState().live).toBeNull();
+      expect(useStore.getState().livePolicy).toBeNull();
+    });
+
+    it("does not resurrect a policy whose handshake lands after the session ended", async () => {
+      const { release } = slowHandshake();
+      await useStore.getState().startLive();
+      const p = useStore.getState().connectPolicy("/venv", "/ckpt");
+      await settle();
+
+      emit("live://ended", { sessionId: 1, reason: "stopped" });
+      release(STARTED_POLICY);
+      await p;
+
+      expect(useStore.getState().livePolicy).toBeNull();
+    });
+
+    // ---- the drive loop while a policy holds the target ----
+
+    it("goes quiet on a held jog key while a policy drives", async () => {
+      await driving();
+      useStore.getState().selectLiveJoint(1);
+      useStore.getState().liveJogKey("=", true);
+      mockInvoke.mockClear();
+
+      _flushLive();
+
+      // the key would re-assert a target sixty times a second against the
+      // policy's own action rate — the arm would just judder between the two
+      expect(targetCalls()).toHaveLength(0);
+      useStore.getState().liveJogKey("=", false);
+    });
+
+    it("goes quiet on a pushed stick while a policy drives", async () => {
+      await driving();
+      emit("live://state", mockState()); // frames + the streamed tip land first
+      _flushLive();
+      withPad([1, 0, 0, 0]); // left stick hard over — the tip drive of the pad
+      mockInvoke.mockClear();
+
+      _flushLive();
+      await settle();
+
+      expect(mockInvoke).not.toHaveBeenCalledWith("solve_ik_governed", expect.anything());
+      expect(targetCalls()).toHaveLength(0);
+    });
+
+    it("still takes a slider nudge, composed onto what the policy is holding", async () => {
+      await driving();
+      // the policy has driven the hold target somewhere of its own
+      emit("live://state", mockState({ target: [0.9, 0.9] }));
+      _flushLive();
+      expect(useStore.getState().liveTarget).toEqual([0.9, 0.9]);
+      mockInvoke.mockClear();
+
+      useStore.getState().setLiveTargetJoint(0, 0.4);
+      _flushLive();
+
+      // one joint moved; the rest stayed where the POLICY put them (without the
+      // re-seed the nudge would have yanked j1 back to the pre-connect pose)
+      expect(targetCalls()).toEqual([[0.4, 0.9]]);
+    });
+
+    it("keeps the one-shot buttons live: pause and the gripper still land", async () => {
+      policyBackend();
+      await useStore.getState().startLive();
+      await useStore.getState().connectPolicy("/venv", "/ckpt");
+      mockInvoke.mockClear();
+      withPad([0, 0, 0, 0], [true]); // A: pause
+
+      _flushLive();
+      await settle();
+
+      expect(mockInvoke).toHaveBeenCalledWith("live_pause", { paused: true });
+    });
+
+    it("keeps driving the human's own target again once the policy is gone", async () => {
+      await driving();
+      await useStore.getState().stopPolicy();
+      useStore.getState().selectLiveJoint(1);
+      useStore.getState().liveJogKey("=", true);
+      mockInvoke.mockClear();
+
+      _flushLive();
+
+      expect(targetCalls()).toHaveLength(1);
+      useStore.getState().liveJogKey("=", false);
+    });
+  });
 });
 
 // ---- task artifacts (Wave C): open a *.caliper-task.json and run it ----
@@ -2320,6 +2759,30 @@ describe("episode replay — store wiring", () => {
     await first;
     expect(useStore.getState().datasetClipLoading).toBe(false);
     expect(replayingEpisode(useStore.getState())).toBe(0);
+  });
+
+  it("drops a bake whose dataset was swapped out from under it", async () => {
+    ready();
+    let release: (c: SimTrajectoryDto) => void = () => {};
+    mockInvoke.mockImplementation(async (cmd: string) =>
+      cmd === "dataset_episode_clip"
+        ? new Promise<SimTrajectoryDto>((r) => (release = r))
+        : undefined,
+    );
+
+    const baking = useStore.getState().replayEpisode(0);
+    // another dataset is opened while the FK bake is still out — the clip that
+    // eventually lands describes bytes nobody is looking at any more
+    useStore.setState({ dataset: { ...mockSummary(), path: "/tmp/other" } });
+    release(mockClip());
+    await baking;
+
+    const s = useStore.getState();
+    expect(s.simTraj).toBeNull();
+    expect(replayingEpisode(s)).toBeNull();
+    expect(s.playing).toBe(false);
+    expect(s.datasetError).toBeNull(); // silently dropped: nothing failed
+    expect(s.datasetClipLoading).toBe(false); // and the button is live again
   });
 
   it("drops the replay when an edit re-lists the dataset under it", async () => {

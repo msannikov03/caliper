@@ -12,21 +12,26 @@
 import { describe, it, expect } from "vitest";
 import {
   classifyLiveState,
+  classifyPolicyEvent,
   gripperControl,
   gripperSeated,
   liveEndedPatch,
   liveFlushFate,
   liveInfoFromStarted,
+  livePolicyFromStarted,
   liveRecAfterStop,
   liveRecFromStarted,
   liveRecPatch,
   liveStatePatch,
+  policyBadge,
+  policyFormError,
   reconcileGripper,
   NO_GRIPPER_TITLE,
 } from "./live";
 import type {
   GripperInfo,
   LiveInfo,
+  LivePolicyInfo,
   LiveRecInfo,
   LiveStartedDto,
   LiveStateEvent,
@@ -470,5 +475,111 @@ describe("liveRecPatch — the stream's view of the take", () => {
     const { rec, discarded } = liveRecPatch(prev, mockEvent({ recording: false }), true);
     expect(rec).toBe(prev);
     expect(discarded).toBe(false);
+  });
+});
+
+// ---- policy in the loop (E1) ----
+
+describe("policyFormError — what keeps a connect off the wire", () => {
+  it("accepts a filled form", () => {
+    expect(policyFormError("/venv/bin/python", "/ckpt/act")).toBeNull();
+  });
+
+  it("names the missing half rather than saying 'invalid'", () => {
+    expect(policyFormError("  ", "/ckpt")).toMatch(/python environment/);
+    expect(policyFormError("/venv", "")).toMatch(/checkpoint/);
+  });
+
+  it("treats whitespace as empty (a pasted path with a stray newline)", () => {
+    expect(policyFormError("/venv", "  \n ")).toMatch(/checkpoint/);
+  });
+});
+
+describe("livePolicyFromStarted — the handshake landing on the loading slice", () => {
+  const loading: LivePolicyInfo = { state: "loading", python: "/venv", ckpt: "/ckpt" };
+
+  it("fills the reply's fields in and flips to driving", () => {
+    expect(
+      livePolicyFromStarted(loading, { ndof: 6, chunk: 20, policyType: "act", device: "mps" }),
+    ).toEqual({
+      state: "driving",
+      python: "/venv",
+      ckpt: "/ckpt",
+      policyType: "act",
+      device: "mps",
+      chunk: 20,
+    });
+  });
+
+  it("keeps what the human asked with — the reply never restates it", () => {
+    const p = livePolicyFromStarted(
+      { ...loading, device: "cpu" },
+      { ndof: 6, chunk: 1, policyType: "diffusion", device: "cpu" },
+    );
+    expect(p.python).toBe("/venv");
+    expect(p.ckpt).toBe("/ckpt");
+  });
+
+  it("overrides a device the human left to the backend with the one it chose", () => {
+    const p = livePolicyFromStarted(loading, {
+      ndof: 6,
+      chunk: 8,
+      policyType: "act",
+      device: "cpu",
+    });
+    expect(p.device).toBe("cpu");
+  });
+
+  it("lands on a slice the DRIVING event already flipped, without undoing it", () => {
+    const already: LivePolicyInfo = { ...loading, state: "driving", policyType: "act" };
+    const p = livePolicyFromStarted(already, {
+      ndof: 6,
+      chunk: 20,
+      policyType: "act",
+      device: "mps",
+    });
+    expect(p).toMatchObject({ state: "driving", policyType: "act", device: "mps", chunk: 20 });
+  });
+});
+
+describe("classifyPolicyEvent — a policy belongs to ONE session", () => {
+  it("applies an event naming the running session", () => {
+    expect(classifyPolicyEvent(mockInfo({ sessionId: 7 }), 7)).toBe("apply");
+  });
+
+  it("drops an event from a session that has been superseded", () => {
+    expect(classifyPolicyEvent(mockInfo({ sessionId: 8 }), 7)).toBe("drop");
+  });
+
+  it("drops an event that arrives with no session at all", () => {
+    expect(classifyPolicyEvent(null, 7)).toBe("drop");
+  });
+});
+
+describe("policyBadge — what the panel says about the policy", () => {
+  it("says loading, and warns the wait is expected", () => {
+    const b = policyBadge({ state: "loading", python: "/venv", ckpt: "/ckpt" });
+    expect(b.label).toBe("loading policy…");
+    expect(b.title).toMatch(/minute/);
+  });
+
+  it("names the policy type and the device it landed on", () => {
+    const b = policyBadge({
+      state: "driving",
+      python: "/venv",
+      ckpt: "/ckpt/act",
+      policyType: "act",
+      device: "mps",
+      chunk: 20,
+    });
+    expect(b.label).toBe("policy: act @ mps");
+    expect(b.title).toContain("/ckpt/act");
+    expect(b.title).toContain("20 actions per inference");
+  });
+
+  it("still reads as a policy when the handshake reported neither", () => {
+    const b = policyBadge({ state: "driving", python: "/venv", ckpt: "/ckpt" });
+    expect(b.label).toBe("policy: policy @ ?");
+    expect(b.title).not.toContain("undefined");
   });
 });

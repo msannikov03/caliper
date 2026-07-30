@@ -79,6 +79,9 @@ Studio. Only what is built is listed as built:
 | **F2 — load time** | ✅ built — parallel hull priming; so101 5.0 ms release / 0.42 s debug (bit-identical hulls) |
 | **F4 — decomposition recon** | ✅ concluded: **skip vendoring** — the seam is points-only by design, CoACD's dylib alone outweighs the entire dmg and is nondeterministic multicore; if ever needed, parry's pure-Rust VHACD behind an optional feature is the pick. The recon's real yield: the hull-builder orientation bug (48% of real meshes falling back) — found and fixed |
 | **G1/G2 — CI** | ✅ built — monthly newest-lerobot pairing watch (skips = failures) + a Linux runtime job |
+| **G3 — v0.2.0** | ✅ cut — versions bumped, changelog dated, the Studio dmg (11 MB, MuJoCo inside) signed + **notarized + stapled** (`spctl: Notarized Developer ID`) |
+| **E1 — policy-in-the-loop** | ✅ built — a trained checkpoint from a user-pointed python env drives the live session over a pure-JSON stdio bridge (`caliper-learn drive`); sim never blocks on inference; record its rollouts as episodes ([details](../capabilities/learning.md)) |
+| Post-program adversarial review | ✅ run — three independent reviewers over the full diff; 9 findings, 9 independently verified, 9 fixed with regression tests (see the changelog) |
 
 ## Deliberately not built (traps the research flagged)
 

@@ -11,7 +11,36 @@ not releases); from `0.1.0` on, every release gets a proper entry.
 
 ## [Unreleased]
 
-Nothing yet.
+### Added
+- **Policy-in-the-loop bridge**: Studio's live session can be driven by a
+  trained policy from a python env you point it at ("connect policy…" in the
+  Live block). Studio spawns `caliper-learn drive CKPT --urdf …` and speaks
+  a pure-JSON stdio protocol (obs out at a configurable rate, default 20 Hz;
+  actions in, latest-wins, clamped to joint limits, limitless joints never
+  clamped); the sim thread never blocks on the child — a one-slot latest-wins
+  observation bus feeds a dedicated driver/reader/stderr-pump thread trio,
+  and a wedged or dead python ends the drive loudly while the sim keeps
+  running. Human inputs still nudge mid-drive, Space pauses the policy with
+  the sim, session end reaps the child (no orphans), and recording during a
+  policy drive is deliberately allowed — that's how policy-rollout datasets
+  are made. State-based policies only: camera-demanding checkpoints are
+  refused at load by name.
+
+### Fixed
+- Post-release adversarial review (three independent reviewers over the full
+  0.2.0 diff; every finding independently verified before fixing): a
+  recording request retried after a >2 s save/finalize could consume the
+  timed-out request's reply as its own (requests now carry correlation ids);
+  a start/stop race could strand a legitimate-looking empty dataset at the
+  chosen root (now reclaimed and removed); an episode-replay bake landing
+  after a dataset switch adopted the wrong dataset's clip (now
+  identity-fenced); an interrupted live IK drag left orbit controls disabled
+  until reload; a double-pressed "start live" could double-start; a stale
+  live IK solve could land on a newer session; robot/task/mode changes now
+  tear the live session down synchronously instead of waiting for the ended
+  event; a partially-failed event subscription could leak a listener; and
+  python's `Lifted(ref="absolute").reset` no longer requires the scored prop
+  at reset time (cross-face parity with the Rust evaluator, which never did).
 
 ## [0.2.0] — 2026-07-30
 

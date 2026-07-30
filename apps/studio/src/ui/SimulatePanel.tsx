@@ -1,11 +1,146 @@
+import { useEffect, useState } from "react";
+import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { REC_FPS_CHOICES, useStore } from "../store";
 import { frameIndexAt, hasContactEngine, MAX_PROPS } from "../sim/props";
-import { gripperControl, gripperSeated } from "../sim/live";
+import { gripperControl, gripperSeated, policyBadge, policyFormError } from "../sim/live";
 import { recFpsChoices, successBadge } from "../sim/task";
 import "./panels.css";
 
 /** Kind glyphs for the compact prop list rows. */
 const KIND_GLYPH: Record<string, string> = { box: "▢", sphere: "◯", cylinder: "◫" };
+
+/** Torch devices the connect form offers. "" = let the backend pick, which is
+ *  the right answer on every machine that has exactly one sensible option. */
+const POLICY_DEVICES: readonly [string, string][] = [
+  ["", "device: auto"],
+  ["cpu", "cpu"],
+  ["mps", "mps"],
+];
+
+/** The policy row of the Live block: connect form → loading → driving badge.
+ *  Split out because it owns the one piece of LOCAL state on this panel (is
+ *  the form open) — everything else here reads straight off the store. */
+function PolicyRow() {
+  const policy = useStore((s) => s.livePolicy);
+  const python = useStore((s) => s.policyPython);
+  const ckpt = useStore((s) => s.policyCkpt);
+  const device = useStore((s) => s.policyDevice);
+  const connectPolicy = useStore((s) => s.connectPolicy);
+  const stopPolicy = useStore((s) => s.stopPolicy);
+  const loadPolicyForm = useStore((s) => s.loadPolicyForm);
+  const [open, setOpen] = useState(false);
+
+  // bring back the last environment + checkpoint (once per process): re-typing
+  // two absolute paths per app start is the friction this exists to remove
+  useEffect(() => {
+    loadPolicyForm();
+  }, [loadPolicyForm]);
+
+  if (policy) {
+    const badge = policyBadge(policy);
+    const loading = policy.state === "loading";
+    return (
+      <div className="policy-block">
+        <div className="policy-row">
+          <span className={loading ? "badge policy loading" : "badge policy"} title={badge.title}>
+            {badge.label}
+          </span>
+          <button
+            title={loading ? "give up on this handshake" : "hand the arm back to the human"}
+            onClick={() => void stopPolicy()}
+          >
+            {loading ? "cancel" : "■ stop policy"}
+          </button>
+        </div>
+        <p className="hint">
+          {loading
+            ? "loading policy… (torch import can take a minute)"
+            : "human inputs still nudge; space pauses"}
+        </p>
+      </div>
+    );
+  }
+  if (!open) {
+    return (
+      <div className="policy-row">
+        <button
+          className="policy-connect"
+          title="drive this session with a trained policy from your own python environment"
+          onClick={() => setOpen(true)}
+        >
+          ◈ connect policy…
+        </button>
+      </div>
+    );
+  }
+  // the same validation the store applies, so the button says why it is off
+  // before the click rather than after it
+  const bad = policyFormError(python, ckpt);
+  /** Native picker for one of the two paths; a cancel leaves the field alone. */
+  const browse = async (title: string, field: "policyPython" | "policyCkpt") => {
+    const picked = await openDialog({ directory: true, multiple: false, title });
+    if (typeof picked === "string") useStore.setState({ [field]: picked });
+  };
+  return (
+    <div className="policy-block">
+      <div className="policy-row">
+        <input
+          value={python}
+          placeholder="python binary or venv dir"
+          title="the environment the policy loads in — a python binary, or a venv directory"
+          onChange={(e) => useStore.setState({ policyPython: e.target.value })}
+        />
+        <button
+          title="pick the venv directory"
+          onClick={() => void browse("Policy python environment", "policyPython")}
+        >
+          …
+        </button>
+      </div>
+      <div className="policy-row">
+        <input
+          value={ckpt}
+          placeholder="checkpoint dir"
+          title="the trained policy directory to load"
+          onChange={(e) => useStore.setState({ policyCkpt: e.target.value })}
+        />
+        <button
+          title="pick the checkpoint directory"
+          onClick={() => void browse("Policy checkpoint", "policyCkpt")}
+        >
+          …
+        </button>
+      </div>
+      <div className="policy-row">
+        <select
+          value={device}
+          title="torch device the policy loads onto"
+          onChange={(e) => useStore.setState({ policyDevice: e.target.value })}
+        >
+          {POLICY_DEVICES.map(([v, label]) => (
+            <option key={v} value={v}>
+              {label}
+            </option>
+          ))}
+        </select>
+        <button
+          className="policy-connect"
+          disabled={bad !== null}
+          title={bad ?? "load the policy and hand it the hold target"}
+          onClick={() => {
+            setOpen(false);
+            void connectPolicy(python, ckpt, device);
+          }}
+        >
+          Connect
+        </button>
+        <button title="leave the session driving by hand" onClick={() => setOpen(false)}>
+          Cancel
+        </button>
+      </div>
+    </div>
+  );
+}
 
 export function SimulatePanel() {
   const mode = useStore((s) => s.mode);
@@ -205,6 +340,9 @@ export function SimulatePanel() {
               space freeze · G grip · sliders/gizmo drive · [ ] pick joint, −/= jog · gamepad:
               sticks=tip, A=pause, B=reset, X=grip
             </p>
+            {/* a policy drives the SAME hold target the inputs above write, so
+                it belongs with them rather than beside the rollout buttons */}
+            <PolicyRow />
             <div className="rec-row">
               <input
                 value={recTask}

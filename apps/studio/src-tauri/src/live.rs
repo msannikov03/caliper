@@ -61,6 +61,7 @@
 //! scored (no predicate, or the builtin engine, which has no props for a
 //! predicate to be about).
 
+use crate::policy::{PolicyBus, PolicyHandle};
 use crate::{bake_frame_row, logged, AppState, PropDto, PropTrackDto};
 use caliper::hal::{ControlLoop, Frame, Gains, PhysicsSimBackend, TeleopSetpoint};
 use caliper::model::Model;
@@ -376,10 +377,16 @@ pub(crate) struct LiveShared {
     target: Mutex<Vec<f64>>,
     reset_req: Mutex<Option<Vec<f64>>>,
     status: Mutex<LiveStatusInner>,
-    /// Pending recording request / its reply. One in flight at a time — the
-    /// commands serialize themselves on `rec_gate` before touching either.
-    rec_req: Mutex<Option<RecRequest>>,
-    rec_reply: Mutex<Option<Result<RecReply, String>>>,
+    /// Pending recording request / its reply, each stamped with the request id
+    /// that `rec_seq` handed out. One in flight at a time — the commands
+    /// serialize themselves on `rec_gate` before touching either — but a
+    /// command that gives up waiting does NOT stop the thread from servicing
+    /// its request, so the id is what keeps a late reply from being handed to
+    /// the next command.
+    rec_req: Mutex<Option<(u64, RecRequest)>>,
+    rec_reply: Mutex<Option<(u64, Result<RecReply, String>)>>,
+    /// Hands out the request ids; only ever incremented.
+    rec_seq: AtomicU64,
     /// Held by a recording command for its whole request→reply cycle. NEVER
     /// taken by the session thread, so it cannot deadlock against it.
     rec_gate: Mutex<()>,
@@ -395,6 +402,9 @@ pub(crate) struct LiveShared {
     /// Prop the session thread currently has welded (B2); thread-owned,
     /// mirrored here for state events. Always `None` on builtin.
     held: Mutex<Option<String>>,
+    /// Latest-wins observation slot for a policy driving this session (E1).
+    /// Inert — one relaxed load per emitted state — until a policy attaches.
+    pub(crate) policy_bus: PolicyBus,
 }
 
 impl LiveShared {
@@ -409,13 +419,35 @@ impl LiveShared {
             status: Mutex::new(LiveStatusInner::default()),
             rec_req: Mutex::new(None),
             rec_reply: Mutex::new(None),
+            rec_seq: AtomicU64::new(0),
             rec_gate: Mutex::new(()),
             rec_mirror: Mutex::new(None),
             recording: AtomicBool::new(false),
             rec_frames: AtomicU64::new(0),
             grasp_closed: AtomicBool::new(false),
             held: Mutex::new(None),
+            policy_bus: PolicyBus::default(),
         }
+    }
+
+    /// Move the PD hold target. THE single source of truth for what the arm is
+    /// commanded to do — the sliders, the IK gizmo, the keyboard jog,
+    /// `live_gripper` and a driving policy (E1) all land here, and the last
+    /// writer before a step wins.
+    pub(crate) fn write_target(&self, q: Vec<f64>) {
+        if let Ok(mut t) = self.target.lock() {
+            *t = q;
+        }
+    }
+
+    pub(crate) fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::Relaxed)
+    }
+
+    /// The session is stopping or already dead — nothing riding on it (a policy
+    /// bridge, say) should keep working.
+    pub(crate) fn is_gone(&self) -> bool {
+        self.stop.load(Ordering::Relaxed) || self.dead.load(Ordering::Relaxed)
     }
 }
 
@@ -441,17 +473,31 @@ impl GripperChannel {
 /// A running live session, held in `AppState.live`. Dropping the slot without
 /// `stop` would leak the thread — every taker must raise `stop` and join.
 pub(crate) struct LiveSession {
-    id: u64,
+    pub(crate) id: u64,
     engine: &'static str,
-    ndof: usize,
+    pub(crate) ndof: usize,
     /// Physics timestep (s) — recording decimates against its tick rate.
     h: f64,
+    /// Actual state-emission rate — a policy's obs cadence decimates from it.
+    pub(crate) emit_hz: f64,
     /// Initial pose — the `live_reset(None)` restore point.
     q0: Vec<f64>,
     /// The gripper channel, when this robot has one (B1).
     gripper: Option<GripperChannel>,
-    shared: Arc<LiveShared>,
+    pub(crate) shared: Arc<LiveShared>,
+    /// The policy driving this session (E1), if any. Held HERE so every way a
+    /// session can end takes the python child with it — dropping the handle
+    /// shuts the bridge down.
+    pub(crate) policy: Mutex<Option<PolicyHandle>>,
     join: Option<JoinHandle<()>>,
+}
+
+impl LiveSession {
+    /// The session thread exited with an error and the slot has not been reaped
+    /// yet.
+    pub(crate) fn is_dead(&self) -> bool {
+        self.shared.dead.load(Ordering::Relaxed)
+    }
 }
 
 // ===== pure pacing helpers =====
@@ -784,7 +830,7 @@ fn record_tick(shared: &LiveShared, rec: &mut Option<Recorder>, frame: &Frame) {
 /// Service at most one pending recording request. Runs in the session thread,
 /// including while paused, so a take can be stopped without resuming first.
 fn service_rec(shared: &LiveShared, rec: &mut Option<Recorder>, ndof: usize) {
-    let Some(req) = shared.rec_req.lock().ok().and_then(|mut r| r.take()) else {
+    let Some((id, req)) = shared.rec_req.lock().ok().and_then(|mut r| r.take()) else {
         return;
     };
     let reply = match req {
@@ -879,8 +925,11 @@ fn service_rec(shared: &LiveShared, rec: &mut Option<Recorder>, ndof: usize) {
         },
     };
     publish_rec(shared, rec.as_ref());
+    // Stamped with the id of the request this answers: a command that already
+    // timed out is no longer listening, and the next one must not mistake this
+    // for its own answer.
     if let Ok(mut slot) = shared.rec_reply.lock() {
-        *slot = Some(reply);
+        *slot = Some((id, reply));
     }
 }
 
@@ -1021,6 +1070,13 @@ fn state_event(
     if !(q.iter().all(|x| x.is_finite()) && qd.iter().all(|x| x.is_finite())) {
         return Err("simulation state went non-finite".into());
     }
+    // A driving policy (E1) reads THIS state — the one the UI is about to see —
+    // out of a one-slot latest-wins bus. Publishing is a mutex write into
+    // pre-grown vectors and a sequence bump; the sim thread never waits on the
+    // policy process, and skips this entirely when nothing is attached.
+    shared
+        .policy_bus
+        .publish(engine.tick(), engine.time(), &q, &qd);
     // Judged from the SAME state that is about to be emitted, so a `true` in an
     // event always describes the poses in that event. A predicate that cannot
     // be answered (a prop that vanished) ends the session loudly rather than
@@ -1450,6 +1506,11 @@ fn resolve_success(
 /// Raise `stop` on an existing session (reason per `superseded`) and join it.
 fn stop_in_slot(slot: &mut Option<LiveSession>, superseded: bool) {
     if let Some(mut s) = slot.take() {
+        // A policy dies with its session — dropping the handle stops the child
+        // and joins its threads, so no python ever outlives the sim it drives.
+        if let Ok(mut p) = s.policy.lock() {
+            drop(p.take());
+        }
         s.shared.superseded.store(superseded, Ordering::Relaxed);
         s.shared.stop.store(true, Ordering::Relaxed);
         if let Some(j) = s.join.take() {
@@ -1563,9 +1624,11 @@ pub(crate) fn live_start_on<E: LiveEmitter>(
         engine: engine_name,
         ndof: n,
         h,
+        emit_hz: actual_hz,
         q0: req.q0,
         gripper: gripper.clone(),
         shared,
+        policy: Mutex::new(None),
         join: Some(join),
     });
 
@@ -1599,7 +1662,7 @@ pub(crate) fn live_start_on<E: LiveEmitter>(
 }
 
 /// Run `f` on the live session, reaping the slot first if its thread died.
-fn with_live<T>(
+pub(crate) fn with_live<T>(
     state: &AppState,
     f: impl FnOnce(&LiveSession) -> Result<T, String>,
 ) -> Result<T, String> {
@@ -1727,6 +1790,29 @@ pub(crate) fn live_status_impl(state: &AppState) -> Result<Option<LiveStatusDto>
 
 // ===== recording command impls =====
 
+/// What a failed [`rec_request_raw`] hands back: the error to report, plus the
+/// request itself when it was still queued and could be taken back. Getting it
+/// back is proof the session thread never saw it, so whatever it owns (a boxed
+/// `DatasetWriter`) is the caller's to clean up.
+struct RecFailed {
+    err: String,
+    unclaimed: Option<RecRequest>,
+}
+
+/// Take a posted request back, but only while it is still ours and still
+/// queued. A request the thread already took is gone — the thread owns its
+/// reply and, on a shutdown, its writer.
+fn reclaim_rec(shared: &LiveShared, id: u64) -> Option<RecRequest> {
+    let mut slot = shared.rec_req.lock().ok()?;
+    match slot.take() {
+        Some((qid, req)) if qid == id => Some(req),
+        other => {
+            *slot = other;
+            None
+        }
+    }
+}
+
 /// Post one recording request to the session thread and wait for its reply.
 ///
 /// The caller holds `rec_gate` (so the slots are ours alone) and NO `AppState`
@@ -1734,39 +1820,126 @@ pub(crate) fn live_status_impl(state: &AppState) -> Result<Option<LiveStatusDto>
 /// for a whole catch-up batch, and blocking on `state.live` while waiting would
 /// stall every other command. A dead/stopping session or a wedged thread ends
 /// the wait with an error instead of hanging the webview.
-fn rec_request(shared: &LiveShared, req: RecRequest) -> Result<RecReply, String> {
+///
+/// Giving up on the wait does not cancel the request: a thread stuck in a long
+/// service (finalizing a big dataset) still answers afterwards. Every request
+/// therefore carries an id and only the reply stamped with OUR id is ours — a
+/// stale one is thrown away and the wait continues. Without that, a retried
+/// command of the same shape (a second `Finish`, a `Stop{save:false}` after a
+/// timed-out `Stop{save:true}`) would consume the abandoned request's answer
+/// and report an outcome that never happened to it.
+fn rec_request_raw(shared: &LiveShared, req: RecRequest) -> Result<RecReply, RecFailed> {
+    let fail = |shared: &LiveShared, id: Option<u64>, err: &str| RecFailed {
+        err: err.to_string(),
+        unclaimed: id.and_then(|id| reclaim_rec(shared, id)),
+    };
+    let id = shared.rec_seq.fetch_add(1, Ordering::Relaxed) + 1;
     {
-        let mut slot = shared.rec_reply.lock().map_err(|_| "state lock poisoned")?;
+        let Ok(mut slot) = shared.rec_reply.lock() else {
+            return Err(fail(shared, None, "state lock poisoned"));
+        };
         *slot = None;
     }
     {
-        let mut slot = shared.rec_req.lock().map_err(|_| "state lock poisoned")?;
-        *slot = Some(req);
+        let Ok(mut slot) = shared.rec_req.lock() else {
+            return Err(fail(shared, None, "state lock poisoned"));
+        };
+        *slot = Some((id, req));
     }
     let deadline = Instant::now() + REC_REPLY_TIMEOUT;
-    let abandon = |shared: &LiveShared| {
-        if let Ok(mut slot) = shared.rec_req.lock() {
-            *slot = None;
-        }
-    };
     loop {
         if let Ok(mut slot) = shared.rec_reply.lock() {
-            if let Some(reply) = slot.take() {
-                return reply;
+            match slot.take() {
+                Some((rid, reply)) if rid == id => {
+                    return reply.map_err(|err| RecFailed {
+                        err,
+                        unclaimed: None,
+                    })
+                }
+                // A late answer to a request we already gave up on: dropped
+                // here (the slot is cleared) so it reaches nobody.
+                Some(_) | None => {}
             }
         }
         // Checked AFTER the reply slot: a thread that answered and then exited
         // still hands us its answer.
         if shared.dead.load(Ordering::Relaxed) || shared.stop.load(Ordering::Relaxed) {
-            abandon(shared);
-            return Err("the live session ended".into());
+            return Err(fail(shared, Some(id), "the live session ended"));
         }
         if Instant::now() >= deadline {
-            abandon(shared);
-            return Err("the live sim thread did not answer the recording request in 2 s".into());
+            return Err(fail(
+                shared,
+                Some(id),
+                "the live sim thread did not answer the recording request in 2 s",
+            ));
         }
         std::thread::sleep(Duration::from_millis(2));
     }
+}
+
+/// [`rec_request_raw`] for the requests that own nothing — a failure has
+/// nothing to clean up, so only the message matters.
+fn rec_request(shared: &LiveShared, req: RecRequest) -> Result<RecReply, String> {
+    rec_request_raw(shared, req).map_err(|f| f.err)
+}
+
+/// Post a record-start request, cleaning up after a start whose dataset THIS
+/// call created but the session thread never accepted.
+///
+/// The window is real: the loop checks `stop` before it services requests, so a
+/// `live_stop` (or a superseding `live_start`) landing between the post and the
+/// service makes the thread exit without ever taking the request. Getting the
+/// request back proves that happened, and it still holds the boxed writer.
+/// Dropping the writer auto-finalizes it, which would strand a
+/// legitimate-looking — but empty — dataset at the root the user picked; the
+/// writer has no consume-without-finalize escape, so it is finalized and the
+/// directory removed.
+///
+/// Removing a directory is safe here only because all three hold: this very
+/// call created it milliseconds ago (a start onto an already-open dataset
+/// carries no writer), the reclaimed request proves the session thread never
+/// touched it, and the path removed is the one the writer itself reports.
+/// `rec_gate` is held throughout, so no other recording command can have
+/// written there in between.
+fn rec_start_request(shared: &LiveShared, req: RecRequest) -> Result<RecReply, String> {
+    let ours = matches!(
+        &req,
+        RecRequest::Start {
+            writer: Some(_),
+            ..
+        }
+    );
+    rec_request_raw(shared, req).map_err(|f| {
+        if ours {
+            if let Some(RecRequest::Start {
+                writer: Some(w),
+                root,
+                ..
+            }) = f.unclaimed
+            {
+                let dir = match w.finalize() {
+                    Ok(p) => p,
+                    Err(e) => {
+                        log::warn!(
+                            target: "studio::live",
+                            "closing the unstarted dataset at {root} failed: {e}"
+                        );
+                        std::path::PathBuf::from(&root)
+                    }
+                };
+                if let Err(e) = std::fs::remove_dir_all(&dir) {
+                    log::warn!(
+                        target: "studio::live",
+                        "removing the unstarted empty dataset at {} failed: {e}",
+                        dir.display()
+                    );
+                }
+            }
+            // Not reclaimed: the thread took the request as it was shutting
+            // down and now owns the writer — `close_recorder` finalizes it.
+        }
+        f.err
+    })
 }
 
 /// Start recording a take, creating the dataset on the first call.
@@ -1835,7 +2008,7 @@ pub(crate) fn live_record_start_impl(
         }
     };
 
-    let reply = rec_request(
+    let reply = rec_start_request(
         &shared,
         RecRequest::Start {
             writer,
@@ -1912,6 +2085,51 @@ pub(crate) fn live_record_status_impl(
         buffered_frames: shared.rec_frames.load(Ordering::Relaxed) as usize,
         episodes_saved: m.episodes_saved,
     }))
+}
+
+// ===== test seams for the sibling policy bridge (E1) =====
+
+/// Start a plain builtin session, for tests in other modules that need a live
+/// session but not the whole `LiveStartReq` surface.
+#[cfg(test)]
+pub(crate) fn test_start_builtin<E: LiveEmitter>(
+    state: &AppState,
+    q0: Vec<f64>,
+    kp: f64,
+    kd: f64,
+    emitter: E,
+) -> Result<LiveStartedDto, String> {
+    live_start_on(
+        state,
+        LiveStartReq {
+            q0,
+            engine: Some("builtin".into()),
+            props: vec![],
+            ground: None,
+            kp: Some(kp),
+            kd: Some(kd),
+            emit_hz: None,
+            gripper_joint: None,
+            gripper_closed: None,
+            success: None,
+        },
+        emitter,
+    )
+}
+
+#[cfg(test)]
+impl LiveStateEvent {
+    /// The PD hold target this state was emitted with.
+    pub(crate) fn target(&self) -> &[f64] {
+        &self.target
+    }
+}
+
+#[cfg(test)]
+impl LiveStatusDto {
+    pub(crate) fn tick(&self) -> u64 {
+        self.tick
+    }
 }
 
 // ===== tauri commands =====
@@ -2783,6 +3001,131 @@ mod tests {
         let err = live_record_stop_impl(&state, true).unwrap_err();
         assert!(err.contains("not recording"), "got: {err}");
         live_record_finish_impl(&state).unwrap();
+
+        live_stop_impl(&state).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Poll `f` until it yields, well inside the 2 s recording-reply timeout so
+    /// the waiter under test is still waiting when the condition holds.
+    fn wait_for<T>(mut f: impl FnMut() -> Option<T>) -> T {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            if let Some(v) = f() {
+                return v;
+            }
+            assert!(Instant::now() < deadline, "the condition never held");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn a_late_reply_is_never_delivered_to_the_next_command() {
+        // Command A gave up waiting while the thread was still servicing it
+        // (a long finalize). Command B posts the SAME variant right after, and
+        // must not be handed A's answer when it finally lands — that is how the
+        // UI came to report "saved episode N" for a take that was discarded.
+        let shared = Arc::new(LiveShared::new(vec![0.0, 0.0]));
+        let a_id = shared.rec_seq.fetch_add(1, Ordering::Relaxed) + 1;
+
+        let waiter = {
+            let shared = shared.clone();
+            std::thread::spawn(move || rec_request(&shared, RecRequest::Stop { save: false }))
+        };
+        // B's request, taken the way the session thread would take it.
+        let b_id = wait_for(|| shared.rec_req.lock().unwrap().take().map(|(id, _)| id));
+        assert_eq!(b_id, a_id + 1, "ids are monotonic");
+
+        // A's answer arrives late, claiming a saved episode.
+        *shared.rec_reply.lock().unwrap() = Some((
+            a_id,
+            Ok(RecReply::Stopped {
+                saved: true,
+                episode_index: Some(7),
+                frames: 99,
+            }),
+        ));
+        // B throws it away (clearing the slot) instead of returning it.
+        wait_for(|| shared.rec_reply.lock().unwrap().is_none().then_some(()));
+
+        *shared.rec_reply.lock().unwrap() = Some((
+            b_id,
+            Ok(RecReply::Stopped {
+                saved: false,
+                episode_index: None,
+                frames: 3,
+            }),
+        ));
+        match waiter.join().unwrap().expect("B gets its own answer") {
+            RecReply::Stopped {
+                saved,
+                episode_index,
+                frames,
+            } => {
+                assert!(!saved, "B was handed A's reply");
+                assert_eq!(episode_index, None);
+                assert_eq!(frames, 3);
+            }
+            _ => panic!("wrong reply variant"),
+        }
+    }
+
+    #[test]
+    fn a_start_that_loses_the_race_to_stop_leaves_no_empty_dataset() {
+        let dir = rec_dir("race");
+        let spec = DatasetSpec::new(
+            50,
+            "pendulum".to_string(),
+            vec![
+                FeatureSpec::vector("observation.state", 2, None),
+                FeatureSpec::vector("action", 2, None),
+            ],
+        );
+        let w = Box::new(DatasetWriter::create(&dir, spec).expect("writer"));
+        assert!(dir.exists(), "the writer creates its root");
+
+        // The session ends between posting the start and the thread servicing
+        // it: the loop checks `stop` first, so the request is never taken and
+        // this call is the writer's only owner.
+        let shared = LiveShared::new(vec![0.0, 0.0]);
+        shared.stop.store(true, Ordering::Relaxed);
+        let err = match rec_start_request(
+            &shared,
+            RecRequest::Start {
+                writer: Some(w),
+                root: dir.display().to_string(),
+                fps: 50,
+                record_every: 20,
+                task: "t".into(),
+            },
+        ) {
+            Err(e) => e,
+            Ok(_) => panic!("a stopped session must not accept a start"),
+        };
+        assert!(err.contains("live session ended"), "got: {err}");
+        assert!(
+            shared.rec_req.lock().unwrap().is_none(),
+            "the request must be reclaimed, not left queued"
+        );
+        assert!(
+            !dir.exists(),
+            "an empty finalized dataset was stranded at {}",
+            dir.display()
+        );
+    }
+
+    #[test]
+    fn a_started_dataset_keeps_its_root() {
+        let state = pendulum_state();
+        let (_em, _dto) = start_builtin(&state, vec![0.1, -0.1]);
+        let dir = rec_dir("race_ok");
+
+        live_record_start_impl(&state, start_req(&dir, "keep", Some(50))).unwrap();
+        assert!(dir.exists());
+        sleep_ms(150);
+        assert!(live_record_stop_impl(&state, true).unwrap().saved);
+        live_record_finish_impl(&state).unwrap();
+        assert!(dir.exists(), "an accepted start must leave its dataset");
 
         live_stop_impl(&state).unwrap();
         let _ = std::fs::remove_dir_all(&dir);

@@ -61,6 +61,18 @@ result = run_policy(policy, loop, fps=50, ticks=400)
 print(result.warn_ticks, result.times[-1])
 ```
 
+**Driving Studio's live sim** — `caliper-learn drive CKPT (--urdf PATH |
+--task FILE) [--device cpu]` is the same deploy leg spoken over stdio: it
+loads the checkpoint, prints one `ready` JSON line, then answers every
+observation line with an action line (tick echoed, actions clamped into the
+URDF limits — except limitless joints, which are never clamped). Studio's
+"connect policy…" spawns exactly this from a python env you point it at, so
+a trained policy drives the live session in-app — while you watch, nudge,
+pause with Space, and even record its rollouts as new episodes. State-based
+policies only: a checkpoint demanding camera features is refused at load,
+naming the missing keys (the live session has no camera stream). Protocol
+chatter from libraries is rerouted to stderr, so stdout stays pure JSON.
+
 - **`load_lerobot_policy(path, device="cpu") -> LoadedPolicy`** — loads a
   LOCAL checkpoint directory (model.safetensors + config.json +
   policy_{pre,post}processor.json). **Safetensors only**: any pickle-format

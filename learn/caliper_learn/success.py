@@ -247,7 +247,15 @@ class Lifted(SuccessPredicate):
         return f"{self.prop} rises {self.height:.3f} m above its initial height"
 
     def reset(self, state: Optional[SuccessState] = None) -> None:
-        self._z0 = None if state is None else float(state.pos(self.prop)[2])
+        # Only an "initial"-ref lift owns a baseline. The absolute form must
+        # NOT look the prop up here: the Rust twin (SuccessTracker::reset)
+        # collects baselines only for initial refs, so a missing prop under an
+        # absolute-ref term errors at the first JUDGE on both faces — not at
+        # reset on one face and at judge on the other.
+        if self.ref == "absolute" or state is None:
+            self._z0 = None
+        else:
+            self._z0 = float(state.pos(self.prop)[2])
 
     def __call__(self, state: SuccessState) -> bool:
         z = float(state.pos(self.prop)[2])

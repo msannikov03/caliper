@@ -201,6 +201,74 @@
   color: var(--accent);
 }
 
+/* --- simulate panel: policy in the loop (E1) ---
+   Same secondary chrome as the live transport it sits under: a policy is one
+   more thing driving the hold target, not a mode the panel switches into. The
+   DRIVING badge is the exception — it fills with the accent, because "something
+   other than you is moving this arm" is the one state worth reading instantly. */
+.sim-panel .policy-block {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.sim-panel .policy-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.sim-panel .policy-row input,
+.sim-panel .policy-row select {
+  flex: 1;
+  min-width: 0;
+  background: var(--base);
+  border: 1px solid var(--border-2);
+  border-radius: var(--r-sm);
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 10.5px;
+  padding: 4px 7px;
+  outline: none;
+}
+.sim-panel .policy-row input:focus,
+.sim-panel .policy-row select:focus {
+  border-color: var(--accent);
+}
+.sim-panel .policy-row button {
+  background: var(--raised);
+  border: 1px solid var(--border-2);
+  color: var(--text);
+  font-weight: 500;
+  padding: 4px 9px;
+}
+.sim-panel .policy-row button:hover:not(:disabled) {
+  background: var(--raised-2);
+}
+.sim-panel .policy-row button.policy-connect {
+  flex: 1;
+  background: var(--accent-dim);
+  border-color: var(--accent-glow);
+  color: var(--accent);
+  font-weight: 600;
+}
+.sim-panel .policy-row .badge.policy {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap; /* a long policy type elides; the title carries it */
+  background: var(--accent-dim);
+  border-color: var(--accent-glow);
+  color: var(--accent);
+}
+/* the handshake can be out for the better part of a minute — the badge has to
+   look BUSY the whole time, or the panel reads as wedged */
+.sim-panel .policy-row .badge.policy.loading {
+  background: transparent;
+  color: var(--muted);
+  border-color: var(--border-2);
+  animation: recpulse 1s infinite alternate;
+}
+
 /* --- simulate panel: teleop recording (A3) ---
    Sits under the live transport and borrows its secondary-chrome treatment;
    the ONE exception is the record control, which is red and pulses while a

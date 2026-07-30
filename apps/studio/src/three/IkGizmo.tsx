@@ -41,11 +41,7 @@ export function IkGizmo() {
   // live drag only: the handle pose held still while the arm catches up
   const dragging = useRef(false);
   const held = useRef<THREE.Matrix4 | null>(null);
-
-  // cancel any queued drag-follow rAF if we unmount mid-drag.
-  useEffect(() => () => {
-    if (raf.current) cancelAnimationFrame(raf.current);
-  }, []);
+  const refs: DragRefs = { raf, dragging, held };
 
   const tip = robot?.tip ?? -1;
   const tipMat = tip >= 0 ? frames[tip] : undefined;
@@ -60,7 +56,20 @@ export function IkGizmo() {
   // hidden during playback, and in simulate mode UNLESS a live session is up
   // (then it retargets the running session instead of posing a static robot)
   const liveDrive = mode === "simulate" && !!live;
-  if (!robot || !tipMat || playing || (mode === "simulate" && !liveDrive)) return null;
+  const hidden = !robot || !tipMat || playing || (mode === "simulate" && !liveDrive);
+
+  // The handle going away IS a drag end, as far as everything a drag holds is
+  // concerned — see releaseDrag. Written as a cleanup so the one path covers
+  // both ways it can happen: `hidden` flipping true, and the unmount.
+  useEffect(() => {
+    if (hidden) return; // nothing can be dragging: there is no handle
+    // `refs` is a fresh object each render over the SAME refs, so it carries no
+    // state and is deliberately not a dep; `controls` is one, so a swapped
+    // OrbitControls is never left disabled by a drag on the old one.
+    return () => releaseDrag(refs, controls);
+  }, [hidden, controls]);
+
+  if (hidden) return null;
 
   const send = (m: number[], snap: boolean) => {
     if (liveDrive) void driveTipLive(m);
@@ -98,13 +107,7 @@ export function IkGizmo() {
           queue(w);
         }}
         onDragEnd={() => {
-          if (raf.current) {
-            cancelAnimationFrame(raf.current);
-            raf.current = 0;
-          }
-          if (controls) controls.enabled = true;
-          dragging.current = false;
-          held.current = null;
+          releaseDrag(refs, controls);
           // exact final target from the last drag world matrix (same path as
           // queue); off-line that also snaps IK, live it is just the last word
           tmp.copy(DISPLAY_UP_INV).multiply(lastWorld.current);
@@ -113,4 +116,37 @@ export function IkGizmo() {
       />
     </group>
   );
+}
+
+/** The mutable half of a drag, as refs. Grouped so the release below is a plain
+ *  function — the component's own `useRef`s satisfy it as they are. */
+export interface DragRefs {
+  /** queued drag-follow rAF handle, 0 when none is pending */
+  raf: { current: number };
+  /** a PivotControls drag is in progress (onDragStart → onDragEnd) */
+  dragging: { current: boolean };
+  /** the handle pose frozen for the duration of a live drag */
+  held: { current: THREE.Matrix4 | null };
+}
+
+/** Undo everything `onDragStart` did, whether or not the drag ended normally.
+ *
+ *  OrbitControls is disabled for the duration of a drag, so SOMETHING has to
+ *  re-enable it — and `onDragEnd` is not that something on its own: the handle
+ *  can be taken off screen mid-drag (playback starts, the live session ends,
+ *  the mode changes) and PivotControls then unmounts without ever firing it,
+ *  leaving the camera dead for the rest of the app's life and the drag refs
+ *  claiming a drag that no longer exists.
+ *
+ *  `controls.enabled` is only touched while a drag of OURS is up: otherwise
+ *  whoever disabled it is not us. Exported for the unit test. */
+export function releaseDrag(refs: DragRefs, controls: { enabled: boolean } | undefined): void {
+  if (refs.raf.current) {
+    cancelAnimationFrame(refs.raf.current);
+    refs.raf.current = 0;
+  }
+  if (!refs.dragging.current) return;
+  if (controls) controls.enabled = true;
+  refs.dragging.current = false;
+  refs.held.current = null;
 }

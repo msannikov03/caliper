@@ -588,3 +588,18 @@ def test_autopsy_verdict_states_the_success_criterion(robot, reach_task_with_cub
     task.success_predicate = None
     plain = evaluate(ProportionalPolicy(q_goal), task, EvalConfig(n_episodes=2, base_seed=0))
     assert "where success =" not in _verdict(clean, [], plain, None)
+
+
+def test_absolute_ref_reset_does_not_require_the_prop():
+    # Cross-face parity (found by review): Rust's SuccessTracker::reset collects
+    # baselines only for initial-ref lifts, so a predicate over a prop missing
+    # from the state must reset FINE and error at the first JUDGE — on both
+    # faces. A reset-time lookup here made python fail one step earlier.
+    p = Lifted("ghost", 0.3, ref="absolute")
+    p.reset(_state(0.1))  # state only knows "cube" — must not raise
+    with pytest.raises(ValueError, match="no prop named 'ghost'"):
+        p(_state(0.1))
+    # the initial form still captures (and still errors on a missing prop)
+    q = Lifted("ghost", 0.3, ref="initial")
+    with pytest.raises(ValueError, match="no prop named 'ghost'"):
+        q.reset(_state(0.1))

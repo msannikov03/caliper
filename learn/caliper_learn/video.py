@@ -265,9 +265,9 @@ class VideoRecorder:
         height: int | None = None,
         width: int | None = None,
     ):
-        ok, reason = available(codec)
-        if not ok:
-            raise RuntimeError(f"no video encoder available: {reason}")
+        # Input validation FIRST: a bad declaration must fail the same way on
+        # every machine — the encoder probe only gates machines that could
+        # otherwise proceed (found by CI, which has no PyAV/ffmpeg).
         fps = int(fps)
         if fps <= 0:
             raise ValueError(f"fps must be positive, got {fps}")
@@ -302,6 +302,9 @@ class VideoRecorder:
                     f"pix_fmt {_PIX_FMT} needs even height and width"
                 )
             self._shape = (int(height), int(width))
+        ok, reason = available(codec)
+        if not ok:
+            raise RuntimeError(f"no video encoder available: {reason}")
         # Per-channel running pixel stats in [0, 1] (mirrors the Rust writer's
         # fold_image_stats): exact population stats over EVERY pixel.
         self._stat_min = np.full(3, np.inf)

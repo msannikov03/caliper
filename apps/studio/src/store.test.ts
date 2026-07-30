@@ -19,6 +19,8 @@
 //    mode switch tears the session down
 //  - teleop recording: dataset picked once and continued, save/discard/empty
 //    takes, a take dying on the stream alone, finish → open in Data
+//  - openVerdict: a real eval report lands in the slice; every failure mode
+//    (unreadable file, non-JSON bytes, not-a-verdict) becomes a plain reason
 
 // vi.mock calls are hoisted before imports by Vitest.
 import { vi, describe, it, expect, beforeEach } from "vitest";
@@ -65,14 +67,23 @@ import {
   _resetNodeSeq,
   _flushLive,
   _resetLive,
+  replayingEpisode,
 } from "./store";
-import type { RobotInfo, TaskDto, TrajectoryDto, StudioState } from "./store";
+import type {
+  DatasetSummary,
+  RobotInfo,
+  SimTrajectoryDto,
+  TaskDto,
+  TrajectoryDto,
+  StudioState,
+} from "./store";
 import type { GripperInfo, LiveStartedDto, LiveStateEvent } from "./sim/live";
 import type { SimProp } from "./sim/props";
 import { serializeGraph } from "./graph/serialize";
 import { defaultParams } from "./graph/spec";
 import type { KindName } from "./graph/spec";
 import type { CNode, CEdge, Diagnostics, GraphRunResult } from "./graph/types";
+import evalFixture from "./verdicts/fixtures/eval.json";
 
 const mockInvoke = vi.mocked(invoke);
 const mockSaveDialog = vi.mocked(save);
@@ -191,6 +202,17 @@ const STORE_RESET = {
   liveRecFps: 50,
   liveRecHint: null,
   liveRecDone: null,
+  dataset: null,
+  datasetError: null,
+  datasetEpisode: null,
+  datasetSeries: null,
+  _datasetSeriesCache: {},
+  _datasetReqId: 0,
+  datasetClip: null,
+  datasetClipLoading: false,
+  dataDoctor: null,
+  verdict: null,
+  verdictError: null,
 };
 
 beforeEach(() => {
@@ -2119,5 +2141,279 @@ describe("task artifacts — store wiring", () => {
     emit("live://state", mockState({ tick: 30, success: false }));
     _flushLive();
     expect(useStore.getState().live?.success).toBe(false);
+  });
+});
+
+// ---- episode replay (Data mode plays a recorded take ON the robot) ----
+
+describe("episode replay — store wiring", () => {
+  const ROOT = "/tmp/ds";
+
+  /** Dataset summary with one 2-dof state feature and two episodes. */
+  function mockSummary(): DatasetSummary {
+    return {
+      path: ROOT,
+      fps: 50,
+      robotType: "panda",
+      codebaseVersion: "v3.0",
+      totalEpisodes: 2,
+      totalFrames: 6,
+      totalTasks: 1,
+      tasks: ["reach"],
+      features: [{ name: "observation.state", dim: 2, names: null }],
+      imageFeatures: [],
+      episodes: [
+        { index: 0, length: 3, tasks: ["reach"], tags: [], durationS: 0.06 },
+        { index: 1, length: 3, tasks: ["reach"], tags: [], durationS: 0.06 },
+      ],
+    };
+  }
+
+  /** What `dataset_episode_clip` returns: a baked clip of kind "episode". */
+  function mockClip(): SimTrajectoryDto {
+    const n = 3;
+    return {
+      kind: "episode",
+      duration: (n - 1) * 0.02,
+      ndof: 2,
+      dt: 0.02,
+      times: [0, 0.02, 0.04],
+      q: [
+        [0, 0],
+        [0.1, -0.1],
+        [0.2, -0.2],
+      ],
+      qd: [
+        [0, 0],
+        [0, 0],
+        [0, 0],
+      ],
+      tipPath: [
+        [0, 0, 0],
+        [0.1, 0, 0],
+        [0.2, 0, 0],
+      ],
+      frames: [[], [], []],
+      ok: true,
+      reached: 1,
+      maxJerkRatio: 0,
+      energy: [0, 0, 0],
+      energyDrift: 0,
+      settled: false,
+      gravity: [0, 0, 0],
+      damping: 0,
+    };
+  }
+
+  /** Data mode, dataset open, matching robot loaded — the ready state. */
+  function ready(): void {
+    useStore.setState({
+      mode: "data",
+      robot: MOCK_ROBOT,
+      dataset: mockSummary(),
+      datasetEpisode: 0,
+    });
+  }
+
+  /** `dataset_episode_clip` answers with the clip; everything else is inert. */
+  function backendServesClip(clip = mockClip()): SimTrajectoryDto {
+    mockInvoke.mockImplementation(async (cmd: string) =>
+      cmd === "dataset_episode_clip" ? clip : undefined,
+    );
+    return clip;
+  }
+
+  it("bakes the episode, adopts it as the clip, and plays — without leaving Data", async () => {
+    ready();
+    const clip = backendServesClip();
+
+    await useStore.getState().replayEpisode(1);
+
+    expect(mockInvoke).toHaveBeenCalledWith("dataset_episode_clip", {
+      path: ROOT,
+      episode: 1,
+    });
+    const s = useStore.getState();
+    expect(s.simTraj).toBe(clip);
+    expect(s.traj).toBeNull();
+    expect(replayingEpisode(s)).toBe(1);
+    expect(s.playing).toBe(true);
+    expect(s.mode).toBe("data"); // replay is not a mode switch
+    // the robot stands at the take's first recorded pose
+    expect(s.q).toEqual(clip.q[0]);
+    // and the table/plots followed the robot to that episode
+    expect(s.datasetEpisode).toBe(1);
+  });
+
+  it("puts the engine's refusal in the Data banner and loads no clip", async () => {
+    ready();
+    mockInvoke.mockRejectedValue("the loaded robot `toy` has 2 joints but …");
+
+    await useStore.getState().replayEpisode(0);
+
+    const s = useStore.getState();
+    expect(s.simTraj).toBeNull();
+    expect(replayingEpisode(s)).toBeNull();
+    expect(s.playing).toBe(false);
+    expect(s.datasetError).toMatch(/2 joints/);
+  });
+
+  it("does nothing at all with no dataset open", async () => {
+    useStore.setState({ mode: "data", robot: MOCK_ROBOT });
+    await useStore.getState().replayEpisode(0);
+    expect(mockInvoke).not.toHaveBeenCalledWith("dataset_episode_clip", expect.anything());
+  });
+
+  it("a doctor location bakes the clip and PAUSES the robot on that frame", async () => {
+    ready();
+    const clip = backendServesClip();
+
+    await useStore.getState().viewFindingFrame(1, 2);
+
+    const s = useStore.getState();
+    expect(replayingEpisode(s)).toBe(1);
+    expect(s.playhead).toBeCloseTo(2 * clip.dt, 12);
+    expect(s.playing).toBe(false); // the point of a jump is to LOOK at it
+    expect(s.q).toEqual(clip.q[2]);
+  });
+
+  it("re-seeks the clip it already has instead of re-baking it", async () => {
+    ready();
+    const clip = backendServesClip();
+    await useStore.getState().viewFindingFrame(1, 2);
+    mockInvoke.mockClear();
+
+    await useStore.getState().viewFindingFrame(1, 1);
+
+    expect(mockInvoke).not.toHaveBeenCalledWith("dataset_episode_clip", expect.anything());
+    expect(useStore.getState().playhead).toBeCloseTo(clip.dt, 12);
+    expect(useStore.getState().q).toEqual(clip.q[1]);
+  });
+
+  it("a location past the end of the clip lands on the last frame, never past it", async () => {
+    ready();
+    const clip = backendServesClip();
+
+    await useStore.getState().viewFindingFrame(0, 99);
+
+    expect(useStore.getState().playhead).toBeCloseTo(clip.duration, 12);
+  });
+
+  it("says it is baking while the FK bake is in flight, and refuses a second", async () => {
+    ready();
+    let release: (c: SimTrajectoryDto) => void = () => {};
+    const pending = new Promise<SimTrajectoryDto>((r) => (release = r));
+    mockInvoke.mockImplementation(async (cmd: string) =>
+      cmd === "dataset_episode_clip" ? pending : undefined,
+    );
+
+    const first = useStore.getState().replayEpisode(0);
+    expect(useStore.getState().datasetClipLoading).toBe(true);
+    // a second click while the first bake is out does NOT reach the backend
+    const calls = mockInvoke.mock.calls.filter((c) => c[0] === "dataset_episode_clip").length;
+    await useStore.getState().replayEpisode(1);
+    expect(mockInvoke.mock.calls.filter((c) => c[0] === "dataset_episode_clip")).toHaveLength(
+      calls,
+    );
+
+    release(mockClip());
+    await first;
+    expect(useStore.getState().datasetClipLoading).toBe(false);
+    expect(replayingEpisode(useStore.getState())).toBe(0);
+  });
+
+  it("drops the replay when an edit re-lists the dataset under it", async () => {
+    ready();
+    backendServesClip();
+    await useStore.getState().replayEpisode(1);
+
+    // deleting an episode renumbers the table: the baked clip describes bytes
+    // that may not live at that index any more, so it does not survive
+    const after = mockSummary();
+    after.episodes = [after.episodes[0]];
+    mockInvoke.mockImplementation(async (cmd: string) =>
+      cmd === "dataset_delete_episodes" ? after : undefined,
+    );
+    await useStore.getState().deleteDatasetEpisodes([1]);
+
+    const s = useStore.getState();
+    expect(s.simTraj).toBeNull();
+    expect(replayingEpisode(s)).toBeNull();
+    expect(s.playing).toBe(false);
+  });
+
+  it("forgets the episode the moment any other clip takes over", async () => {
+    ready();
+    backendServesClip();
+    await useStore.getState().replayEpisode(1);
+    expect(replayingEpisode(useStore.getState())).toBe(1);
+
+    // a gravity drop replaces the clip: `datasetClip` is stale by definition,
+    // and reading it through the clip's own kind is what makes that harmless
+    mockInvoke.mockImplementation(async (cmd: string) =>
+      cmd === "sim_drop" ? { ...mockClip(), kind: "sim" } : undefined,
+    );
+    await useStore.getState().runGravityDrop();
+    expect(replayingEpisode(useStore.getState())).toBeNull();
+
+    // and so does simply clearing the transport
+    await useStore.getState().replayEpisode(1);
+    useStore.getState().clearTraj();
+    expect(replayingEpisode(useStore.getState())).toBeNull();
+  });
+});
+
+// ---- openVerdict (read_verdict_file seam + detection) ----
+
+describe("openVerdict — verdict files land in the store or say why not", () => {
+  it("adopts a REAL caliper-learn eval report with its path", async () => {
+    mockInvoke.mockResolvedValueOnce(JSON.stringify(evalFixture));
+    await useStore.getState().openVerdict("/runs/run7.json");
+
+    expect(mockInvoke).toHaveBeenCalledWith("read_verdict_file", { path: "/runs/run7.json" });
+    const v = useStore.getState().verdict;
+    expect(v?.kind).toBe("eval");
+    expect(v?.path).toBe("/runs/run7.json");
+    // the document itself is intact (the panel reads it straight)
+    expect(v?.kind === "eval" && v.doc.n_episodes).toBe(6);
+    expect(useStore.getState().verdictError).toBeNull();
+  });
+
+  it("surfaces the backend's own refusal (not .json / too big / unreadable)", async () => {
+    mockInvoke.mockRejectedValueOnce("not a .json file: `/runs/report.txt`");
+    await useStore.getState().openVerdict("/runs/report.txt");
+    const s = useStore.getState();
+    expect(s.verdict).toBeNull();
+    expect(s.verdictError).toContain("not a .json file");
+  });
+
+  it("says the bytes are not JSON instead of throwing at the renderer", async () => {
+    mockInvoke.mockResolvedValueOnce("{ truncated");
+    await useStore.getState().openVerdict("/runs/half.json");
+    const s = useStore.getState();
+    expect(s.verdict).toBeNull();
+    expect(s.verdictError).toContain("/runs/half.json is not valid JSON");
+  });
+
+  it("refuses a JSON file that is not a verdict, quoting the reason", async () => {
+    mockInvoke.mockResolvedValueOnce(JSON.stringify({ hello: "world" }));
+    await useStore.getState().openVerdict("/runs/notes.json");
+    const s = useStore.getState();
+    expect(s.verdict).toBeNull();
+    expect(s.verdictError).toContain("not a caliper-learn verdict");
+    expect(s.verdictError).toContain("fingerprint");
+  });
+
+  it("a failed open never keeps a stale verdict on screen, and × clears both", async () => {
+    mockInvoke.mockResolvedValueOnce(JSON.stringify(evalFixture));
+    await useStore.getState().openVerdict("/runs/good.json");
+    expect(useStore.getState().verdict).not.toBeNull();
+
+    mockInvoke.mockRejectedValueOnce("could not read `/runs/gone.json`: No such file");
+    await useStore.getState().openVerdict("/runs/gone.json");
+    expect(useStore.getState().verdict).toBeNull();
+
+    useStore.getState().clearVerdict();
+    expect(useStore.getState().verdictError).toBeNull();
   });
 });

@@ -1,0 +1,122 @@
+{
+  "findings": [
+    {
+      "code": "P001",
+      "dof": null,
+      "feature": null,
+      "fix_hint": "training loss can look fine here \u2014 a mean-predictor is the L2 optimum for unlearnable labels. Check for zeroed/corrupted weights, then whether the state->action map is one-to-many (the repo's one-step-lookahead labeling exists precisely to fix that)",
+      "message": "across 32 varied probe states every action is (nearly) identical \u2014 max per-dof spread is 0.0000 of the data's action scale. The policy has collapsed to a constant (typically the dataset mean).",
+      "severity": "error",
+      "value": 0.0
+    },
+    {
+      "code": "P002",
+      "dof": 0,
+      "feature": null,
+      "fix_hint": "look at this dof's loss contribution and normalization std; a per-dof std that is wrongly large makes its normalized targets vanish, and the network learns to ignore the joint",
+      "message": "action dof 0 never moves across the probes (spread 0.0000 of its data scale) while the dataset moves it (std 1.0151) \u2014 the policy has written this joint off.",
+      "severity": "warn",
+      "value": 0.0
+    },
+    {
+      "code": "P002",
+      "dof": 1,
+      "feature": null,
+      "fix_hint": "look at this dof's loss contribution and normalization std; a per-dof std that is wrongly large makes its normalized targets vanish, and the network learns to ignore the joint",
+      "message": "action dof 1 never moves across the probes (spread 0.0000 of its data scale) while the dataset moves it (std 0.7907) \u2014 the policy has written this joint off.",
+      "severity": "warn",
+      "value": 0.0
+    },
+    {
+      "code": "P002",
+      "dof": 2,
+      "feature": null,
+      "fix_hint": "look at this dof's loss contribution and normalization std; a per-dof std that is wrongly large makes its normalized targets vanish, and the network learns to ignore the joint",
+      "message": "action dof 2 never moves across the probes (spread 0.0000 of its data scale) while the dataset moves it (std 0.6345) \u2014 the policy has written this joint off.",
+      "severity": "warn",
+      "value": 0.0
+    },
+    {
+      "code": "P002",
+      "dof": 3,
+      "feature": null,
+      "fix_hint": "look at this dof's loss contribution and normalization std; a per-dof std that is wrongly large makes its normalized targets vanish, and the network learns to ignore the joint",
+      "message": "action dof 3 never moves across the probes (spread 0.0000 of its data scale) while the dataset moves it (std 0.4933) \u2014 the policy has written this joint off.",
+      "severity": "warn",
+      "value": 0.0
+    },
+    {
+      "code": "P002",
+      "dof": 4,
+      "feature": null,
+      "fix_hint": "look at this dof's loss contribution and normalization std; a per-dof std that is wrongly large makes its normalized targets vanish, and the network learns to ignore the joint",
+      "message": "action dof 4 never moves across the probes (spread 0.0000 of its data scale) while the dataset moves it (std 0.5404) \u2014 the policy has written this joint off.",
+      "severity": "warn",
+      "value": 0.0
+    },
+    {
+      "code": "P002",
+      "dof": 5,
+      "feature": null,
+      "fix_hint": "look at this dof's loss contribution and normalization std; a per-dof std that is wrongly large makes its normalized targets vanish, and the network learns to ignore the joint",
+      "message": "action dof 5 never moves across the probes (spread 0.0000 of its data scale) while the dataset moves it (std 0.3682) \u2014 the policy has written this joint off.",
+      "severity": "warn",
+      "value": 0.0
+    },
+    {
+      "code": "P006",
+      "dof": 0,
+      "feature": null,
+      "fix_hint": "if the task genuinely needs this joint the policy cannot close the loop on it; check the feature wiring and whether this dim was constant in training (see the dataset doctor's D001)",
+      "message": "perturbing state dim 0 by \u00b10.141 never changes the action (max normalized response 0.0000) \u2014 the policy ignores this joint's measurement.",
+      "severity": "warn",
+      "value": 0.0
+    },
+    {
+      "code": "P006",
+      "dof": 1,
+      "feature": null,
+      "fix_hint": "if the task genuinely needs this joint the policy cannot close the loop on it; check the feature wiring and whether this dim was constant in training (see the dataset doctor's D001)",
+      "message": "perturbing state dim 1 by \u00b10.124 never changes the action (max normalized response 0.0000) \u2014 the policy ignores this joint's measurement.",
+      "severity": "warn",
+      "value": 0.0
+    },
+    {
+      "code": "P006",
+      "dof": 2,
+      "feature": null,
+      "fix_hint": "if the task genuinely needs this joint the policy cannot close the loop on it; check the feature wiring and whether this dim was constant in training (see the dataset doctor's D001)",
+      "message": "perturbing state dim 2 by \u00b10.106 never changes the action (max normalized response 0.0000) \u2014 the policy ignores this joint's measurement.",
+      "severity": "warn",
+      "value": 0.0
+    },
+    {
+      "code": "P006",
+      "dof": 3,
+      "feature": null,
+      "fix_hint": "if the task genuinely needs this joint the policy cannot close the loop on it; check the feature wiring and whether this dim was constant in training (see the dataset doctor's D001)",
+      "message": "perturbing state dim 3 by \u00b10.100 never changes the action (max normalized response 0.0000) \u2014 the policy ignores this joint's measurement.",
+      "severity": "warn",
+      "value": 0.0
+    },
+    {
+      "code": "P006",
+      "dof": 4,
+      "feature": null,
+      "fix_hint": "if the task genuinely needs this joint the policy cannot close the loop on it; check the feature wiring and whether this dim was constant in training (see the dataset doctor's D001)",
+      "message": "perturbing state dim 4 by \u00b10.100 never changes the action (max normalized response 0.0000) \u2014 the policy ignores this joint's measurement.",
+      "severity": "warn",
+      "value": 0.0
+    },
+    {
+      "code": "P006",
+      "dof": 5,
+      "feature": null,
+      "fix_hint": "if the task genuinely needs this joint the policy cannot close the loop on it; check the feature wiring and whether this dim was constant in training (see the dataset doctor's D001)",
+      "message": "perturbing state dim 5 by \u00b10.100 never changes the action (max normalized response 0.0000) \u2014 the policy ignores this joint's measurement.",
+      "severity": "warn",
+      "value": 0.0
+    }
+  ],
+  "policy_dir": "/var/folders/6y/qb9zpwjd37gbkhftl2xz4gl00000gn/T/verdict-fixtures-b97k2xr8/ckpt_zero"
+}

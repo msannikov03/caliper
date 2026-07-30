@@ -62,6 +62,8 @@ import {
 } from "./sim/input";
 import type { GamepadIntent } from "./sim/input";
 import type { DataDoctorReport, DoctorReport } from "./doctor/doctor";
+import { detectVerdict } from "./verdicts/verdicts";
+import type { Detected, LoadedVerdict } from "./verdicts/verdicts";
 
 // ---- wire types: mirror the serde structs in src-tauri/src/lib.rs exactly ----
 
@@ -505,6 +507,23 @@ export interface StudioState {
   datasetSeries: DatasetEpisodeSeries | null; // plotted series of the selection
   _datasetSeriesCache: Record<number, DatasetEpisodeSeries>; // per-summary; edits clear it
   _datasetReqId: number; // monotonic latest-wins guard for series fetches
+  /** Episode whose replay clip was last baked. Only meaningful while the
+   *  active clip IS that clip (`simTraj.kind === "episode"`) — every path that
+   *  clears or replaces `simTraj` therefore invalidates it for free, with no
+   *  bookkeeping to forget. Read it through [`replayingEpisode`]. */
+  datasetClip: number | null;
+  /** A bake is in flight. Baking is FK per recorded frame, so a long take is
+   *  seconds — the button says so rather than looking dead (same reason
+   *  `dataDoctorLoading` exists). */
+  datasetClipLoading: boolean;
+  /** Bake one recorded episode into a clip and play it ON the robot: the
+   *  take's own joint rows through the loaded robot's FK, driven by the SAME
+   *  transport every other rollout uses. Stays in Data mode. `frame` starts
+   *  paused at that recorded frame instead of playing from the top. */
+  replayEpisode: (episode: number, frame?: number) => Promise<void>;
+  /** A doctor finding's location → the robot standing at that instant: bake
+   *  the episode's clip if it is not already loaded, then seek to the frame. */
+  viewFindingFrame: (episode: number, frame: number) => Promise<void>;
   /** Open (or re-open) a dataset directory picked in the native dialog. */
   openDataset: (path: string) => Promise<void>;
   /** Re-list the currently-open dataset from disk. */
@@ -530,6 +549,21 @@ export interface StudioState {
   runDataDoctor: () => Promise<void>;
   /** Dismiss the doctor findings panel. */
   clearDataDoctor: () => void;
+
+  // verdict viewers — the JSON a training run leaves behind (`caliper-learn
+  // eval|autopsy|profile|debug --json`). Read-only and dataset-independent: a
+  // verdict is a snapshot of a run, not of the bytes currently open, so nothing
+  // here is invalidated by a dataset edit. The document is fingerprinted and
+  // type-checked in verdicts.ts BEFORE it lands in the store — the panel never
+  // renders a half-understood file.
+  verdict: LoadedVerdict | null;
+  /** Why the last open attempt produced nothing (read error, bad JSON, or a
+   *  file that is not a verdict — the reason is always plain English). */
+  verdictError: string | null;
+  /** Read + detect a verdict JSON picked in the native open dialog. */
+  openVerdict: (path: string) => Promise<void>;
+  /** Dismiss the verdict panel (and any error it is showing). */
+  clearVerdict: () => void;
 }
 
 export const useStore = create<StudioState>((set, get) => ({
@@ -589,8 +623,12 @@ export const useStore = create<StudioState>((set, get) => ({
   datasetSeries: null,
   _datasetSeriesCache: {},
   _datasetReqId: 0,
+  datasetClip: null,
+  datasetClipLoading: false,
   dataDoctor: null,
   dataDoctorLoading: false,
+  verdict: null,
+  verdictError: null,
 
   async loadFixtures() {
     try {
@@ -1622,6 +1660,51 @@ export const useStore = create<StudioState>((set, get) => ({
       if (get()._datasetReqId === reqId) set({ datasetError: String(e) });
     }
   },
+  async replayEpisode(episode, frame) {
+    const ds = get().dataset;
+    if (!ds || get().datasetClipLoading) return; // one bake at a time
+    // the plots and the table follow the robot (cached after the first fetch)
+    if (get().datasetEpisode !== episode) void get().selectDatasetEpisode(episode);
+    set({ datasetClipLoading: true });
+    try {
+      const clip = await invoke<SimTrajectoryDto>("dataset_episode_clip", {
+        path: ds.path,
+        episode,
+      });
+      // adopted exactly like every other rollout — one playback path
+      stopClock();
+      set({
+        simTraj: clip,
+        traj: null,
+        datasetClip: episode,
+        playhead: 0,
+        playing: false,
+        datasetError: null,
+      });
+      if (frame === undefined) {
+        get()._applyTrajAt(0);
+        get().play();
+      } else {
+        // a jump lands paused ON the frame asked for: the point is to LOOK
+        get().seek(Math.min(Math.max(frame, 0) * clip.dt, clip.duration));
+      }
+    } catch (e) {
+      // the backend refuses loudly (no robot, ndof mismatch, too long) — that
+      // sentence is the useful one, so it goes straight into the Data banner
+      set({ datasetError: String(e) });
+    } finally {
+      set({ datasetClipLoading: false });
+    }
+  },
+  async viewFindingFrame(episode, frame) {
+    if (replayingEpisode(get()) !== episode) {
+      await get().replayEpisode(episode, frame);
+      return;
+    }
+    const clip = get().simTraj;
+    if (!clip) return;
+    get().seek(Math.min(Math.max(frame, 0) * clip.dt, clip.duration));
+  },
   async deleteDatasetEpisodes(episodes) {
     await datasetEdit("dataset_delete_episodes", { episodes }, null, get, set);
   },
@@ -1665,11 +1748,62 @@ export const useStore = create<StudioState>((set, get) => ({
   clearDataDoctor() {
     set({ dataDoctor: null });
   },
+
+  // ---- verdict viewers ----
+  async openVerdict(path) {
+    let text: string;
+    try {
+      text = await invoke<string>("read_verdict_file", { path });
+    } catch (e) {
+      // the backend's own reason (not .json, too big, unreadable) is the message
+      set({ verdict: null, verdictError: String(e) });
+      return;
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(text);
+    } catch (e) {
+      set({ verdict: null, verdictError: `${path} is not valid JSON: ${String(e)}` });
+      return;
+    }
+    const detected = detectVerdict(parsed);
+    if (detected.kind === "unknown") {
+      set({ verdict: null, verdictError: `not a caliper-learn verdict — ${detected.why}` });
+      return;
+    }
+    set({ verdict: withVerdictPath(detected, path), verdictError: null });
+  },
+  clearVerdict() {
+    set({ verdict: null, verdictError: null });
+  },
 }));
+
+/// The store's verdict slice is the detected document PLUS where it came from.
+/// Written as a switch rather than a spread so the kind↔doc correlation of the
+/// discriminated union survives (a spread widens both halves independently).
+function withVerdictPath(d: Detected, path: string): LoadedVerdict {
+  switch (d.kind) {
+    case "eval":
+      return { kind: "eval", doc: d.doc, path };
+    case "autopsy":
+      return { kind: "autopsy", doc: d.doc, path };
+    case "profile":
+      return { kind: "profile", doc: d.doc, path };
+    case "debug":
+      return { kind: "debug", doc: d.doc, path };
+  }
+}
 
 /// The active playback clip: a baked sim rollout takes precedence over a motion traj.
 function activeClip(s: StudioState): TrajectoryDto | null {
   return s.simTraj ?? s.traj;
+}
+
+/// The episode currently loaded as the active clip, or null. Reads `datasetClip`
+/// THROUGH the clip itself, so a gravity drop, a graph run, a mode switch or a
+/// plain `clearTraj` invalidates it without anyone having to remember to.
+export function replayingEpisode(s: StudioState): number | null {
+  return s.simTraj?.kind === "episode" ? s.datasetClip : null;
 }
 
 // ---- robot adoption (module scope) ----
@@ -1752,6 +1886,12 @@ function adoptDatasetSummary(
   get: () => StudioState,
   set: (p: Partial<StudioState>) => void,
 ): void {
+  // a replay clip was baked from bytes an edit may just have moved (or
+  // deleted): keeping it playing would show a take the dataset no longer has
+  if (replayingEpisode(get()) !== null) {
+    stopClock();
+    set({ simTraj: null, datasetClip: null, playing: false, playhead: 0 });
+  }
   set({
     dataset: summary,
     datasetError: null,

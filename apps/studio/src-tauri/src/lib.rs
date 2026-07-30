@@ -2643,6 +2643,47 @@ fn load_graph_file(path: String) -> Result<String, String> {
     Ok(json)
 }
 
+// ----- verdict files (caliper-learn --json output; path comes from the dialog) -----
+
+/// Verdict documents are kilobytes (an autopsy over a big dataset is tens of
+/// them). The cap exists so a mis-picked multi-gigabyte JSON cannot be pulled
+/// through the IPC bridge into the webview's memory.
+const VERDICT_MAX_BYTES: u64 = 5 * 1024 * 1024;
+
+/// Read a `caliper-learn` verdict JSON (`eval` / `autopsy` / `profile` /
+/// `debug --json`) picked in the native open dialog, as TEXT.
+///
+/// Deliberately NOT a generic file reader: the path must end in `.json`, the
+/// file must fit `VERDICT_MAX_BYTES`, and every read is logged. Nothing here
+/// interprets the document — the frontend fingerprints and type-checks it
+/// (`src/verdicts/verdicts.ts`), which is also what keeps this command from
+/// having to track the python reporters' schemas.
+#[tauri::command]
+fn read_verdict_file(path: String) -> Result<String, String> {
+    let p = std::path::Path::new(&path);
+    if !p
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("json"))
+    {
+        return Err(format!(
+            "not a .json file: `{path}` — verdicts are written by `caliper-learn … --json`"
+        ));
+    }
+    let len = std::fs::metadata(p)
+        .map_err(|e| format!("could not read `{path}`: {e}"))?
+        .len();
+    if len > VERDICT_MAX_BYTES {
+        return Err(format!(
+            "`{path}` is {:.1} MB — a verdict file is kilobytes; the limit is {} MB",
+            len as f64 / (1024.0 * 1024.0),
+            VERDICT_MAX_BYTES / (1024 * 1024)
+        ));
+    }
+    let text = std::fs::read_to_string(p).map_err(|e| format!("could not read `{path}`: {e}"))?;
+    log::info!(target: "studio::verdict", "read_verdict_file {path} ({len} bytes)");
+    Ok(text)
+}
+
 // ----- dataset browser (LeRobotDataset v3.0; path comes from the native open dialog) -----
 
 /// One episode row of the dataset table.
@@ -2709,6 +2750,28 @@ struct DatasetEpisodeSeries {
     channels: Vec<DatasetChannel>,
 }
 
+/// Bookkeeping columns that some writers emit as `float32` vectors: they are
+/// never a robot pose, so neither the feature list nor episode replay may pick
+/// one up. MUST stay in lockstep with `INDEX_FEATURES` in
+/// `apps/studio/src/data/episodes.ts` (the FE applies the same rule to decide
+/// what a "replay on robot" button would play, and at what dimension).
+const INDEX_FEATURES: [&str; 5] = [
+    "timestamp",
+    "frame_index",
+    "episode_index",
+    "index",
+    "task_index",
+];
+
+/// lerobot's conventional proprioception feature — the recorded joint pose,
+/// and therefore the first choice for replay.
+const STATE_FEATURE: &str = "observation.state";
+
+/// Replay cap. A clip bakes a full FK frame set per row (nframes × 16 f64), so
+/// a long episode is tens of megabytes crossing the IPC bridge; past this the
+/// command refuses instead of quietly truncating the take.
+const MAX_CLIP_FRAMES: usize = 20_000;
+
 /// Canonicalize + sanity-check a webview-supplied dataset path. Desktop trust
 /// model (same as the graph file dialogs): the path comes from the native
 /// open dialog, so beyond "resolves to a directory" no allowlist is needed.
@@ -2732,12 +2795,7 @@ fn dataset_summary_impl(root: &Path) -> Result<DatasetSummary, String> {
         .features
         .iter()
         .filter(|(name, f)| {
-            f.dtype == "float32"
-                && f.shape.len() == 1
-                && !matches!(
-                    name.as_str(),
-                    "timestamp" | "frame_index" | "episode_index" | "index" | "task_index"
-                )
+            f.dtype == "float32" && f.shape.len() == 1 && !INDEX_FEATURES.contains(&name.as_str())
         })
         .map(|(name, f)| DatasetFeatureDto {
             name: name.clone(),
@@ -2916,6 +2974,146 @@ fn dataset_episode_thumbs(
         dataset_episode_thumbs_impl(&path, episode, &feature, count),
     )
     .map(tauri::ipc::Response::new)
+}
+
+/// The feature an episode is replayed from: `observation.state` when the
+/// dataset has it, otherwise the first real vector feature (a converted
+/// dataset may name proprioception anything). Index columns are never it.
+/// Mirrored by `replayFeature` in `apps/studio/src/data/episodes.ts`.
+fn replay_feature(features: &std::collections::BTreeMap<String, Vec<Vec<f32>>>) -> Option<&String> {
+    features
+        .keys()
+        .find(|n| n.as_str() == STATE_FEATURE)
+        .or_else(|| {
+            features
+                .keys()
+                .find(|n| !INDEX_FEATURES.contains(&n.as_str()))
+        })
+}
+
+fn dataset_episode_clip_impl(
+    path: &str,
+    episode: usize,
+    state: &AppState,
+) -> Result<SimTrajectoryDto, String> {
+    let root = dataset_dir(path)?;
+    let reader = caliper_dataset::DatasetReader::open(&root).map_err(|e| e.to_string())?;
+    let fps = reader.fps();
+    let ep = reader.read_episode(episode).map_err(|e| e.to_string())?;
+    let feature = replay_feature(&ep.features)
+        .ok_or_else(|| {
+            format!(
+                "episode {episode} carries no vector feature to replay — a dataset with no \
+                 `{STATE_FEATURE}` (and no other float32 vector feature) holds no joint \
+                 trajectory, only images and bookkeeping columns"
+            )
+        })?
+        .clone();
+    let rows = &ep.features[&feature];
+    if rows.is_empty() {
+        return Err(format!("episode {episode} has no frames to replay"));
+    }
+    if rows.len() > MAX_CLIP_FRAMES {
+        return Err(format!(
+            "episode {episode} is {} frames long — too long to replay (the cap is \
+             {MAX_CLIP_FRAMES} baked frames, ~{:.0}s at {fps} fps). Split it in Data mode and \
+             replay a piece.",
+            rows.len(),
+            MAX_CLIP_FRAMES as f64 / f64::from(fps.max(1))
+        ));
+    }
+    let dim = rows[0].len();
+
+    // Clone the model out of state (as `sim_drop` does) so the FK bake below —
+    // up to MAX_CLIP_FRAMES rows — never holds the lock other commands need.
+    let arc = {
+        let guard = state.model.lock().map_err(|_| "state lock poisoned")?;
+        let model = guard.as_ref().ok_or(
+            "no robot loaded — episode replay poses the robot you have open, so open the URDF \
+             this dataset was recorded with first",
+        )?;
+        if model.ndof != dim {
+            return Err(format!(
+                "the loaded robot `{}` has {} joints but `{feature}` in this dataset is \
+                 {dim}-dimensional — load the robot this dataset was recorded with",
+                model.name, model.ndof
+            ));
+        }
+        Arc::new(model.clone())
+    };
+    let model: &Model = arc.as_ref();
+
+    let dt = 1.0 / f64::from(fps.max(1));
+    let n = rows.len();
+    let mut times = Vec::with_capacity(n);
+    let mut q = Vec::with_capacity(n);
+    let mut tip_path = Vec::with_capacity(n);
+    let mut frames = Vec::with_capacity(n);
+    for (i, row) in rows.iter().enumerate() {
+        if row.len() != dim {
+            return Err(format!(
+                "feature `{feature}`: ragged rows (frame {i} has {} values, the first frame has \
+                 {dim}) — the episode parquet is corrupt",
+                row.len()
+            ));
+        }
+        let qi: Vec<f64> = row.iter().map(|&v| f64::from(v)).collect();
+        if let Some(j) = qi.iter().position(|v| !v.is_finite()) {
+            return Err(format!(
+                "episode {episode} frame {i}: `{feature}` dof {j} is non-finite (NaN/inf) — there \
+                 is no pose to put the robot in. Run the dataset doctor (D016) on this dataset.",
+            ));
+        }
+        let (fr, tp) = bake_frame_row(model, &qi);
+        times.push(i as f64 * dt);
+        q.push(qi);
+        tip_path.push(tp);
+        frames.push(fr);
+    }
+
+    Ok(SimTrajectoryDto {
+        kind: "episode".into(),
+        duration: (n - 1) as f64 * dt,
+        ndof: dim,
+        dt,
+        times,
+        q,
+        // Recorded takes carry positions, not velocities: zeros are the honest
+        // answer. (Differencing the rows would invent a signal nobody measured.)
+        qd: vec![vec![0.0; dim]; n],
+        tip_path,
+        frames,
+        energy: vec![0.0; n],
+        energy_drift: 0.0,
+        settled: false,
+        gravity: [0.0; 3],
+        damping: 0.0,
+        ok: true,
+        reached: 1.0,
+        max_jerk_ratio: 0.0,
+        props: None,
+        contacts: None,
+        lint: None,
+    })
+}
+
+/// Bake one recorded episode into a playback clip: the take's own joint rows,
+/// posed through the LOADED robot's FK, on a uniform `1/fps` clock. The result
+/// is a `SimTrajectoryDto` (kind `"episode"`) so Data mode replays a dataset
+/// through exactly the transport every other rollout uses.
+///
+/// Errors rather than approximating: no robot, an ndof/feature-dim mismatch, a
+/// non-finite row, or an episode past the replay cap all come back as text.
+#[tauri::command]
+fn dataset_episode_clip(
+    path: String,
+    episode: usize,
+    state: tauri::State<'_, AppState>,
+) -> Result<SimTrajectoryDto, String> {
+    logged(
+        "dataset_episode_clip",
+        dataset_episode_clip_impl(&path, episode, &state),
+    )
 }
 
 fn dataset_delete_episodes_impl(path: &str, episodes: &[usize]) -> Result<DatasetSummary, String> {
@@ -3195,8 +3393,8 @@ fn urdf_doctor(path: String, repair: bool) -> Result<UrdfDoctorDto, String> {
     logged("urdf_doctor", urdf_doctor_impl(&path, repair))
 }
 
-/// One dataset-doctor finding. `episode`/`dof` are the machine-readable refs
-/// the Data panel uses to jump to the row concerned.
+/// One dataset-doctor finding. `episode`/`dof`/`frame` are the machine-readable
+/// refs the Data panel uses to jump to the row — and the instant — concerned.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct DataFindingDto {
@@ -3207,6 +3405,9 @@ struct DataFindingDto {
     feature: Option<String>,
     episode: Option<i64>,
     dof: Option<usize>,
+    /// Frame inside `episode` the check fired at, when it localizes one
+    /// (D006/D010/D011) — the Data panel seeks episode replay to it.
+    frame: Option<usize>,
     message: String,
     fix_hint: String,
 }
@@ -3247,6 +3448,7 @@ fn dataset_doctor_impl(path: &str) -> Result<DataDoctorDto, String> {
                 feature: f.feature.clone(),
                 episode: f.episode,
                 dof: f.dof,
+                frame: f.frame,
                 message: f.message.clone(),
                 fix_hint: f.fix_hint.clone(),
             })
@@ -3351,8 +3553,10 @@ pub fn run() {
             delete_graph,
             save_graph_file,
             load_graph_file,
+            read_verdict_file,
             dataset_open,
             dataset_episode,
+            dataset_episode_clip,
             dataset_episode_thumbs,
             dataset_delete_episodes,
             dataset_split_episode,
@@ -3665,7 +3869,7 @@ mod tests {
         assert_eq!(placed["kind"], "placed_in_zone");
         assert_eq!(
             placed["zone"]["center"],
-            serde_json::json!([0.4, 0.2, 0.02])
+            serde_json::json!([0.4, 0.2, 0.12])
         );
         assert!(
             dto.success_description
@@ -4105,6 +4309,33 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// The verdict reader's gates: only `.json`, only files that exist, and the
+    /// bytes come back verbatim (the FE does all the parsing).
+    #[test]
+    fn read_verdict_file_gates_extension_and_existence() {
+        let dir = std::env::temp_dir().join(format!("caliper-verdict-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("eval.json");
+        let doc = r#"{"success_rate":0.5,"episodes":[]}"#;
+        std::fs::write(&path, doc).unwrap();
+        let p = path.to_string_lossy().to_string();
+        assert_eq!(read_verdict_file(p.clone()).unwrap(), doc);
+        // case-insensitive extension, but nothing else
+        let upper = dir.join("EVAL.JSON");
+        std::fs::write(&upper, doc).unwrap();
+        assert!(read_verdict_file(upper.to_string_lossy().to_string()).is_ok());
+        let txt = dir.join("eval.txt");
+        std::fs::write(&txt, doc).unwrap();
+        assert!(read_verdict_file(txt.to_string_lossy().to_string()).is_err());
+        // a missing file, and a DIRECTORY that happens to end in .json, are
+        // honest errors rather than panics
+        assert!(read_verdict_file(dir.join("nope.json").to_string_lossy().to_string()).is_err());
+        let dir_json = dir.join("run.json.d.json");
+        std::fs::create_dir_all(&dir_json).unwrap();
+        assert!(read_verdict_file(dir_json.to_string_lossy().to_string()).is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn sanitize_name_strips_unsafe() {
         // already-safe names pass through unchanged
@@ -4440,5 +4671,165 @@ mod tests {
     #[test]
     fn dataset_doctor_rejects_missing_root() {
         assert!(dataset_doctor_impl("/definitely/not/a/dataset").is_err());
+    }
+
+    /// A take whose robot froze before the recording stopped — D011, the
+    /// finding that knows not just which episode but which frame.
+    fn write_frozen_tail_dataset() -> PathBuf {
+        use caliper_dataset::{DatasetSpec, DatasetWriter, FeatureSpec};
+        let dir = std::env::temp_dir().join(format!("studio_data_tail_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let spec = DatasetSpec::new(
+            50,
+            "test_bot",
+            vec![
+                FeatureSpec::vector("observation.state", 2, None),
+                FeatureSpec::vector("action", 2, None),
+            ],
+        );
+        let mut w = DatasetWriter::create(&dir, spec).unwrap();
+        let mut seed = 11u64;
+        let mut noise = move || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((seed >> 11) as f64 / (1u64 << 53) as f64) * 2.0 - 1.0
+        };
+        for _ in 0..2 {
+            for _ in 0..20 {
+                let s = [noise(), noise()];
+                w.add_frame(&[("observation.state", &s), ("action", &s)])
+                    .unwrap();
+            }
+            // the arm stops moving 6 frames before the operator stops recording
+            let s = [0.3, -0.2];
+            for _ in 0..6 {
+                w.add_frame(&[("observation.state", &s), ("action", &s)])
+                    .unwrap();
+            }
+            w.save_episode("t").unwrap();
+        }
+        w.finalize().unwrap()
+    }
+
+    /// D011 comes back with a FRAME ref, not just an episode — that is what
+    /// lets the Data panel seek the replay to the instant it fired.
+    #[test]
+    fn dataset_doctor_localizes_a_frozen_tail_to_a_frame() {
+        let root = write_frozen_tail_dataset();
+        let dto = dataset_doctor_impl(root.to_str().unwrap()).unwrap();
+        let d11 = dto
+            .findings
+            .iter()
+            .find(|f| f.code == "D011")
+            .expect("D011 on the frozen tail");
+        assert_eq!(d11.episode, Some(0));
+        // 26 frames, the last 5 bit-identical → the freeze starts at 21
+        assert_eq!(d11.frame, Some(21));
+        // a frame ref is meaningless without the episode it indexes into
+        assert!(dto
+            .findings
+            .iter()
+            .all(|f| f.frame.is_none() || f.episode.is_some()));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // -- episode replay clips --
+
+    /// The replay feature is a decision, not a guess: proprioception first,
+    /// then the first real vector feature, never a bookkeeping column.
+    #[test]
+    fn replay_feature_prefers_state_and_never_an_index_column() {
+        let map = |names: &[&str]| -> std::collections::BTreeMap<String, Vec<Vec<f32>>> {
+            names
+                .iter()
+                .map(|n| ((*n).to_string(), vec![vec![0.0]]))
+                .collect()
+        };
+        // BTreeMap order would hand back "action" first — state still wins
+        let m = map(&["action", "observation.state"]);
+        assert_eq!(replay_feature(&m).unwrap().as_str(), "observation.state");
+        // a converted dataset without observation.state: first real feature
+        let m = map(&["action", "observation.velocity"]);
+        assert_eq!(replay_feature(&m).unwrap().as_str(), "action");
+        // nothing but bookkeeping → no trajectory to replay at all
+        let m = map(&["index", "task_index", "frame_index", "episode_index"]);
+        assert!(replay_feature(&m).is_none());
+    }
+
+    /// A recorded episode bakes back into a clip: the take's own rows, posed
+    /// through the loaded robot's FK, on the dataset's own 1/fps clock.
+    #[test]
+    fn episode_clip_round_trips_a_recorded_episode() {
+        let root = write_dataset("clip", false);
+        let state = AppState::default();
+        load_robot_into_state(&fixture("toy.urdf").display().to_string(), &state)
+            .expect("toy.urdf loads");
+        let dto = dataset_episode_clip_impl(root.to_str().unwrap(), 1, &state).expect("clip bakes");
+
+        let reader = caliper_dataset::DatasetReader::open(&root).unwrap();
+        let rows = reader.read_episode(1).unwrap().features["observation.state"].clone();
+
+        assert_eq!(dto.kind, "episode");
+        assert_eq!(dto.ndof, 2);
+        assert!((dto.dt - 0.02).abs() < 1e-12, "dt is 1/fps");
+        assert_eq!(dto.q.len(), rows.len());
+        assert_eq!(dto.frames.len(), rows.len());
+        assert_eq!(dto.tip_path.len(), rows.len());
+        assert!((dto.duration - (rows.len() - 1) as f64 * 0.02).abs() < 1e-12);
+        // every recorded row, verbatim and in order — no resampling, no filter
+        for (i, row) in rows.iter().enumerate() {
+            let want: Vec<f64> = row.iter().map(|&v| f64::from(v)).collect();
+            assert_eq!(dto.q[i], want, "frame {i}");
+            assert!((dto.times[i] - i as f64 * 0.02).abs() < 1e-12, "frame {i}");
+        }
+        // the poses ARE the engine's FK of those rows
+        let model = load("toy.urdf");
+        let (want_frames, want_tip) = bake_frame_row(&model, &dto.q[3]);
+        assert_eq!(dto.frames[3], want_frames);
+        assert_eq!(dto.tip_path[3], want_tip);
+        // a take records positions; velocity was never measured, so it is zero
+        // rather than a difference quotient nobody demonstrated
+        assert!(dto.qd.iter().all(|r| r.iter().all(|&v| v == 0.0)));
+        assert!(dto.ok && !dto.settled);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Wrong robot open = a loud error naming BOTH sizes, never a silent
+    /// truncation or a pose built from the wrong joints.
+    #[test]
+    fn episode_clip_refuses_a_robot_of_the_wrong_size() {
+        let root = write_dataset("clip_mismatch", false);
+        let state = AppState::default();
+        load_robot_into_state(&fixture("gripper_arm.urdf").display().to_string(), &state)
+            .expect("gripper_arm.urdf loads");
+        let Err(err) = dataset_episode_clip_impl(root.to_str().unwrap(), 0, &state) else {
+            panic!("a 3-joint robot must not replay a 2-dof take");
+        };
+        assert!(err.contains("3 joints"), "{err}");
+        assert!(err.contains("2-dimensional"), "{err}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Replay poses the OPEN robot — with none open there is nothing to pose.
+    #[test]
+    fn episode_clip_needs_a_loaded_robot() {
+        let root = write_dataset("clip_norobot", false);
+        let Err(err) = dataset_episode_clip_impl(root.to_str().unwrap(), 0, &AppState::default())
+        else {
+            panic!("replay with no robot open must not fabricate a pose");
+        };
+        assert!(err.contains("no robot loaded"), "{err}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// An episode index the dataset does not have is an Err, not an empty clip.
+    #[test]
+    fn episode_clip_rejects_an_unknown_episode() {
+        let root = write_dataset("clip_range", false);
+        let state = AppState::default();
+        load_robot_into_state(&fixture("toy.urdf").display().to_string(), &state).unwrap();
+        assert!(dataset_episode_clip_impl(root.to_str().unwrap(), 99, &state).is_err());
+        std::fs::remove_dir_all(&root).ok();
     }
 }

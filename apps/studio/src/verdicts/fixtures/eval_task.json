@@ -1,0 +1,48 @@
+{
+  "ci95_high": 0.5614970317550454,
+  "ci95_low": 0.0,
+  "episodes": [
+    {
+      "episode_return": 0.0,
+      "final_distance": null,
+      "seed": 0,
+      "steps": 10,
+      "success": false
+    },
+    {
+      "episode_return": 0.0,
+      "final_distance": null,
+      "seed": 1,
+      "steps": 10,
+      "success": false
+    },
+    {
+      "episode_return": 0.0,
+      "final_distance": null,
+      "seed": 2,
+      "steps": 10,
+      "success": false
+    }
+  ],
+  "findings": [
+    {
+      "code": "E001",
+      "fix_hint": "Training loss says nothing about this. Check the deploy cadence (eval fps vs the collection fps \u2014 action chunks consumed at the wrong rate), the observation feature mapping (right robot, right dof count, right feature names), and sweep() the other checkpoints before blaming the data.",
+      "message": "0/3 episodes met 'cube's center is inside the 0.100 x 0.100 x 0.040 m box centered at (0.400, 0.200, 0.020) and has come to rest (speed <= 0.010 m/s)' \u2014 the policy never solved the task.",
+      "severity": "warn"
+    },
+    {
+      "code": "E003",
+      "fix_hint": "Wire a reward_fn into EvalTask (e.g. reach_eval_task): success alone cannot rank near-misses, so returns stay uninformative.",
+      "message": "every episode returned exactly 0.0 across 3 seeds \u2014 no reward signal reached the evaluator.",
+      "severity": "warn"
+    }
+  ],
+  "mean_return": 0.0,
+  "mean_steps_to_success": null,
+  "median_return": 0.0,
+  "n_episodes": 3,
+  "n_success": 0,
+  "success_criterion": "cube's center is inside the 0.100 x 0.100 x 0.040 m box centered at (0.400, 0.200, 0.020) and has come to rest (speed <= 0.010 m/s)",
+  "success_rate": 0.0
+}

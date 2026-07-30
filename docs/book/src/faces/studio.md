@@ -19,7 +19,13 @@ persistent 3D canvas (⌘1…⌘5, or the ⌘K command palette):
   save/load, file import/export, live scopes).
 - **Data** — a LeRobotDataset v3.0 browser/editor (episode table, per-channel
   plots, camera thumbnails, tags, delete/split/merge) — reachable with no
-  robot loaded.
+  robot loaded. With a matching robot loaded, an episode **replays on the 3D
+  robot** (the take's own joint rows through FK, frame-accurate in-panel
+  transport; doctor findings that know an instant jump the robot to that
+  pose). The **Verdict…** button opens any `caliper-learn … --json` report —
+  eval (success rate with the Wilson-95 interval drawn as a bar), debug,
+  profile, or the full autopsy — rendered with the doctor panel's severity
+  vocabulary.
 
 On first launch a **six-step tour** points out the mode tabs, Open URDF… and
 ⌘K. It is a pure frontend overlay: skippable at every step, it never blocks

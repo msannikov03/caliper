@@ -209,8 +209,10 @@ export default function App() {
           {!docked && <JointPanel />}
           {!docked && <PosePanel />}
           {!docked && <SimulatePanel />}
-          {/* Data mode drives no clips and owns its own error banner — the robot
-              HUD/transport overlays would only mislead over the docked preview */}
+          {/* Data mode owns its own error banner, and its episode replay owns
+              its own compact transport INSIDE the panel — the docked stage is
+              28% wide, too narrow for the global scrubber. The robot HUDs would
+              only mislead over a passive preview. */}
           {!isData && <Hud />}
           {!isData && <SingularityHud />}
           {!isData && <Transport />}

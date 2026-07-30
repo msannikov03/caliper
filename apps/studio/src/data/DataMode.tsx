@@ -14,20 +14,30 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
-import { useStore } from "../store";
+import { replayingEpisode, useStore } from "../store";
 import type { DatasetEpisodeSeries, DatasetSummary } from "../store";
-import { doctorSummary, findingEpisode, findingRefs, sevClass, sevLabel } from "../doctor/doctor";
+import {
+  doctorSummary,
+  findingEpisode,
+  findingLocation,
+  findingRefs,
+  sevClass,
+  sevLabel,
+} from "../doctor/doctor";
 import { EpisodeChart } from "./EpisodeChart";
+import { openVerdictDialog, VerdictPanel } from "../verdicts/VerdictPanel";
 import {
   addTag,
   alignChannel,
   clampSplitFrame,
+  clipFrame,
   cursorIndex,
   decodeThumbs,
   dimLabels,
   fmtDuration,
   mergePartner,
   removeTag,
+  replayBlockedReason,
   rowView,
   seriesColor,
   THUMB_COUNT,
@@ -52,6 +62,7 @@ function DataDoctorPanel({ ds }: { ds: DatasetSummary }) {
   const dd = useStore((s) => s.dataDoctor);
   const clear = useStore((s) => s.clearDataDoctor);
   const selectEpisode = useStore((s) => s.selectDatasetEpisode);
+  const viewFrame = useStore((s) => s.viewFindingFrame);
   if (!dd) return null;
 
   return (
@@ -72,25 +83,38 @@ function DataDoctorPanel({ ds }: { ds: DatasetSummary }) {
         )}
         {dd.findings.map((f, i) => {
           const jump = findingEpisode(f, ds.episodes.length);
+          const at = findingLocation(f, ds.episodes);
           return (
-            <button
-              key={`${f.code}-${i}`}
-              className={`dd-row${jump !== null ? " jump" : ""}`}
-              disabled={jump === null}
-              title={f.fixHint}
-              onClick={() => jump !== null && void selectEpisode(jump)}
-            >
-              <span className={`sev-chip ${sevClass(f.severity)}`}>{sevLabel(f.severity)}</span>
-              <span className="dd-code">{f.code}</span>
-              <span className="dd-msg">{f.message}</span>
-              <span className="dd-refs">
-                {findingRefs(f).map((r) => (
-                  <span className="dd-ref" key={r}>
-                    {r}
-                  </span>
-                ))}
-              </span>
-            </button>
+            <div className="dd-item" key={`${f.code}-${i}`}>
+              <button
+                className={`dd-row${jump !== null ? " jump" : ""}`}
+                disabled={jump === null}
+                title={f.fixHint}
+                onClick={() => jump !== null && void selectEpisode(jump)}
+              >
+                <span className={`sev-chip ${sevClass(f.severity)}`}>{sevLabel(f.severity)}</span>
+                <span className="dd-code">{f.code}</span>
+                <span className="dd-msg">{f.message}</span>
+                <span className="dd-refs">
+                  {findingRefs(f).map((r) => (
+                    <span className="dd-ref" key={r}>
+                      {r}
+                    </span>
+                  ))}
+                </span>
+              </button>
+              {/* only findings that KNOW an instant offer to show it — the
+                  rest are whole-dataset statistics with nowhere to point */}
+              {at && (
+                <button
+                  className="dd-view"
+                  title={`pose the robot at episode ${at.episode} frame ${at.frame}`}
+                  onClick={() => void viewFrame(at.episode, at.frame)}
+                >
+                  → view
+                </button>
+              )}
+            </div>
           );
         })}
       </div>
@@ -276,6 +300,55 @@ function ThumbStrip({
   );
 }
 
+/** Compact transport for episode replay, INSIDE the Data panel: the global
+ *  one lives over the 3D stage, which Data mode docks down to a strip too
+ *  narrow for a scrubber. Same store clock (play/pause/seek), so the robot
+ *  view, the transport and the split cursor never disagree. Renders only
+ *  while the active clip IS a replayed episode. */
+function ReplayTransport({ ds }: { ds: DatasetSummary }) {
+  const clip = useStore((s) => s.simTraj);
+  const episode = useStore(replayingEpisode);
+  const playing = useStore((s) => s.playing);
+  const playhead = useStore((s) => s.playhead);
+  const play = useStore((s) => s.play);
+  const pause = useStore((s) => s.pause);
+  const seek = useStore((s) => s.seek);
+  const clearTraj = useStore((s) => s.clearTraj);
+  if (!clip || episode === null) return null;
+  const frame = clipFrame(playhead, clip.dt, clip.frames.length);
+  return (
+    <div className="data-replay">
+      <button
+        className="dr-play"
+        aria-label={playing ? "pause replay" : "play replay"}
+        onClick={() => (playing ? pause() : play())}
+      >
+        {playing ? "❚❚" : "▶"}
+      </button>
+      <span className="eyebrow accent">Replay ep {episode}</span>
+      <input
+        type="range"
+        min={0}
+        max={clip.duration}
+        step={0.001}
+        value={playhead}
+        aria-label="replay position"
+        // grabbing the scrubber takes the transport (same rule as the global
+        // one): pause so the clock stops fighting the drag
+        onPointerDown={() => pause()}
+        onChange={(e) => seek(parseFloat(e.target.value))}
+      />
+      <span className="dr-read">
+        frame {frame} / {clip.frames.length - 1} · {playhead.toFixed(2)}s
+      </span>
+      <span className="dr-meta">{ds.fps} fps</span>
+      <button className="dr-close" aria-label="clear replay" onClick={clearTraj}>
+        ×
+      </button>
+    </div>
+  );
+}
+
 function EpisodeDetail({
   ds,
   sel,
@@ -288,6 +361,8 @@ function EpisodeDetail({
   loading: boolean;
 }) {
   const row = ds.episodes[sel];
+  const robot = useStore((s) => s.robot);
+  const baking = useStore((s) => s.datasetClipLoading);
   const [splitFrame, setSplitFrame] = useState(0);
   const [tagDraft, setTagDraft] = useState("");
   // inline destructive-op confirm (small strip in the edit bar area)
@@ -304,6 +379,9 @@ function EpisodeDetail({
   if (!row) return null;
 
   const partner = mergePartner(sel, ds.episodes.length);
+  // why replay is unavailable (no robot / wrong ndof / nothing to play), or
+  // null when it is — the same rule the backend enforces
+  const blocked = replayBlockedReason(ds.features, robot);
   const split = clampSplitFrame(splitFrame, row.length);
   const live = series && series.episode === sel ? series : null;
   const cursorT =
@@ -373,7 +451,17 @@ function EpisodeDetail({
         >
           Delete
         </button>
+        <button
+          className="btn"
+          disabled={loading || baking || blocked !== null}
+          title={blocked ?? "play this take back on the loaded robot"}
+          onClick={() => void useStore.getState().replayEpisode(sel)}
+        >
+          {baking ? "Baking…" : "Replay on robot"}
+        </button>
       </div>
+
+      <ReplayTransport ds={ds} />
 
       {/* draggable split cursor — mirrored as the dashed line on every chart */}
       <input
@@ -509,6 +597,14 @@ export function DataMode() {
           >
             {doctorLoading ? "Doctor…" : "Doctor"}
           </button>
+          {/* a verdict is a run's own report — readable with no dataset open */}
+          <button
+            className="btn ghost"
+            title="open a caliper-learn eval / autopsy / profile / debug --json report"
+            onClick={() => void openVerdictDialog()}
+          >
+            Verdict…
+          </button>
         </div>
         {error && <div className="data-banner">{error}</div>}
         {ds ? (
@@ -527,6 +623,9 @@ export function DataMode() {
         )}
       </aside>
       <section className="data-detail">
+        {/* the run's verdict above the take it was trained on; dismissing it
+            with × puts the episode detail back at the top */}
+        <VerdictPanel />
         {ds && sel !== null ? (
           <EpisodeDetail ds={ds} sel={sel} series={series} loading={loading} />
         ) : (

@@ -86,6 +86,11 @@ pub struct Finding {
     pub episode: Option<i64>,
     /// Feature element (dof) the finding is about, when it concerns one.
     pub dof: Option<usize>,
+    /// Frame INSIDE `episode` the finding fired at, when the check localizes
+    /// one (D006/D010/D011). `None` means the check genuinely does not know a
+    /// frame — a whole-dataset statistic has nowhere to point.
+    #[serde(default)]
+    pub frame: Option<usize>,
     pub message: String,
     pub fix_hint: String,
 }
@@ -529,6 +534,7 @@ impl<'a> Analyzer<'a> {
                 feature: None,
                 episode: Some(ep.episode_index),
                 dof: None,
+                frame: None,
                 message: format!(
                     "episode {}: {bad} of {} timestamps are non-finite (NaN/inf) — \
                      delta-timestamp windowing pairs garbage frames, and the timestamp \
@@ -563,6 +569,7 @@ impl<'a> Analyzer<'a> {
                 feature: None,
                 episode: Some(ep.episode_index),
                 dof: None,
+                frame: Some(frame),
                 message: format!(
                     "episode {}: timestamps are irregular — worst at frame {frame}, dt = {dt:.6}s \
                      where fps {} implies {expected:.6}s; delta-timestamp windowing and action \
@@ -600,6 +607,8 @@ impl<'a> Analyzer<'a> {
                 feature: None,
                 episode: Some(ep.episode_index),
                 dof: None,
+                // where the freeze starts — the first of the M identical frames
+                frame: Some(len - m),
                 message: format!(
                     "episode {}: the last {m} frames are bit-identical across every vector \
                      feature — the robot froze before the recording stopped; the policy will \
@@ -704,6 +713,7 @@ impl<'a> Analyzer<'a> {
                     feature: Some(name.clone()),
                     episode: Some(ep.episode_index),
                     dof: None,
+                    frame: None,
                     message: format!(
                         "episode {} feature '{name}': {undecodable} of {} frames cannot be \
                          decoded ({first_error}) — the dataloader will crash or silently drop \
@@ -733,6 +743,7 @@ impl<'a> Analyzer<'a> {
                     feature: Some(name.clone()),
                     episode: Some(ep.episode_index),
                     dof: None,
+                    frame: None,
                     message: format!(
                         "episode {} feature '{name}': {what} frames out of {} — the camera fed \
                          no usable signal; a vision policy trained on this input is blind here",
@@ -753,6 +764,7 @@ impl<'a> Analyzer<'a> {
                         feature: Some(name.clone()),
                         episode: Some(ep.episode_index),
                         dof: None,
+                        frame: None,
                         message: format!(
                             "episode {} feature '{name}': {:.0}% of consecutive frames are exact \
                              duplicates — the camera delivered fewer real frames than the \
@@ -775,6 +787,7 @@ impl<'a> Analyzer<'a> {
                         feature: Some(name.clone()),
                         episode: Some(ep.episode_index),
                         dof: None,
+                        frame: None,
                         message: format!(
                             "episode {} feature '{name}': mean brightness drifts by {drift:.2} \
                              (on the 0–1 scale) from start to end — auto-exposure or lighting \
@@ -887,6 +900,7 @@ impl<'a> Analyzer<'a> {
                         feature: Some(name.clone()),
                         episode: None,
                         dof: Some(j),
+                        frame: None,
                         message: format!(
                             "feature '{name}' {}: {n} of {} frames hold a non-finite value \
                              (NaN/inf) — every loss touching them turns NaN and training \
@@ -918,6 +932,7 @@ impl<'a> Analyzer<'a> {
                         feature: Some(name.clone()),
                         episode: None,
                         dof: Some(j),
+                        frame: None,
                         message: format!(
                             "feature '{name}' {}: constant at {:.6} across all {} frames — this \
                              joint never moves; the policy will learn to ignore it, and std-based \
@@ -951,6 +966,7 @@ impl<'a> Analyzer<'a> {
                     feature: None,
                     episode: None,
                     dof: None,
+                    frame: None,
                     message: "meta/stats.json is missing — lerobot normalizes with these values; \
                               without them training cannot even start"
                         .to_string(),
@@ -970,6 +986,7 @@ impl<'a> Analyzer<'a> {
                     feature: Some(name.clone()),
                     episode: None,
                     dof: None,
+                    frame: None,
                     message: format!(
                         "feature '{name}' has no entry in meta/stats.json — normalization will \
                          fail or silently pass raw values through"
@@ -993,6 +1010,7 @@ impl<'a> Analyzer<'a> {
                         feature: Some(name.clone()),
                         episode: None,
                         dof: None,
+                        frame: None,
                         message: format!(
                             "feature '{name}': meta/stats.json '{stat}' is missing or not a flat \
                              number list — normalization cannot use it"
@@ -1008,6 +1026,7 @@ impl<'a> Analyzer<'a> {
                         feature: Some(name.clone()),
                         episode: None,
                         dof: None,
+                        frame: None,
                         message: format!(
                             "feature '{name}': meta/stats.json '{stat}' has {} entries but the \
                              feature has {} dofs — stats belong to a different schema",
@@ -1037,6 +1056,7 @@ impl<'a> Analyzer<'a> {
                         feature: Some(name.clone()),
                         episode: None,
                         dof: Some(j),
+                        frame: None,
                         message: format!(
                             "feature '{name}' {}: meta/stats.json {stat} = {stored_v:.6} but the \
                              data's actual {stat} is {actual_v:.6} — every input is normalized \
@@ -1108,6 +1128,7 @@ impl<'a> Analyzer<'a> {
                         feature: Some(ACTION_FEATURE.into()),
                         episode: None,
                         dof: Some(j),
+                        frame: None,
                         message: format!(
                             "feature 'action' {}: {msg} — saturated/clipped commands; the policy \
                              mostly sees one label and will slam that value at deployment",
@@ -1135,6 +1156,7 @@ impl<'a> Analyzer<'a> {
                     feature: Some(ACTION_FEATURE.into()),
                     episode: None,
                     dof: None,
+                    frame: None,
                     message: format!(
                         "'action' is nearly identical to 'observation.state' (rms difference \
                          {diff_rms:.6} vs state spread {state_rms:.4}) — echo/lag labels; the \
@@ -1166,6 +1188,7 @@ impl<'a> Analyzer<'a> {
                             feature: Some(ACTION_FEATURE.into()),
                             episode: None,
                             dof: Some(j),
+                            frame: None,
                             message: format!(
                                 "feature 'action' {}: range {range:.2e} vs a typical state range \
                                  of {median_state_range:.2e} — actions are numerically tiny; \
@@ -1225,6 +1248,9 @@ impl<'a> Analyzer<'a> {
                 feature: Some(ACTION_FEATURE.into()),
                 episode: Some(si.episode),
                 dof: None,
+                // the FIRST of the two frames (the pair's other half is named
+                // in the message — one finding can only point at one place)
+                frame: Some(si.frame),
                 message: format!(
                     "episode {} frame {} vs episode {} frame {}: states are nearly identical \
                      (normalized distance {s_dist:.3}) but the actions diverge (normalized \
@@ -1264,6 +1290,7 @@ impl<'a> Analyzer<'a> {
                         feature: Some(name.clone()),
                         episode: None,
                         dof: Some(j),
+                        frame: None,
                         message: format!(
                             "feature '{name}' {}: only {visited} of {bins} bins between min \
                              ({:.4}) and max ({:.4}) are ever visited — coverage holes; the \
@@ -1314,6 +1341,7 @@ impl<'a> Analyzer<'a> {
                     feature: Some(name.clone()),
                     episode: None,
                     dof: None,
+                    frame: None,
                     message: format!(
                         "feature '{name}': mean |pairwise correlation| across its {} dofs is \
                          {mean_abs:.2} — corridor-shaped data (the dofs move in lockstep along \
@@ -1357,6 +1385,7 @@ impl<'a> Analyzer<'a> {
                     feature: None,
                     episode: Some(episode),
                     dof: None,
+                    frame: None,
                     message: format!(
                         "episode {episode}: length {len} frames vs a median of {median:.0} \
                          (robust z = {z:.1}) — likely a stuck recording, a concatenated take, or \
@@ -1427,6 +1456,7 @@ impl<'a> Analyzer<'a> {
                     feature: None,
                     episode: Some(ea.episode_index),
                     dof: None,
+                    frame: None,
                     message: format!(
                         "episode {} and episode {}: {detail}",
                         ea.episode_index, eb.episode_index

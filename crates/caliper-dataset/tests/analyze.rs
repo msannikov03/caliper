@@ -356,6 +356,15 @@ fn d006_flags_contradictory_demonstrations() {
         .expect("D006 expected");
     assert!(f.message.contains("nearly identical"), "{}", f.message);
     assert!(f.message.contains("actions diverge"), "{}", f.message);
+    // the pair's FIRST half is machine-readable: episode + frame, and both
+    // appear in the sentence the human reads
+    let (ep, fr) = (f.episode.expect("episode ref"), f.frame.expect("frame ref"));
+    assert!(
+        f.message
+            .starts_with(&format!("episode {ep} frame {fr} vs")),
+        "{}",
+        f.message
+    );
     // Worst pairs are capped.
     let n = r.findings.iter().filter(|f| f.code == "D006").count();
     assert!(n <= AnalyzeOptions::default().max_pair_findings);
@@ -485,6 +494,8 @@ fn d010_flags_irregular_timestamps() {
         .expect("D010 expected");
     assert_eq!(f.episode, Some(0));
     assert!(f.message.contains("frame 10"), "{}", f.message);
+    // the machine ref agrees with the sentence — a caller can seek to it
+    assert_eq!(f.frame, Some(10));
 }
 
 // ===== D011 frozen tail =====
@@ -513,6 +524,8 @@ fn d011_flags_a_frozen_tail() {
         .expect("D011 expected");
     assert_eq!(f.episode, Some(0));
     assert!(f.message.contains("froze"), "{}", f.message);
+    // 26 frames, the last 5 bit-identical → the freeze is reported at 21
+    assert_eq!(f.frame, Some(21));
 }
 
 // ===== image checks (D012/D013/D014) =====

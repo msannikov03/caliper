@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "name": "zoo-lift-cube",
+  "robot": "../oracle/fixtures/robots/gripper_arm.urdf",
+  "q0": [0.0, 0.0, 0.02],
+  "scene": {
+    "ground": 0.0,
+    "props": [
+      {
+        "name": "cube",
+        "kind": "box",
+        "halfExtents": [0.05, 0.05, 0.05],
+        "pos": [0.0, 0.0, 0.05],
+        "mass": 0.05,
+        "rgba": [0.90, 0.45, 0.20, 1.0],
+        "material": "wood"
+      }
+    ]
+  },
+  "gripper": { "joint": "gripper", "closed": "lo" },
+  "success": {
+    "kind": "lifted",
+    "prop": "cube",
+    "height": 0.08,
+    "ref": "initial"
+  },
+  "horizonS": 8.0,
+  "fps": 50
+}

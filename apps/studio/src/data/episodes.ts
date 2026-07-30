@@ -5,7 +5,7 @@
 // renderers over these.
 // ============================================================
 
-import type { DatasetChannel, DatasetEpisodeRow } from "../store";
+import type { DatasetChannel, DatasetEpisodeRow, DatasetFeature } from "../store";
 
 /** Per-dim series labels for one channel: the dataset's element names when
  *  present (and dimension-consistent), else `name[i]`. */
@@ -81,6 +81,56 @@ export function addTag(tags: string[], raw: string): string[] {
 /** Chip-input remove (unchanged identity when the tag is absent). */
 export function removeTag(tags: string[], tag: string): string[] {
   return tags.includes(tag) ? tags.filter((x) => x !== tag) : tags;
+}
+
+// ---- episode replay (the recorded take, played back ON the robot) ----
+
+/** lerobot's conventional proprioception feature: the recorded joint pose. */
+export const STATE_FEATURE = "observation.state";
+
+/** Bookkeeping columns some writers emit as float32 vectors — never a pose.
+ *  MUST stay in lockstep with `INDEX_FEATURES` in `src-tauri/src/lib.rs`: the
+ *  backend picks the replayed feature by the same rule, and this mirror is
+ *  what lets the button say "no" (and why) before the round-trip. */
+export const INDEX_FEATURES = [
+  "timestamp",
+  "frame_index",
+  "episode_index",
+  "index",
+  "task_index",
+] as const;
+
+/** The feature an episode replays from: proprioception when the dataset has
+ *  it, else its first real vector feature. Null when there is none. */
+export function replayFeature(features: DatasetFeature[]): DatasetFeature | null {
+  return (
+    features.find((f) => f.name === STATE_FEATURE) ??
+    features.find((f) => !(INDEX_FEATURES as readonly string[]).includes(f.name)) ??
+    null
+  );
+}
+
+/** Why replay is unavailable, as one sentence for the button's tooltip — or
+ *  null when it IS available. Mirrors the backend's own refusals so a hopeless
+ *  click never has to travel to the engine to be told no. */
+export function replayBlockedReason(
+  features: DatasetFeature[],
+  robot: { name: string; ndof: number } | null,
+): string | null {
+  const f = replayFeature(features);
+  if (!f) return "this dataset carries no joint feature to replay";
+  if (!robot) return "load the robot this dataset was recorded with first";
+  if (f.dim !== robot.ndof) {
+    return `${f.name} is ${f.dim}-dimensional but ${robot.name} has ${robot.ndof} joints — load the robot this dataset was recorded with`;
+  }
+  return null;
+}
+
+/** Frame the playhead sits on, for the replay transport's "frame k / n"
+ *  readout: nearest baked row (playback picks rows the same way), clamped. */
+export function clipFrame(playhead: number, dt: number, count: number): number {
+  if (count <= 0 || !(dt > 0) || !Number.isFinite(playhead)) return 0;
+  return Math.min(Math.max(Math.round(playhead / dt), 0), count - 1);
 }
 
 // ---- camera thumbnails ----

@@ -1,0 +1,60 @@
+{
+  "fps": 2000,
+  "ticks": 40,
+  "budget_s": 0.0005,
+  "achievable_hz": 557.0209694164573,
+  "jitter_s": 0.0004003334619000232,
+  "frac_over_budget": 1.0,
+  "overhead_s": 1.2500000000000002e-07,
+  "stages": {
+    "obs_build": {
+      "p50": 3.2715e-06,
+      "p95": 6.445199999999998e-06,
+      "p99": 9.135e-06,
+      "max": 1.0500000000000001e-05
+    },
+    "inference": {
+      "p50": 9.9417e-05,
+      "p95": 0.00098336935,
+      "p99": 0.0012021166099999998,
+      "max": 0.001341542
+    },
+    "step": {
+      "p50": 0.000767375,
+      "p95": 0.0008409649,
+      "p99": 0.000896165,
+      "max": 0.0009308750000000001
+    },
+    "total": {
+      "p50": 0.0008681455,
+      "p95": 0.00179526455,
+      "p99": 0.00210416662,
+      "max": 0.002278708
+    }
+  },
+  "chunk": {
+    "source": "config",
+    "period": 4,
+    "n_refill_ticks": 10,
+    "refill": {
+      "p50": 0.0008825205000000001,
+      "p95": 0.0011806665499999997,
+      "p99": 0.00130936691,
+      "max": 0.001341542
+    },
+    "pop": {
+      "p50": 8.51665e-05,
+      "p95": 0.00012451715,
+      "p99": 0.00015173504000000004,
+      "max": 0.00016279100000000002
+    }
+  },
+  "findings": [
+    {
+      "code": "L001",
+      "severity": "error",
+      "message": "the 2000 Hz budget (0.500 ms/tick) was exceeded on 100.0% of ticks; p95 tick time is 1.795 ms (3.6x the budget) \u2014 the max sustainable rate is ~557 Hz",
+      "fix_hint": "run the loop at <= 557 Hz (and retrain/collect at that fps \u2014 deploy cadence must match collection), or cut the dominant stage in the table above"
+    }
+  ]
+}

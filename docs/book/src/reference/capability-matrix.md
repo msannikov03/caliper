@@ -99,7 +99,7 @@ Faces: [CLI](../faces/cli.md) · [Python](../faces/python.md) ·
 | **Coverage generator** (doctor→generator loop) | [`caliper_learn.coverage_gen`](../capabilities/data-factory.md) | ✗ ³ (`caliper-learn coverage`) | `generate_coverage` | ✗ |
 | Vectorized sim env (gym-vector semantics) | [`caliper_learn.vec_env`](../capabilities/learning.md) | ✗ | `VecSimEnv` / `reach_task` / `rollout_random` | ✗ |
 | Sim-camera collector (offscreen → image dataset) | [`caliper_learn.sim_camera`](../capabilities/learning.md) | ✗ | `SimCameraScene` / `collect_camera_dataset` | ✗ |
-| **MP4 video features** (dtype `video`, lerobot-exact) | [`caliper_learn.video`](../capabilities/data-factory.md) | ✗ | `encode_episode_video` / `VideoRecorder` / `attach_video_metadata` | ✗ |
+| **MP4 video features** (dtype `video`, lerobot-exact; metadata native in the Rust writer) | [`caliper_learn.video` + `caliper-dataset`](../capabilities/data-factory.md) | ✗ | `encode_episode_video` / `VideoRecorder` / `RecorderV3(video_features=…)` (`attach_video_metadata` = repair tool) | ✗ |
 
 ## Dataflow graph
 

@@ -176,13 +176,18 @@ available()   # (bool, reason) — probes PyAV → ffmpeg → unavailable
 
 `VideoRecorder` buffers a camera stream per episode and writes the v3.0
 `videos/{key}/chunk-XXX/file-XXX.mp4` layout (one episode per file,
-`from`/`to_timestamp` bookkeeping). Because the Rust writer does not yet emit
-video columns, `attach_video_metadata` is a deterministic pyarrow post-write
-that appends the four `videos/{key}/*` columns to `meta/episodes`, the pixel
-stats to `stats.json`, and the feature entry to `info.json` — documented as the
-bridge until the Rust writer grows native video columns. A recorded sim video
-dataset loads directly in real lerobot and decodes to frames matching the
-renders within measured codec tolerance (≈0.011 mean-abs-diff vs a 0.05 gate).
+`from`/`to_timestamp` bookkeeping). The **Rust writer emits video metadata
+natively**: declare a `dtype: "video"` feature and it writes the four
+`videos/{key}/*` episode columns, the `info.json` feature entry, `video_path`
+and the pixel stats in one pass — with coherence gates (the registered span
+must cover the episode's frame count, every referenced MP4 must exist, no
+orphaned registrations). Rust never encodes or decodes video; Python supplies
+the MP4s and the stats. `attach_video_metadata` remains as a documented
+repair tool for datasets written without the feature, and a test pins that
+native and bridge output are equal down to every `meta/episodes` row. A
+recorded sim video dataset loads directly in real lerobot and decodes to
+frames matching the renders within measured codec tolerance (≈0.011
+mean-abs-diff vs a 0.05 gate).
 
 > **Encoder availability.** Encoding needs PyAV or an `ffmpeg` on `PATH`; the
 > gate test skips honestly when neither is present. Decoding for the lerobot

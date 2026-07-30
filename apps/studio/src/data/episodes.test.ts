@@ -10,9 +10,12 @@ import {
   dimLabels,
   fmtDuration,
   mergePartner,
+  clipFrame,
   decodeThumbFrames,
   decodeThumbs,
   removeTag,
+  replayBlockedReason,
+  replayFeature,
   rowView,
   seriesColor,
   SERIES_COLORS,
@@ -162,6 +165,43 @@ describe("episodes — camera thumbnails", () => {
     const trailing = new Uint8Array(ok.byteLength + 1);
     trailing.set(new Uint8Array(ok), 0);
     expect(() => decodeThumbFrames(trailing.buffer)).toThrow(/trailing/);
+  });
+});
+
+describe("episodes — replay gating", () => {
+  const feat = (name: string, dim: number) => ({ name, dim, names: null });
+
+  it("replayFeature prefers proprioception, then the first real feature", () => {
+    const state = feat("observation.state", 6);
+    expect(replayFeature([feat("action", 6), state])).toBe(state);
+    // a converted dataset that never named a state feature
+    const action = feat("action", 4);
+    expect(replayFeature([action, feat("observation.velocity", 4)])).toBe(action);
+    // bookkeeping columns are never a pose, so there is nothing to replay
+    expect(replayFeature([feat("index", 1), feat("task_index", 1)])).toBeNull();
+    expect(replayFeature([])).toBeNull();
+  });
+
+  it("replayBlockedReason states WHY, and stays null when replay is possible", () => {
+    const fs = [feat("observation.state", 6)];
+    const robot = { name: "so101", ndof: 6 };
+    expect(replayBlockedReason(fs, robot)).toBeNull();
+    expect(replayBlockedReason(fs, null)).toMatch(/load the robot/);
+    // the mismatch names both sizes, the way the backend's refusal does
+    const wrong = replayBlockedReason(fs, { name: "toy", ndof: 2 });
+    expect(wrong).toMatch(/6-dimensional/);
+    expect(wrong).toMatch(/2 joints/);
+    expect(replayBlockedReason([feat("index", 1)], robot)).toMatch(/no joint feature/);
+  });
+
+  it("clipFrame maps the playhead to the baked row the robot is showing", () => {
+    expect(clipFrame(0, 0.02, 100)).toBe(0);
+    expect(clipFrame(0.21, 0.02, 100)).toBe(11); // nearest row, like playback
+    expect(clipFrame(99, 0.02, 100)).toBe(99); // clamped to the last row
+    // degenerate inputs report the first frame instead of NaN
+    expect(clipFrame(0.5, 0, 100)).toBe(0);
+    expect(clipFrame(Number.NaN, 0.02, 100)).toBe(0);
+    expect(clipFrame(0.5, 0.02, 0)).toBe(0);
   });
 });
 

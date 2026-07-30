@@ -8,6 +8,7 @@ import {
   canRepair,
   doctorSummary,
   findingEpisode,
+  findingLocation,
   findingRefs,
   sevClass,
   sevLabel,
@@ -33,6 +34,7 @@ function dataFinding(p: Partial<DataDoctorFinding> = {}): DataDoctorFinding {
     feature: "observation.state",
     episode: null,
     dof: null,
+    frame: null,
     message: "dof never moves",
     fixHint: "check the pipeline",
     ...p,
@@ -130,9 +132,9 @@ describe("findingEpisode", () => {
 });
 
 describe("findingRefs", () => {
-  it("renders every present ref, in ep/dof/feature order (positive)", () => {
-    const f = dataFinding({ episode: 4, dof: 1, feature: "action" });
-    expect(findingRefs(f)).toEqual(["ep 4", "dof 1", "action"]);
+  it("renders every present ref, in ep/frame/dof/feature order (positive)", () => {
+    const f = dataFinding({ episode: 4, frame: 21, dof: 1, feature: "action" });
+    expect(findingRefs(f)).toEqual(["ep 4", "frame 21", "dof 1", "action"]);
   });
 
   it("skips absent refs, including dof 0 kept and episode 0 kept", () => {
@@ -144,5 +146,33 @@ describe("findingRefs", () => {
 
   it("is empty for a dataset-wide finding (negative)", () => {
     expect(findingRefs(dataFinding({ feature: null }))).toEqual([]);
+  });
+});
+
+describe("findingLocation", () => {
+  const rows = [{ length: 40 }, { length: 26 }];
+
+  it("returns the instant a localized finding points at (positive)", () => {
+    expect(findingLocation(dataFinding({ episode: 1, frame: 21 }), rows)).toEqual({
+      episode: 1,
+      frame: 21,
+    });
+    // frame 0 is a location like any other
+    expect(findingLocation(dataFinding({ episode: 0, frame: 0 }), rows)).toEqual({
+      episode: 0,
+      frame: 0,
+    });
+  });
+
+  it("refuses to invent one (negative)", () => {
+    // a whole-dataset statistic has nowhere to point
+    expect(findingLocation(dataFinding({ episode: 0 }), rows)).toBeNull();
+    // an episode ref alone is a row jump, not an instant
+    expect(findingLocation(dataFinding({ frame: 3 }), rows)).toBeNull();
+    // past the end of THAT episode: disabled, never clamped to the last frame
+    expect(findingLocation(dataFinding({ episode: 1, frame: 26 }), rows)).toBeNull();
+    expect(findingLocation(dataFinding({ episode: 1, frame: -1 }), rows)).toBeNull();
+    expect(findingLocation(dataFinding({ episode: 1, frame: 2.5 }), rows)).toBeNull();
+    expect(findingLocation(dataFinding({ episode: 9, frame: 1 }), rows)).toBeNull();
   });
 });

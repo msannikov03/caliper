@@ -1,0 +1,63 @@
+{
+  "ci95_high": 0.8123836935173494,
+  "ci95_low": 0.1876163064826506,
+  "episodes": [
+    {
+      "episode_return": -4.934786501901706,
+      "final_distance": 0.1296423203181212,
+      "seed": 0,
+      "steps": 24,
+      "success": false
+    },
+    {
+      "episode_return": -2.1151186611075747,
+      "final_distance": 0.07912601589211683,
+      "seed": 1,
+      "steps": 19,
+      "success": true
+    },
+    {
+      "episode_return": -2.9870079689258606,
+      "final_distance": 0.08132629167838365,
+      "seed": 2,
+      "steps": 24,
+      "success": false
+    },
+    {
+      "episode_return": -3.244546149220877,
+      "final_distance": 0.09055011266196251,
+      "seed": 3,
+      "steps": 24,
+      "success": false
+    },
+    {
+      "episode_return": -1.433979830711169,
+      "final_distance": 0.0787819452331667,
+      "seed": 4,
+      "steps": 14,
+      "success": true
+    },
+    {
+      "episode_return": -1.671125282754287,
+      "final_distance": 0.0772937461047496,
+      "seed": 5,
+      "steps": 16,
+      "success": true
+    }
+  ],
+  "findings": [
+    {
+      "code": "E002",
+      "fix_hint": "Raise EvalConfig.n_episodes (the interval shrinks ~1/sqrt(n)); picking a checkpoint on this few seeds is the seed lottery.",
+      "message": "success flips seed-to-seed: 3/6, 95% CI [0.19, 0.81] spans 0.62 \u2014 this run cannot distinguish checkpoints.",
+      "severity": "warn"
+    }
+  ],
+  "mean_return": -2.7310940657702454,
+  "mean_steps_to_success": 16.333333333333332,
+  "median_return": -2.5510633150167177,
+  "n_episodes": 6,
+  "n_success": 3,
+  "success_criterion": null,
+  "success_rate": 0.5
+}

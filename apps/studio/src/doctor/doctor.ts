@@ -39,6 +39,9 @@ export interface DataDoctorFinding {
   feature: string | null;
   episode: number | null;
   dof: number | null;
+  /** frame inside `episode` the check fired at, when it localizes one
+   *  (D006/D010/D011); null when the check has nowhere to point */
+  frame: number | null;
   message: string;
   fixHint: string;
 }
@@ -97,12 +100,29 @@ export function findingEpisode(f: DataDoctorFinding, episodeCount: number): numb
   return f.episode >= 0 && f.episode < episodeCount ? f.episode : null;
 }
 
-/** Machine refs of a dataset finding as short chips: "ep 3", "dof 1", and the
- *  feature name — in that order, empties skipped. */
+/** Machine refs of a dataset finding as short chips: "ep 3", "frame 21",
+ *  "dof 1", and the feature name — in that order, empties skipped. */
 export function findingRefs(f: DataDoctorFinding): string[] {
   const refs: string[] = [];
   if (f.episode !== null) refs.push(`ep ${f.episode}`);
+  if (f.frame !== null) refs.push(`frame ${f.frame}`);
   if (f.dof !== null) refs.push(`dof ${f.dof}`);
   if (f.feature !== null && f.feature !== "") refs.push(f.feature);
   return refs;
+}
+
+/** The exact instant a finding points at — an episode AND a frame, both real
+ *  for the dataset in hand — or null when the check does not localize one.
+ *  Gates the "→ view" affordance: a jump to an invented frame would be worse
+ *  than no jump at all, so an out-of-range ref disables it rather than clamps.
+ *  (`rows` is the episode table; each row's `length` is its frame count.) */
+export function findingLocation(
+  f: DataDoctorFinding,
+  rows: { length: number }[],
+): { episode: number; frame: number } | null {
+  const episode = findingEpisode(f, rows.length);
+  if (episode === null) return null;
+  const frame = f.frame;
+  if (frame === null || !Number.isInteger(frame) || frame < 0) return null;
+  return frame < rows[episode].length ? { episode, frame } : null;
 }

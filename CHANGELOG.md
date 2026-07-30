@@ -105,6 +105,40 @@ not releases); from `0.1.0` on, every release gets a proper entry.
   became name-resolved — a prop free-joint in `extra_xml` previously landed
   *before* the robot in qpos order, so scene props would have silently
   received the arm's commands; props now also render in image observations.
+- **Episode replay in Data mode**: a dataset episode's recorded joint rows
+  play back on the docked 3D robot (the take's own positions through the
+  loaded robot's FK — velocities are not invented), with an in-panel
+  frame-accurate transport; dataset-doctor findings that know an instant
+  (`D006`/`D010`/`D011` now carry frame locations) jump the robot straight
+  to that pose, landing paused. Refuses honestly on ndof mismatch,
+  non-finite rows, or >20k frames — never silently truncates.
+- **Verdict viewers in Data mode**: `caliper-learn eval/debug/profile/
+  autopsy --json` documents open in Studio — success rate with the Wilson
+  interval drawn as a bar, per-episode tables, `E`/`P`/`L` findings with the
+  doctor panel's severity vocabulary, and the autopsy's verdict line —
+  detected by structural fingerprint, tolerant of additive fields, loud on
+  structurally wrong files.
+- **The task zoo** (`tasks/`): five graduated, solvability-witnessed starter
+  tasks on the bundled gripper arm (lift, place, hold-high, sort, precise
+  place) covering every predicate kind and four material presets. Difficulty
+  was measured (admissible-pose counts from an FK sweep), not claimed; both
+  suites assert no zoo task is born solved and every prop is reachable.
+- **Convex hull builder fixed** — the incremental hull oriented seed faces
+  against the whole-cloud centroid instead of the seed tetrahedron's, so
+  bracket/shell-shaped meshes collapsed and fell back to raw point clouds:
+  measured across a six-family robot zoo, **48% of real collision meshes**
+  (206/430) were falling back; now 3.3%, with 47% fewer collider points and
+  mutation-checked containment/support-equivalence tests. Collision
+  semantics are unchanged (a support function over a point set equals its
+  hull's); MJCF collider output legitimately shrinks.
+- **Native video features in the dataset writer**: `dtype: "video"` is
+  first-class — the writer emits the `videos/{key}/*` episode columns,
+  `info.json` entry, `video_path`, and pixel stats in one pass, with
+  coherence gates (span-vs-frame-count, mp4-exists, no orphaned
+  registrations). Python still encodes the MP4s; the pyarrow post-write
+  bridge (`attach_video_metadata`) is retired from the writing path and
+  demoted to a documented repair tool, with a test proving native and
+  bridge output are equal down to every `meta/episodes` row.
 - **The task artifact** (`*.caliper-task.json`, version 1, under the
   stability contract): one JSON file — robot, scene props/materials, named
   zones, gripper override, success predicate, horizon, fps — consumed by

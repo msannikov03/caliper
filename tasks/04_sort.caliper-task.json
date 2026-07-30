@@ -1,0 +1,57 @@
+{
+  "version": 1,
+  "name": "zoo-sort-blocks",
+  "robot": "../oracle/fixtures/robots/gripper_arm.urdf",
+  "q0": [0.0, 0.0, 0.02],
+  "scene": {
+    "ground": 0.0,
+    "props": [
+      {
+        "name": "tall_block",
+        "kind": "box",
+        "halfExtents": [0.05, 0.05, 0.10],
+        "pos": [-0.22, 0.0, 0.10],
+        "mass": 0.08,
+        "rgba": [0.85, 0.30, 0.30, 1.0],
+        "material": "wood"
+      },
+      {
+        "name": "short_block",
+        "kind": "box",
+        "halfExtents": [0.05, 0.05, 0.07],
+        "pos": [-0.10, 0.0, 0.07],
+        "mass": 0.06,
+        "rgba": [0.25, 0.45, 0.85, 1.0],
+        "material": "rubber"
+      }
+    ],
+    "zones": [
+      {
+        "name": "dock",
+        "center": [0.21, 0.0, 0.10],
+        "half": [0.08, 0.07, 0.10],
+        "rgba": [0.20, 0.80, 0.40, 0.30]
+      }
+    ]
+  },
+  "gripper": { "joint": "gripper", "closed": "lo" },
+  "success": {
+    "kind": "any_of",
+    "terms": [
+      {
+        "kind": "placed_in_zone",
+        "prop": "tall_block",
+        "zone": "dock",
+        "settled_speed": 0.01
+      },
+      {
+        "kind": "placed_in_zone",
+        "prop": "short_block",
+        "zone": "dock",
+        "settled_speed": 0.01
+      }
+    ]
+  },
+  "horizonS": 30.0,
+  "fps": 50
+}

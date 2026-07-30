@@ -56,7 +56,7 @@ so there is no Studio autopsy panel. Stated plainly in the chapter.
 | Coverage generator (doctor→generator loop) | ✅ `caliper_learn.coverage_gen` + `caliper-learn coverage` |
 | Contact material presets + stability linter | ✅ `ContactMaterial` presets, `lint_contact_stability` (`C001`–`C003`) |
 | Convex decomposition | ◑ **seam only** — `ColliderDecomposer` trait + identity impl; CoACD-class algorithm deliberately not vendored (per the research: leave the seam, don't build it) |
-| MP4 video encoding | ✅ `caliper_learn.video` (dtype `video`, lerobot-exact, real round-trip); ◑ video meta columns via a pyarrow post-write bridge until the Rust writer grows them natively |
+| MP4 video encoding | ✅ `caliper_learn.video` (dtype `video`, lerobot-exact, real round-trip); video meta columns now emitted **natively by the Rust writer** (the pyarrow bridge is a repair tool — see the follow-on table) |
 | Data factory docs + this audit | ✅ Data factory chapter, capability-matrix rows, this page |
 
 ## Follow-on — human demonstration loop (in progress)
@@ -71,6 +71,14 @@ Studio. Only what is built is listed as built:
 | **A3 — teleop episode recording** | ✅ built — record takes from a live session straight into a native LeRobotDataset v3.0, captured in the sim thread at exact tick decimation (default 50 fps; timestamps are `k/fps`, never wall-clock): per-episode task labels, save/discard per take, finish-dataset, open-in-Data. Reset discards the take. Acceptance verified: a Studio-recorded dataset loads in real lerobot 0.6.0 |
 | **B1/B2 — gripper channel + weld attach-on-grasp** | ✅ built — gripper auto-detection (joint or child-link name, mimic-aware, override supported), open/close on the shared PD hold target, and an explicitly-labeled weld grasp: commanded-closed + contact ⇒ weld with relpose captured at activation (snap-free < 1 mm), open ⇒ natural release; one prop at a time; reset releases ([details](../capabilities/contact-sim.md)) |
 | **B3 — success predicates** | ✅ built — `lifted` / `placed_in_zone` / combinators with an exact JSON schema (the seed of the coming task artifact), reported by `VecSimEnv(success=…)`, scored by the eval harness (wilson unchanged), named in the autopsy verdict |
+| **C — task artifact** | ✅ built — `*.caliper-task.json` v1, every face consumes it, Rust/Python predicate parity pinned by a shared table ([details](./task-artifact.md)) |
+| **D1 — episode replay** | ✅ built — recorded episodes re-perform on the 3D robot in Data mode; located doctor findings jump to their pose |
+| **D2 — verdict viewers** | ✅ built — eval/debug/profile/autopsy `--json` render in Data mode (Wilson bar, findings, verdict line) |
+| **D3 — task zoo** | ✅ built — five solvability-witnessed starters in `tasks/` ([details](./task-zoo.md)) |
+| **F1 — native video features** | ✅ built — the writer emits video metadata in one pass; the pyarrow bridge is a repair tool now |
+| **F2 — load time** | ✅ built — parallel hull priming; so101 5.0 ms release / 0.42 s debug (bit-identical hulls) |
+| **F4 — decomposition recon** | ✅ concluded: **skip vendoring** — the seam is points-only by design, CoACD's dylib alone outweighs the entire dmg and is nondeterministic multicore; if ever needed, parry's pure-Rust VHACD behind an optional feature is the pick. The recon's real yield: the hull-builder orientation bug (48% of real meshes falling back) — found and fixed |
+| **G1/G2 — CI** | ✅ built — monthly newest-lerobot pairing watch (skips = failures) + a Linux runtime job |
 
 ## Deliberately not built (traps the research flagged)
 

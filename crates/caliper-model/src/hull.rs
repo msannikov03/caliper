@@ -18,16 +18,14 @@ use nalgebra::{Point3, Vector3};
 /// tens of thousands of vertices each — and the unbounded incremental build on
 /// that is pathologically slow (effectively an infinite hang on load). Any cloud
 /// larger than this is deterministically subsampled down to it *before* the
-/// expensive work, so both the dedup and the build become bounded. 4096 is large
-/// enough for an accurate collision hull (far more than the ~dozens of true hull
-/// vertices a robot link has) yet small enough that the whole pipeline finishes
-/// in well under a second even for a mesh with 50k+ vertices.
+/// expensive work, so both the dedup and the build become bounded.
 ///
 /// Sized against the actual cost: `dedup` and `build_faces` are both ~O(n²), so a
-/// mesh capped at 4096 still took ~7 s to hull. A robot link's *true* convex hull
-/// has only dozens–low-hundreds of vertices, so 1024 axis-preserving samples
-/// capture its shape well while keeping the whole pipeline well under ~0.5 s per
-/// mesh (≈(1024/4096)² of the 4096 cost).
+/// cap of 4096 was tried first and still took ~7 s per mesh. A robot link's *true*
+/// convex hull has only dozens–low-hundreds of vertices, so 1024 axis-preserving
+/// samples capture its shape well (measured on so101: 144–389 hull vertices per
+/// link) while keeping the whole pipeline well under ~0.5 s per mesh — roughly
+/// (1024/4096)² of the 4096 cost.
 const MAX_HULL_INPUT: usize = 1024;
 
 /// Convex hull vertices of `points`. Guaranteed to be a subset of `points` whose
@@ -165,8 +163,9 @@ fn dedup(points: &[Point3<f64>]) -> Vec<Point3<f64>> {
     out
 }
 
-/// A hull face: three indices into the point list (orientation is fixed up to
-/// outward by the centroid, so winding is not relied upon for normals).
+/// A hull face: three indices into the point list (orientation is fixed outward
+/// against an interior reference point, so winding is not relied upon for
+/// normals — see the reference-point choice in [`build_faces`]).
 #[derive(Clone, Copy)]
 struct Face {
     v: [usize; 3],
@@ -209,7 +208,6 @@ fn build_faces(pts: &[Point3<f64>]) -> Option<Vec<Face>> {
     }
     let scale = scale_of(pts);
     let eps = 1e-9 * scale;
-    let centroid: Vector3<f64> = pts.iter().map(|p| p.coords).sum::<Vector3<f64>>() / n as f64;
     let i0 = 0usize;
     let i1 = (0..n)
         .max_by(|&a, &b| {
@@ -247,6 +245,20 @@ fn build_faces(pts: &[Point3<f64>]) -> Option<Vec<Face>> {
     if ((pts[i3] - pts[i0]).dot(&plane_n)).abs() <= eps {
         return None;
     }
+    // Interior reference point used to orient every face outward. It MUST be the
+    // centroid of the SEED TETRA, not of the whole cloud: the sweep's invariant is
+    // that the reference sits strictly inside the *current* hull, and the current
+    // hull starts as the seed tetra and only ever grows. The full-cloud centroid
+    // does not satisfy that — for an L-shaped or shell-like link (so101's
+    // under_arm, moving_jaw, motor_holder_wrist, waveshare_mounting_plate) it lies
+    // OUTSIDE the seed tetra, which flips the seed faces' normals inward. With
+    // inward normals no exterior point is ever "visible", the sweep inserts almost
+    // nothing, and `build_faces` returns a tiny polyhedron that does not contain
+    // the cloud — `verify` then rejects it and the caller falls back to the full
+    // 1000-point cloud. The tetra centroid is strictly interior by construction
+    // (the i0..i3 selection above already rejected a degenerate seed).
+    let centroid: Vector3<f64> =
+        (pts[i0].coords + pts[i1].coords + pts[i2].coords + pts[i3].coords) / 4.0;
     let mk = |a: usize, b: usize, c: usize| -> Face {
         let mut nrm = (pts[b] - pts[a]).cross(&(pts[c] - pts[a]));
         let nn = nrm.norm();
@@ -347,17 +359,22 @@ mod tests {
 
     #[test]
     fn cube_hull_is_collision_correct() {
-        // A cube has COPLANAR faces, the degenerate case for the incremental hull;
-        // per the module contract it then safely falls back to the full deduplicated
-        // cloud (collision-correct: GJK support over the cloud == over the true hull).
-        // So we assert the CONTRACT (correctness), not minimality (which is a deferred
-        // optimization for coplanar-faced meshes — see the coplanar-minimize TODO).
+        // A cube has COPLANAR faces — the hard case for an incremental hull. The
+        // contract is correctness (GJK support over the output == over the input
+        // cloud); minimality is a bonus. Both hold here: the interior and
+        // on-a-face points are dropped and only the 8 corners survive.
         let corners = cube_corners(0.5);
         let mut pts = corners.clone();
         pts.push(Point3::new(0.0, 0.0, 0.0)); // interior
         pts.push(Point3::new(0.2, -0.1, 0.3)); // interior
         pts.push(Point3::new(0.5, 0.0, 0.0)); // on a face
         let h = convex_hull(&pts);
+        assert_eq!(
+            h.len(),
+            8,
+            "cube should reduce to its 8 corners, got {}",
+            h.len()
+        );
         // (1) subset of input
         for p in &h {
             assert!(
@@ -553,6 +570,194 @@ mod tests {
             assert!(
                 (s_in - s_h).abs() < 1e-9,
                 "axis support mismatch along {d:?}"
+            );
+        }
+    }
+
+    /// A Fibonacci-sphere shell of `n` points on the unit sphere. Every point is
+    /// an extreme point of its own convex hull, and no four are coplanar — so a
+    /// fallback here cannot be blamed on the coplanar-degeneracy path.
+    fn fib_shell(n: usize) -> Vec<Point3<f64>> {
+        let ga = std::f64::consts::PI * (3.0 - 5.0f64.sqrt());
+        (0..n)
+            .map(|i| {
+                let y = 1.0 - (i as f64 / (n as f64 - 1.0)) * 2.0;
+                let r = (1.0 - y * y).max(0.0).sqrt();
+                let th = ga * i as f64;
+                Point3::new(th.cos() * r, y, th.sin() * r)
+            })
+            .collect()
+    }
+
+    /// Deterministic interior blob of `m` points in the cube of half-width `r`
+    /// around `c` — a stand-in for the dense tessellation CAD kernels put on
+    /// small curved features (holes, fillets), which is what drags a real mesh's
+    /// *sampled* centroid away from its geometric center.
+    fn blob(c: [f64; 3], r: f64, m: usize, seed: u64) -> Vec<Point3<f64>> {
+        let mut next = splitmix(seed);
+        (0..m)
+            .map(|_| Point3::new(c[0] + r * next(), c[1] + r * next(), c[2] + r * next()))
+            .collect()
+    }
+
+    /// Assert the two properties that make a hull safe to hand to GJK:
+    /// (a) CONTAINMENT — every input point is inside-or-on the output hull, and
+    /// (b) SUPPORT EQUIVALENCE — max·d over the hull equals max·d over the raw
+    ///     cloud for many directions, which is exactly what a collision query
+    ///     reads. Together these say the hull is neither too small (would make
+    ///     collision non-conservative) nor a different shape.
+    fn assert_hull_is_safe(cloud: &[Point3<f64>], hull: &[Point3<f64>], what: &str) {
+        for p in hull {
+            assert!(
+                cloud.iter().any(|q| (q - p).norm() < 1e-12),
+                "{what}: hull vertex {p:?} is not one of the input points"
+            );
+        }
+        let faces = build_faces(hull).unwrap_or_else(|| panic!("{what}: hull is degenerate"));
+        let eps = 1e-9 * scale_of(cloud);
+        for p in cloud {
+            let worst = faces
+                .iter()
+                .map(|f| f.n.dot(&(p.coords - f.p0)))
+                .fold(f64::MIN, f64::max);
+            assert!(
+                worst <= eps,
+                "{what}: input point {p:?} lies {worst:e} outside the hull (eps {eps:e})"
+            );
+        }
+        // 62 directions: the 6 axes + a deterministic spread over the sphere.
+        let mut dirs: Vec<Vector3<f64>> = vec![
+            Vector3::x(),
+            -Vector3::x(),
+            Vector3::y(),
+            -Vector3::y(),
+            Vector3::z(),
+            -Vector3::z(),
+        ];
+        for p in fib_shell(56) {
+            dirs.push(p.coords);
+        }
+        for d in dirs {
+            let s_cloud = cloud
+                .iter()
+                .map(|p| p.coords.dot(&d))
+                .fold(f64::MIN, f64::max);
+            let s_hull = hull
+                .iter()
+                .map(|p| p.coords.dot(&d))
+                .fold(f64::MIN, f64::max);
+            assert!(
+                (s_cloud - s_hull).abs() < 1e-12,
+                "{what}: support mismatch along {d:?}: cloud {s_cloud} vs hull {s_hull}"
+            );
+        }
+    }
+
+    #[test]
+    fn offcenter_mass_still_builds_a_real_hull() {
+        // REGRESSION (so101 under_arm / moving_jaw / motor_holder_wrist /
+        // waveshare_mounting_plate): when the point cloud's centroid falls
+        // OUTSIDE the seed tetrahedron, orienting faces against the cloud
+        // centroid points the seed normals inward, the sweep goes blind, and
+        // `build_faces` returns a ~6-face polyhedron that fails `verify` — so
+        // `convex_hull` fell back to the entire 1000-point cloud.
+        //
+        // 40 shell points (all extreme, no coplanar quadruples) + 400 interior
+        // points packed off-center: the sampled centroid lands outside the seed
+        // tetra, exactly as it does on those four links. The hull must be the 40
+        // shell points and nothing else.
+        let shell = fib_shell(40);
+        let mut cloud = shell.clone();
+        cloud.extend(blob([0.6, 0.3, 0.4], 0.06, 400, 15));
+        assert!(
+            cloud.len() <= MAX_HULL_INPUT,
+            "fixture must not be subsampled"
+        );
+
+        let hull = convex_hull(&cloud);
+        assert_eq!(
+            hull.len(),
+            shell.len(),
+            "expected the {} shell points and no fallback (got {})",
+            shell.len(),
+            hull.len()
+        );
+        for sp in &shell {
+            assert!(
+                hull.iter().any(|p| (p - sp).norm() < 1e-12),
+                "hull dropped shell point {sp:?}"
+            );
+        }
+        assert_hull_is_safe(&cloud, &hull, "offcenter_mass");
+    }
+
+    #[test]
+    fn flat_faced_solid_with_a_dense_feature_still_builds_a_real_hull() {
+        // The same failure with CAD-shaped input: big flat faces (a box) plus a
+        // dense cluster of interior points near one corner. The hull must reduce
+        // to the 8 box corners.
+        let corners = cube_corners(0.5);
+        let mut cloud = corners.clone();
+        cloud.extend(blob([0.35, 0.3, 0.25], 0.05, 400, 21));
+        assert!(
+            cloud.len() <= MAX_HULL_INPUT,
+            "fixture must not be subsampled"
+        );
+
+        let hull = convex_hull(&cloud);
+        assert_eq!(
+            hull.len(),
+            8,
+            "expected the 8 box corners, got {}",
+            hull.len()
+        );
+        assert_hull_is_safe(&cloud, &hull, "flat_faced_solid");
+    }
+
+    #[test]
+    fn hull_stays_safe_across_a_family_of_offcenter_shapes() {
+        // Sweep the failure mode: the same shell+blob construction with the mass
+        // pushed to many different places. Whatever the builder returns (a real
+        // hull or the safe fallback) it must satisfy containment and support
+        // equivalence, and for these non-degenerate clouds it must actually
+        // REDUCE — a fallback here means the builder has regressed.
+        let cases: [([f64; 3], f64, usize, u64, usize); 6] = [
+            ([0.5, 0.5, 0.5], 0.08, 500, 11, 60),
+            ([0.55, -0.4, 0.5], 0.08, 500, 12, 60),
+            ([-0.5, 0.5, 0.4], 0.07, 500, 13, 80),
+            ([0.3, 0.6, -0.5], 0.07, 500, 14, 60),
+            ([0.0, 0.7, 0.2], 0.06, 500, 16, 60),
+            ([-0.2, -0.55, 0.45], 0.05, 300, 19, 48),
+        ];
+        for (c, r, m, seed, nshell) in cases {
+            let shell = fib_shell(nshell);
+            let mut cloud = shell.clone();
+            cloud.extend(blob(c, r, m, seed));
+            assert!(cloud.len() <= MAX_HULL_INPUT);
+            let hull = convex_hull(&cloud);
+            let what = format!("shell{nshell}+blob{c:?}");
+            assert!(
+                hull.len() < cloud.len(),
+                "{what}: no reduction — fell back to the full {}-point cloud",
+                cloud.len()
+            );
+            assert_hull_is_safe(&cloud, &hull, &what);
+        }
+    }
+
+    #[test]
+    fn hull_is_deterministic_across_repeated_builds() {
+        // Caliper promises bit-identical model loads; the hull must be a pure
+        // function of the input, with no iteration-order or accumulation drift.
+        let shell = fib_shell(40);
+        let mut cloud = shell.clone();
+        cloud.extend(blob([0.6, 0.3, 0.4], 0.06, 400, 15));
+        let first = convex_hull(&cloud);
+        for _ in 0..4 {
+            assert_eq!(
+                convex_hull(&cloud),
+                first,
+                "hull output is not deterministic"
             );
         }
     }

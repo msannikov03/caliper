@@ -13,7 +13,12 @@
 //! codes to expect ([`ZooEntry::known_doctor_errors`]) instead of papering
 //! over them, and the unit tests pin that set.
 //!
-//! NOTE (packaging): `include_str!` reaches OUTSIDE the crate root into the
+//! NOTE (packaging): the vendored URDFs live in `crates/caliper-cli/zoo/` —
+//! INSIDE the crate — because a crates.io tarball cannot include files above
+//! the crate root (publish verify fails otherwise). `oracle/fixtures/corpus/`
+//! keeps its own copies for the cross-validation tests; a drift test below
+//! pins the two sets byte-identical.
+//! (previous note): `include_str!` reaches OUTSIDE the crate root into the
 //! repo's `oracle/fixtures/corpus/` — fine for workspace builds and CI, but
 //! `cargo package`/`cargo publish` of caliper-cli would need the corpus
 //! vendored under the crate first.
@@ -56,7 +61,7 @@ pub const REGISTRY: &[ZooEntry] = &[
         name: "panda",
         robot: "Franka Emika Panda (arm + hand)",
         file_name: "panda.urdf",
-        urdf: include_str!("../../../oracle/fixtures/corpus/panda.urdf"),
+        urdf: include_str!("../zoo/panda.urdf"),
         dof: 9,
         license: "BSD-2-Clause",
         source: "https://github.com/Gepetto/example-robot-data \
@@ -69,7 +74,7 @@ pub const REGISTRY: &[ZooEntry] = &[
         name: "so101_new_calib",
         robot: "SO-101 arm (TheRobotStudio)",
         file_name: "so101_new_calib.urdf",
-        urdf: include_str!("../../../oracle/fixtures/corpus/so101_new_calib.urdf"),
+        urdf: include_str!("../zoo/so101_new_calib.urdf"),
         dof: 6,
         license: "Apache-2.0",
         source: "https://github.com/TheRobotStudio/SO-ARM100 \
@@ -81,7 +86,7 @@ pub const REGISTRY: &[ZooEntry] = &[
         name: "so100",
         robot: "SO-100 arm (TheRobotStudio)",
         file_name: "so100.urdf",
-        urdf: include_str!("../../../oracle/fixtures/corpus/so100.urdf"),
+        urdf: include_str!("../zoo/so100.urdf"),
         dof: 6,
         license: "Apache-2.0",
         source: "https://github.com/TheRobotStudio/SO-ARM100 \
@@ -93,7 +98,7 @@ pub const REGISTRY: &[ZooEntry] = &[
         name: "gen3_lite",
         robot: "Kinova Gen3 lite",
         file_name: "gen3_lite.urdf",
-        urdf: include_str!("../../../oracle/fixtures/corpus/gen3_lite.urdf"),
+        urdf: include_str!("../zoo/gen3_lite.urdf"),
         dof: 10,
         license: "BSD-3-Clause",
         source: "https://github.com/Kinovarobotics/ros2_kortex \
@@ -318,5 +323,34 @@ mod tests {
             "unexpected default dir: {}",
             d.display()
         );
+    }
+}
+
+#[cfg(test)]
+mod zoo_packaging {
+    /// The CLI ships its own copies of the corpus URDFs (crates.io tarballs
+    /// cannot reach above the crate root). If the oracle corpus is updated,
+    /// this test forces the shipped copies to follow.
+    #[test]
+    fn shipped_zoo_matches_the_oracle_corpus() {
+        for name in [
+            "panda.urdf",
+            "so101_new_calib.urdf",
+            "so100.urdf",
+            "gen3_lite.urdf",
+        ] {
+            let shipped =
+                std::fs::read_to_string(format!("{}/zoo/{name}", env!("CARGO_MANIFEST_DIR")))
+                    .unwrap();
+            let corpus = std::fs::read_to_string(format!(
+                "{}/../../oracle/fixtures/corpus/{name}",
+                env!("CARGO_MANIFEST_DIR")
+            ))
+            .unwrap();
+            assert_eq!(
+                shipped, corpus,
+                "{name} drifted — re-copy into crates/caliper-cli/zoo/"
+            );
+        }
     }
 }

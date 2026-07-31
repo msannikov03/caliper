@@ -37,6 +37,9 @@ jobs:
       - run: npm --prefix apps/studio ci
       - run: npm --prefix apps/studio run test
       - run: npm --prefix apps/studio run build
+      # test BEFORE build: the studio crate has 91 Rust tests (live session,
+      # recording, policy bridge, task_open) that a build alone never runs
+      - run: cargo test -p studio --lib
       - run: cargo build -p studio
 
   python:

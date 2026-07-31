@@ -17,6 +17,8 @@ jobs:
       # studio (Tauri app) excluded: it needs a built frontend (dist/); see the `studio` job.
       - run: cargo clippy --workspace --exclude studio --all-targets -- -D warnings
       - run: cargo test --workspace --exclude studio
+      # the can/dynamixel/remote codec tests are feature-gated and ran in NO lane
+      - run: cargo test -p caliper-hal --all-features
       - run: bash scripts/assert-lean.sh
       # Docs must build (catches doc-code + structural errors). Not -D warnings:
       # mathematical notation like `[v;ω]` trips rustdoc's intra-doc-link lint as a

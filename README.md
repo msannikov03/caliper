@@ -15,7 +15,9 @@ through three faces that share the exact same code:
 **⬇ Download**: [Caliper Studio for macOS (Apple Silicon)](https://github.com/msannikov03/caliper/releases/latest)
 — an 11 MB signed & **notarized** dmg with the MuJoCo contact sim inside;
 opens with no Gatekeeper warning. Python wheels are attached to the same
-release; everything also builds from source (`cargo build`, `maturin develop`).
+release. Rust: `cargo add caliper-robotics` (library, `use caliper::…`) or
+`cargo install caliper-cli` (the CLI) — all crates on crates.io. Everything
+also builds from source.
 
 **Start here → [Zero to moving in 10 minutes](docs/book/src/quickstart.md)** —
 one guided path through the whole loop on a real SO-101 description. Full

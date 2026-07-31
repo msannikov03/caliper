@@ -136,24 +136,18 @@ jobs:
       CRATES: >-
         -p caliper-spatial -p caliper-model -p caliper-kinematics
         -p caliper-dynamics -p caliper-ik -p caliper-calib -p caliper-motion
-        -p caliper-hal -p caliper-collision -p caliper-trajopt
-        -p caliper-planning -p caliper-graph -p caliper -p caliper-cli
+        -p caliper-hal -p caliper-collision -p caliper-dataset
+        -p caliper-doctor -p caliper-trajopt -p caliper-planning
+        -p caliper-graph -p caliper-sim-mujoco -p caliper-robotics
+        -p caliper-cli
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      # The dry run resolves inter-crate path deps against the crates.io
-      # INDEX, where nothing is published yet (the umbrella name is still
-      # unresolved) — so it structurally cannot pass until the first real
-      # publish. Non-blocking until then; flip it back once crates exist.
+      # All 17 crates are live on crates.io (0.2.1, 2026-07-31) — the dry run
+      # resolves against the real index and is BLOCKING again.
       - name: Publish (dry run)
-        continue-on-error: true
-        run: |
-          if cargo publish --dry-run $CRATES; then
-            echo "dry run clean"
-          else
-            echo "::notice title=crates dry-run::expected to fail until the first real publish — inter-crate deps resolve against the crates.io index, which has none of our crates yet"
-          fi
+        run: cargo publish --dry-run $CRATES
       - name: Check for crates.io token
         id: token
         env:

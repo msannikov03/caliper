@@ -65,7 +65,7 @@ caliper-graph      = { path = "crates/caliper-graph", version = "0.2.1" }
 caliper-calib      = { path = "crates/caliper-calib", version = "0.2.1" }
 caliper-doctor     = { path = "crates/caliper-doctor", version = "0.2.1" }
 caliper-sim-mujoco = { path = "crates/caliper-sim-mujoco", version = "0.2.1" }
-caliper            = { path = "crates/caliper", version = "0.2.1" }
+caliper            = { package = "caliper-robotics", path = "crates/caliper", version = "0.2.1" }
 
 [profile.release]
 lto = "thin"

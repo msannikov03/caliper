@@ -749,25 +749,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "caliper"
-version = "0.2.1"
-dependencies = [
- "caliper-calib",
- "caliper-collision",
- "caliper-dynamics",
- "caliper-graph",
- "caliper-hal",
- "caliper-ik",
- "caliper-kinematics",
- "caliper-model",
- "caliper-motion",
- "caliper-planning",
- "caliper-sim-mujoco",
- "caliper-spatial",
- "caliper-trajopt",
-]
-
-[[package]]
 name = "caliper-calib"
 version = "0.2.1"
 dependencies = [
@@ -783,10 +764,10 @@ name = "caliper-cli"
 version = "0.2.1"
 dependencies = [
  "anyhow",
- "caliper",
  "caliper-collision",
  "caliper-dataset",
  "caliper-doctor",
+ "caliper-robotics",
  "caliper-sim-mujoco",
  "clap",
  "nalgebra",
@@ -942,14 +923,33 @@ dependencies = [
 name = "caliper-py"
 version = "0.2.1"
 dependencies = [
- "caliper",
  "caliper-collision",
  "caliper-dataset",
  "caliper-doctor",
+ "caliper-robotics",
  "caliper-sim-mujoco",
  "nalgebra",
  "pyo3",
  "serde_json",
+]
+
+[[package]]
+name = "caliper-robotics"
+version = "0.2.1"
+dependencies = [
+ "caliper-calib",
+ "caliper-collision",
+ "caliper-dynamics",
+ "caliper-graph",
+ "caliper-hal",
+ "caliper-ik",
+ "caliper-kinematics",
+ "caliper-model",
+ "caliper-motion",
+ "caliper-planning",
+ "caliper-sim-mujoco",
+ "caliper-spatial",
+ "caliper-trajopt",
 ]
 
 [[package]]
@@ -4830,10 +4830,10 @@ checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 name = "studio"
 version = "0.2.1"
 dependencies = [
- "caliper",
  "caliper-collision",
  "caliper-dataset",
  "caliper-doctor",
+ "caliper-robotics",
  "caliper-sim-mujoco",
  "log",
  "nalgebra",

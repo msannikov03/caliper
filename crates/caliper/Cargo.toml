@@ -1,5 +1,9 @@
 [package]
-name = "caliper"
+# Published as `caliper-robotics` (the bare `caliper` name on crates.io is
+# taken); the LIBRARY stays `caliper`, so `use caliper::…` and the
+# workspace-level package-rename keep every consumer unchanged. Mirrors PyPI,
+# where the wheel is `caliper-robotics` and the module is `caliper`.
+name = "caliper-robotics"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -7,7 +11,10 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 readme.workspace = true
-description = "Caliper robotics engine — unified facade over the sub-crates"
+description = "Caliper robotics engine — one deterministic core for serial-arm kinematics, IK, motion, dynamics, planning, simulation and learning; `use caliper::…`"
+
+[lib]
+name = "caliper"
 keywords = ["robotics", "kinematics", "dynamics", "ik", "engine"]
 categories = ["science::robotics"]
 

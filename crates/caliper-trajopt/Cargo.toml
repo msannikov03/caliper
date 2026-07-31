@@ -8,7 +8,7 @@ repository.workspace = true
 homepage.workspace = true
 readme.workspace = true
 description = "CHOMP-style collision-aware trajectory optimization (smoothness + obstacle)"
-keywords = ["robotics", "trajectory-optimization", "chomp", "motion-planning", "collision"]
+keywords = ["robotics", "optimization", "chomp", "motion-planning", "collision"]
 categories = ["science::robotics", "algorithms"]
 
 # CHOMP-style trajectory optimizer: minimizes a smoothness (finite-difference

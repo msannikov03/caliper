@@ -123,11 +123,9 @@ jobs:
     # The list is every publishable crate in dependency order; excluded:
     # studio (Tauri app) and caliper-py (ships via PyPI, not crates.io).
     #
-    # ⚠ crates.io names (checked 2026-07-09): every caliper-* sub-crate name is
-    # free, but bare `caliper` is TAKEN by an existing crate — the facade (and
-    # caliper-cli, which depends on it) cannot be published under this name.
-    # The dry-run still validates packaging end-to-end; before flipping the
-    # real publish, rename the facade or resolve the name with its owner.
+    # crates.io naming (resolved 2026-07-31): bare `caliper` is squatted, so
+    # the facade publishes as `caliper-robotics` with its lib named `caliper`
+    # — same package name as PyPI, same `use caliper::` in code.
     # A real publish is NOT atomic: crates land one at a time and cannot be
     # unpublished (only yanked), hence the double gate below.
     needs: version-check

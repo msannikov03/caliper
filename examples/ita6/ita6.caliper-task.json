@@ -1,0 +1,37 @@
+{
+  "version": 1,
+  "name": "ita6-pick-place-cube",
+  "robot": "ita6.urdf",
+  "q0": [-0.23554, 0.53965, 1.43271, 0.0, 1.16924, 0.0, 0.012],
+  "scene": {
+    "ground": 0.0,
+    "props": [
+      {
+        "name": "cube",
+        "kind": "box",
+        "halfExtents": [0.02, 0.02, 0.02],
+        "pos": [0.25, -0.06, 0.02],
+        "mass": 0.05,
+        "rgba": [0.92, 0.41, 0.2, 1.0],
+        "material": "wood"
+      }
+    ],
+    "zones": [
+      {
+        "name": "bin",
+        "center": [0.22, 0.1, 0.04],
+        "half": [0.055, 0.055, 0.05],
+        "rgba": [0.16, 0.47, 0.84, 0.32]
+      }
+    ]
+  },
+  "gripper": { "joint": "gripper", "closed": "lo" },
+  "success": {
+    "kind": "placed_in_zone",
+    "prop": "cube",
+    "zone": "bin",
+    "settled_speed": 0.01
+  },
+  "horizonS": 20.0,
+  "fps": 50
+}

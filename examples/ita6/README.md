@@ -84,7 +84,9 @@ Higher scores elsewhere on the grid belong to *longer arms* that fail the
 | Work-zone reachability, tool vertical | **100 %** of 100 poses |
 | Mean manipulability over the zone | **0.00556 m³** |
 | Mean joint-limit margin | **0.333** (1.0 = dead centre of every range) |
-| Self-collision over the zone | **0 of 100 poses**, 16 colliders, 0 uncovered frames |
+| Self-collision over the zone | **0 of 100 poses** on the SHIPPED 7-DOF model (18 colliders incl. the jaw, checked at both gripper extremes), 0 uncovered frames |
+| Twin agreement (arm6 vs full) | measured: the fixed tcp→jaw offset drifts ≤ 3.3e-16 across 50 random in-limit q — the 6R chains are identical |
+| Analytic-IK residual (winner) | measured: max 2.6e-16 m over all 100 reached zone poses; **0 of 100 needed the micro-nudge** (the y=0 workaround never fires on the final geometry) |
 | Static 1 kg payload | worst \|τ\| = 5.90 N·m (J2), 2.80 N·m (J3) — **within** the 12 N·m limits |
 | Task in `VecSimEnv` | loads, steps, holds q0 to 0.00 mrad over 2 s |
 | Design sweep runtime | **3.0 s** for 41 candidates × 100 IK poses |

@@ -588,6 +588,9 @@ _NUDGES = (
 )
 
 
+NUDGE_STATS = {"nudged": 0, "solved": 0}
+
+
 def solve_pose(robot, p, seed=None) -> list:
     """Limit-respecting closed-form solutions for "tool vertical at `p`".
 
@@ -614,11 +617,16 @@ def solve_pose(robot, p, seed=None) -> list:
     seed = seed or [math.atan2(p[1], p[0]), *SEED_REST]
     branches = _working_branches(robot.analytic_ik(down_target(p), seed=seed))
     if branches:
+        NUDGE_STATS["solved"] += 1
         return branches
     for dx, dy, dz in _NUDGES:
         branches = _working_branches(robot.analytic_ik(
             down_target((p[0] + dx, p[1] + dy, p[2] + dz)), seed=seed))
         if branches:
+            # a retry rescued this pose from the y=0 solver bug -- counted so
+            # "reached" is auditable as exact-vs-nudged (see analysis.json)
+            NUDGE_STATS["nudged"] += 1
+            NUDGE_STATS["solved"] += 1
             return branches
     return []
 
@@ -680,6 +688,43 @@ def score_candidate(robot, samples: np.ndarray) -> dict:
     }
 
 
+def self_collision_report_full(arm, full, samples: np.ndarray) -> dict:
+    """Self-collision of the SHIPPED robot (jaw included) over the zone.
+
+    IK runs on the bare 6R core (the closed form needs ndof == 6); each
+    solution is then checked on the full 7-DOF model with the gripper padded
+    at BOTH travel extremes -- the jaw is a moving body sitting exactly where
+    the first geometry pass had real interference, so checking only the arm
+    would verify a robot we do not ship.
+    """
+    cm = caliper.CollisionModel(full)
+    names = full.frame_names()
+    g_lo, g_hi = full.joint_limits[6]
+    pairs: dict[tuple[str, str], float] = {}
+    hits = 0
+    for p in samples:
+        branches = solve_pose(arm, p)
+        if not branches:
+            continue
+        colliding = False
+        for g in (g_lo, g_hi):
+            q7 = list(branches[0]) + [g]
+            if cm.query(q7)["collision"]:
+                colliding = True
+                for a, b, info in cm.contacts(q7):
+                    key = (names[a], names[b])
+                    pairs[key] = max(pairs.get(key, 0.0), float(info["depth"]))
+        hits += int(colliding)
+    return {
+        "colliding_poses": hits,
+        "n_samples": int(len(samples)),
+        "gripper_configs_checked": ["open", "closed"],
+        "colliders": cm.num_colliders,
+        "uncovered_frames": cm.uncovered_frames,
+        "pairs": {f"{a} <-> {b}": round(d, 5) for (a, b), d in pairs.items()},
+    }
+
+
 def self_collision_report(robot, samples: np.ndarray) -> dict:
     """Do the work-zone IK solutions actually fit inside the machine?
 
@@ -723,6 +768,7 @@ def static_payload_check(robot, samples: np.ndarray, payload: float) -> dict:
     """
     worst = np.zeros(6)
     worst_at = None
+    per_joint_peak = np.zeros(6)  # each joint's own max over the zone
     # World-frame wrench of the payload hanging at the TCP, [v; omega] ordering
     # (caliper's jacobian puts the three linear rows first -- verified against a
     # hand-computed 90-degree shoulder pose).
@@ -739,6 +785,7 @@ def static_payload_check(robot, samples: np.ndarray, payload: float) -> dict:
         # turns a real 7.7 N.m into a comfortable-looking 0.6 N.m.
         j = np.array(robot.jacobian(q))          # 6 x ndof, World frame
         tau = np.array(robot.gravity_torque(q)) - j.T @ wrench
+        per_joint_peak = np.maximum(per_joint_peak, np.abs(tau[:6]))
         if np.max(np.abs(tau)) > np.max(np.abs(worst)):
             worst, worst_at = tau, tuple(float(v) for v in p)
     efforts = [drive_limits(f"j{i + 1}")[0] for i in range(6)]
@@ -748,7 +795,11 @@ def static_payload_check(robot, samples: np.ndarray, payload: float) -> dict:
         "at_point": worst_at,
         "effort_limit_nm": efforts,
         "utilisation": [round(abs(float(t)) / e, 3) for t, e in zip(worst, efforts)],
-        "within_limits": bool(all(abs(float(t)) <= e for t, e in zip(worst, efforts))),
+        # each joint's OWN peak over the zone (the single worst pose above is
+        # worst for ONE joint; other joints can peak at other poses)
+        "per_joint_peak_nm": [round(float(t), 3) for t in per_joint_peak],
+        "per_joint_peak_utilisation": [round(float(t) / e, 3) for t, e in zip(per_joint_peak, efforts)],
+        "within_limits": bool(all(float(t) <= e for t, e in zip(per_joint_peak, efforts))),
     }
 
 
@@ -842,10 +893,49 @@ def main() -> None:
 
     arm = caliper.Robot.from_urdf(str(arm_path))
     full = caliper.Robot.from_urdf(str(full_path))
+    NUDGE_STATS["nudged"] = NUDGE_STATS["solved"] = 0
     detail = score_candidate(arm, samples)
-    selfcol = self_collision_report(arm, samples)
+    winner_nudges = dict(NUDGE_STATS)
+    selfcol = self_collision_report_full(arm, full, samples)
     payload_1kg = static_payload_check(arm, samples, PAYLOAD_KG)
     payload_half = static_payload_check(arm, samples, 0.5)
+
+    # Measured (not inferred) twin-agreement and IK-residual figures: the two
+    # URDFs share a byte-identical 6R chain, but the claim ships as a number.
+    # `fk(q)` returns the TIP pose as a 4x4. The twins' tips differ (tcp vs
+    # jaw), so the measurement is: T_arm_tcp(q)^-1 . T_full_jaw(q+[0]) must be
+    # the CONSTANT fixed tcp->jaw offset for every q -- any drift means the 6R
+    # chains differ. Stronger than a single-frame diff, and it is a number.
+    rng = np.random.default_rng(0)
+    lims = arm.joint_limits
+    x0 = None
+    tcp_diff = 0.0
+    for _ in range(50):
+        q6 = [float(rng.uniform(lo, hi)) for lo, hi in lims]
+        fa = np.array(arm.fk(q6))
+        ff = np.array(full.fk(q6 + [0.0]))
+        x = np.linalg.inv(fa) @ ff
+        if x0 is None:
+            x0 = x
+        tcp_diff = max(tcp_diff, float(np.max(np.abs(x - x0))))
+    ik_resid = 0.0
+    n_res = 0
+    for pnt in samples:
+        for q in solve_pose(arm, pnt)[:1]:
+            tip = np.array(arm.fk(list(q)))[:3, 3]
+            ik_resid = max(ik_resid, float(np.linalg.norm(tip - np.array(pnt))))
+            n_res += 1
+    verification = {
+        "tcp_agreement_max": tcp_diff,
+        "tcp_agreement_note": "max element drift of inv(T_arm_tcp) @ T_full_jaw across 50 random in-limit q (gripper 0) -- the fixed tcp->jaw offset must be constant iff the twin 6R chains are identical",
+        "ik_residual_max_m": ik_resid,
+        "ik_residual_note": f"max |FK(analytic branch) - target| over {n_res} reached zone poses (nudged targets measured against the ORIGINAL point, so the bound includes the 1e-5 m worst-case nudge)",
+        "nudged_samples": winner_nudges["nudged"],
+        "solved_samples": winner_nudges["solved"],
+    }
+    print(f"  twin TCP agreement        max |dFK| = {tcp_diff:.3e}")
+    print(f"  analytic IK residual      max {ik_resid:.3e} m over {n_res} poses "
+          f"({winner_nudges['nudged']} of {winner_nudges['solved']} needed the micro-nudge)")
 
     doc_arm = caliper.doctor(str(arm_path))
     doc_full = caliper.doctor(str(full_path))
@@ -934,6 +1024,7 @@ def main() -> None:
                                     for i in range(6)},
         },
         "self_collision": selfcol,
+        "verification": verification,
         "payload_check": {"structural_1kg": payload_1kg, "precision_0p5kg": payload_half},
         "doctor": {
             "ita6_arm6.urdf": {k: doc_arm[k] for k in
